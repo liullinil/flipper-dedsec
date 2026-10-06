@@ -63,6 +63,20 @@ class RfEvent:
     @classmethod
     def from_dict(cls, data):
         data = dict(data)
+        # Accept the compact Flipper JSONL shape as well as the desktop schema.
+        if not data.get("device_uuid") and data.get("device_id"):
+            data["device_uuid"] = data["device_id"]
+        if not data.get("captured_at_utc") and data.get("captured_at"):
+            data["captured_at_utc"] = data["captured_at"]
+        if "rssi_dbm" in data:
+            value = float(data.get("rssi_dbm") or 0)
+            data.setdefault("rssi_min_dbm", value)
+            data.setdefault("rssi_avg_dbm", value)
+            data.setdefault("rssi_max_dbm", value)
+        if not data.get("duration_us") and data.get("last_duration_us"):
+            data["duration_us"] = int(data["last_duration_us"])
+        if not data.get("source_type"):
+            data["source_type"] = "nfc" if data.get("mode") == "NFC" else "subghz"
         event = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
         return event
 
@@ -87,18 +101,49 @@ class FamilyGrouper:
         self.frequency_tolerance_hz = frequency_tolerance_hz
         self.families: Dict[str, dict] = {}
 
+    @staticmethod
+    def similarity(left: RfEvent, right: RfEvent) -> dict:
+        reasons = []
+        score = 0.0
+        if left.source_type == right.source_type:
+            score += 0.10
+            reasons.append("same source type")
+        if left.modulation == right.modulation:
+            score += 0.25
+            reasons.append("same modulation")
+        if left.frequency_hz and right.frequency_hz:
+            drift = abs(left.frequency_hz - right.frequency_hz)
+            if drift <= 150_000:
+                score += 0.25
+                reasons.append("same carrier frequency")
+        if left.pulse_timings_us and right.pulse_timings_us:
+            count = min(len(left.pulse_timings_us), len(right.pulse_timings_us), 96)
+            matches = sum(
+                abs(left.pulse_timings_us[i] - right.pulse_timings_us[i]) <= 75
+                for i in range(count)
+            )
+            timing = matches / max(1, count)
+            score += 0.30 * timing
+            if timing >= 0.75:
+                reasons.append("same pulse timing")
+        if left.repeat_count == right.repeat_count:
+            score += 0.10
+            reasons.append("same repetition pattern")
+        return {"score": round(min(1.0, score), 3), "reasons": reasons}
+
     def assign(self, event: RfEvent) -> str:
         fp = event.fingerprint_id or fingerprint(event)
         event.fingerprint_id = fp
         for family_id, family in self.families.items():
-            if event.modulation != family["modulation"]:
-                continue
-            if abs(event.frequency_hz - family["frequency_hz"]) > self.frequency_tolerance_hz:
+            representative = family["representative"]
+            match = self.similarity(event, representative)
+            if match["score"] < 0.55:
                 continue
             event.family_id = family_id
             family["event_ids"].append(event.event_id)
             family["fingerprints"].add(fp)
             family["last_seen"] = event.captured_at_utc
+            family["confidence"] = max(family["confidence"], match["score"])
             return family_id
         family_id = "family-" + hashlib.sha256(fp.encode("ascii")).hexdigest()[:12]
         self.families[family_id] = {
@@ -106,6 +151,8 @@ class FamilyGrouper:
             "modulation": event.modulation,
             "event_ids": [event.event_id],
             "fingerprints": {fp},
+            "representative": event,
+            "confidence": 1.0,
             "first_seen": event.captured_at_utc,
             "last_seen": event.captured_at_utc,
         }

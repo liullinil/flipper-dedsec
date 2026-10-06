@@ -45,3 +45,22 @@ def test_upload_receiver_resumes_chunks_and_validates_checksum(tmp_path):
     assert store.pending()
     assert store.acknowledge(event.event_id)
     assert not store.pending()
+
+
+def test_flipper_compact_record_is_normalized():
+    event = RfEvent.from_dict({
+        "event_id": "rf-device-session-2",
+        "device_id": "device",
+        "session_id": "session",
+        "sequence_number": 2,
+        "captured_at": "2026-01-01T00:00:00Z",
+        "monotonic_ms": 12,
+        "frequency_hz": 433920000,
+        "rssi_dbm": -52,
+        "last_duration_us": 900,
+        "pulse_timings_us": [400, 800],
+    })
+    assert event.event_id == "rf-device-session-2"
+    assert event.device_uuid == "device"
+    assert event.rssi_min_dbm == event.rssi_avg_dbm == event.rssi_max_dbm == -52
+    assert event.duration_us == 900

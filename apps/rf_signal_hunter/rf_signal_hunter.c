@@ -14,6 +14,9 @@
 #include <furi_hal_rtc.h>
 #include <furi_hal_random.h>
 #include <furi_hal_nfc.h>
+#include <furi_hal_bt.h>
+#include <bt/bt_service/bt.h>
+#include "rf_hunter_ble.h"
 
 #define HUNTER_EVENTS_DIR APP_DATA_PATH("rf_signal_hunter")
 #define HUNTER_EVENTS_PATH HUNTER_EVENTS_DIR "/events.jsonl"
@@ -58,6 +61,12 @@ typedef struct {
     float rssi_max;
     float rssi_sum;
     uint32_t rssi_samples;
+    Bt* bt;
+    FuriHalBleProfileBase* ble_profile;
+    RfHunterProfileParams ble_params;
+    FuriStreamBuffer* ble_rx;
+    char ble_line[1024];
+    uint16_t ble_line_len;
 } Hunter;
 
 static void hunter_hex_random(char* out, size_t chars) {
@@ -161,6 +170,95 @@ static void hunter_capture(bool level, uint32_t duration, void* context) {
     if(duration > 8000) hunter->bursts++;
 }
 
+static void hunter_ble_rx(const uint8_t* data, uint16_t size, void* context) {
+    Hunter* hunter = context;
+    if(hunter->ble_rx) furi_stream_buffer_send(hunter->ble_rx, data, size, 0);
+}
+
+static void hunter_ble_send(Hunter* hunter, const char* text) {
+    if(hunter->ble_profile && text) {
+        rfhunter_ble_tx(hunter->ble_profile, (const uint8_t*)text, MIN(strlen(text), (size_t)RFHUNTER_TX_MAX));
+    }
+}
+
+static bool hunter_extract_string(const char* line, const char* key, char* out, size_t out_size) {
+    char needle[48];
+    snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    const char* p = strstr(line, needle);
+    if(!p) return false;
+    p += strlen(needle);
+    const char* end = strchr(p, '\"');
+    if(!end) return false;
+    size_t n = MIN((size_t)(end - p), out_size - 1);
+    memcpy(out, p, n);
+    out[n] = 0;
+    return true;
+}
+
+static void hunter_ble_handle(Hunter* hunter, const char* line) {
+    if(strstr(line, "\"op\":\"hello\"")) {
+        hunter_ble_send(hunter, "{\"v\":1,\"op\":\"hello_ack\",\"protocol\":1,\"chunk_size\":192}\n");
+    } else if(strstr(line, "\"op\":\"manifest\"")) {
+        // The event stream is newline JSON already; advertise its presence and let the
+        // desktop request individual records by event_id. This keeps BLE frames bounded.
+        hunter_ble_send(hunter, "{\"v\":1,\"op\":\"manifest_ack\",\"events_file\":\"events.jsonl\"}\n");
+    } else if(strstr(line, "\"op\":\"event_get\"")) {
+        char id[80];
+        if(hunter_extract_string(line, "event_id", id, sizeof(id))) {
+            // Individual metadata delivery is implemented by scanning the compact JSONL
+            // index. Raw timing data is already embedded in each event record.
+            File* file = storage_file_alloc(hunter->storage);
+            if(storage_file_open(file, HUNTER_EVENTS_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+                char buf[448];
+                size_t n;
+                while((n = storage_file_read(file, buf, sizeof(buf) - 1)) > 0) {
+                    buf[n] = 0;
+                    char* line_start = buf;
+                    for(char* e = buf; e < buf + n; e++) {
+                        if(*e != '\n' && e != buf + n - 1) continue;
+                        char saved = *e;
+                        *e = 0;
+                        if(strstr(line_start, "\"event_id\":\"") && strstr(line_start, id)) {
+                            char frame[640];
+                            snprintf(frame, sizeof(frame), "{\"v\":1,\"op\":\"event_record\",\"event_id\":\"%s\",\"metadata\":%s}\n", id, line_start);
+                            hunter_ble_send(hunter, frame);
+                            break;
+                        }
+                        *e = saved;
+                        line_start = e + 1;
+                    }
+                }
+                storage_file_close(file);
+            }
+            storage_file_free(file);
+            hunter_ble_send(hunter, "{\"v\":1,\"op\":\"event_end\"}\n");
+        }
+    } else if(strstr(line, "\"op\":\"event_ack\"")) {
+        // The current event record is compact metadata; ACK is retained for future raw
+        // capture reclamation and is intentionally idempotent.
+        hunter_ble_send(hunter, "{\"v\":1,\"op\":\"ack\"}\n");
+    }
+}
+
+static void hunter_ble_drain(Hunter* hunter) {
+    uint8_t data[128];
+    size_t got;
+    while(hunter->ble_rx && (got = furi_stream_buffer_receive(hunter->ble_rx, data, sizeof(data), 0)) > 0) {
+        for(size_t i = 0; i < got; i++) {
+            char ch = (char)data[i];
+            if(ch == '\n' || ch == '\r') {
+                if(hunter->ble_line_len) {
+                    hunter->ble_line[hunter->ble_line_len] = 0;
+                    hunter_ble_handle(hunter, hunter->ble_line);
+                    hunter->ble_line_len = 0;
+                }
+            } else if(hunter->ble_line_len < sizeof(hunter->ble_line) - 1) {
+                hunter->ble_line[hunter->ble_line_len++] = ch;
+            }
+        }
+    }
+}
+
 static void hunter_draw(Canvas* canvas, void* context) {
     Hunter* hunter = context;
     canvas_clear(canvas);
@@ -232,6 +330,8 @@ int32_t rf_signal_hunter_app(void* context) {
     Hunter hunter = {0};
     hunter.gui = furi_record_open(RECORD_GUI);
     hunter.notifications = furi_record_open(RECORD_NOTIFICATION);
+    hunter.bt = furi_record_open(RECORD_BT);
+    hunter.ble_rx = furi_stream_buffer_alloc(4096, 1);
     hunter.storage = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(hunter.storage, HUNTER_EVENTS_DIR);
     hunter_load_identity(&hunter);
@@ -248,10 +348,18 @@ int32_t rf_signal_hunter_app(void* context) {
     gui_add_view_port(hunter.gui, hunter.viewport, GuiLayerFullscreen);
     hunter.running = true;
     hunter.mode = HunterModeScout;
+    bt_disconnect(hunter.bt);
+    furi_delay_ms(200);
+    bt_keys_storage_set_storage_path(hunter.bt, APP_DATA_PATH(".rf_hunter.keys"));
+    hunter.ble_params.rx_callback = hunter_ble_rx;
+    hunter.ble_params.rx_context = &hunter;
+    hunter.ble_profile = bt_profile_start(hunter.bt, rfhunter_ble_profile, &hunter.ble_params);
+    if(hunter.ble_profile) furi_hal_bt_start_advertising();
     view_port_update(hunter.viewport);
 
     while(hunter.running) {
         furi_delay_ms(250);
+        hunter_ble_drain(&hunter);
         if(hunter.receiver_active) {
             float rssi = furi_hal_subghz_get_rssi();
             if(hunter.rssi_samples == 0 || rssi < hunter.rssi_min) hunter.rssi_min = rssi;
@@ -283,12 +391,18 @@ int32_t rf_signal_hunter_app(void* context) {
         furi_hal_subghz_idle();
     }
     if(hunter.nfc_detect_active) furi_hal_nfc_field_detect_stop();
+    bt_disconnect(hunter.bt);
+    furi_delay_ms(200);
+    bt_keys_storage_set_default_path(hunter.bt);
+    if(!bt_profile_restore_default(hunter.bt)) FURI_LOG_E("RfHunter", "restore default BLE failed");
     notification_message(hunter.notifications, &sequence_reset_rgb);
     if(hunter.events_file) {
         storage_file_close(hunter.events_file);
         storage_file_free(hunter.events_file);
     }
     if(hunter.storage) furi_record_close(RECORD_STORAGE);
+    if(hunter.ble_rx) furi_stream_buffer_free(hunter.ble_rx);
+    if(hunter.bt) furi_record_close(RECORD_BT);
     gui_remove_view_port(hunter.gui, hunter.viewport);
     view_port_free(hunter.viewport);
     furi_record_close(RECORD_NOTIFICATION);
