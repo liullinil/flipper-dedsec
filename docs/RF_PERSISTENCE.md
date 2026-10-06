@@ -13,7 +13,10 @@ Each record now carries `captured_at_utc`, `captured_at_unix`,
 the RTC-calendar epoch minus the configured offset. Monotonic time starts at
 this application session, so changing the RTC does not change that ordering
 evidence. The hardware calendar has whole-second precision; the app does not
-invent subsecond RTC accuracy.
+invent subsecond RTC accuracy. Desktop import preserves both epochs and the
+offset, normalizes ISO timestamps to UTC and rejects an explicit epoch that
+disagrees with the calendar timestamp before acknowledgement. An offset-free
+legacy timestamp uses its recorded device offset.
 
 ## Retention
 
@@ -52,5 +55,5 @@ identifies the event but does not yet retain the timestamp/fingerprint summary
 required by specification section 9.2. The legacy `events.jsonl` mirror also
 still duplicates raw data; its removal or migration is required before claiming
 bounded post-ACK SD reclamation. These are explicit remaining work, not covered
-by the native tests above. Desktop epoch-field propagation is being integrated
-separately.
+by the native tests above. Desktop time conversion and epoch consistency are
+covered by `uplink/tests/test_rf_time.py`.

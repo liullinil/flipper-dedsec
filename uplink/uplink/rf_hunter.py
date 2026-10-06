@@ -11,7 +11,7 @@ import json
 import os
 import tempfile
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterator, Optional
 
 
@@ -57,6 +57,8 @@ class RfEvent:
     capture_blob: str = ""
     upload_state: str = "pending"
     timezone_offset_minutes: int = 0
+    captured_at_unix: Optional[float] = None
+    rtc_local_unix: Optional[int] = None
     pulse_timings_us: tuple = field(default_factory=tuple)
     event_id: str = ""
 
@@ -64,6 +66,24 @@ class RfEvent:
         if not self.event_id:
             self.event_id = event_id(self.device_uuid, self.session_id, self.sequence_number)
         self.pulse_timings_us = tuple(int(x) for x in self.pulse_timings_us)
+        self.timezone_offset_minutes = int(self.timezone_offset_minutes)
+        if not -14 * 60 <= self.timezone_offset_minutes <= 14 * 60:
+            raise ValueError("timezone offset is outside the supported UTC±14:00 range")
+        # Normalize once at the import boundary; selected display timezone is
+        # independent of the offset recorded by the capture device.
+        instant = datetime.fromisoformat(str(self.captured_at_utc).replace("Z", "+00:00"))
+        if instant.tzinfo is None:
+            instant = instant.replace(tzinfo=timezone(timedelta(minutes=self.timezone_offset_minutes)))
+        instant = instant.astimezone(timezone.utc)
+        self.captured_at_utc = instant.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        if self.captured_at_unix is None:
+            self.captured_at_unix = instant.timestamp()
+        else:
+            self.captured_at_unix = float(self.captured_at_unix)
+            if abs(self.captured_at_unix - instant.timestamp()) >= 1:
+                raise ValueError("UTC calendar timestamp and epoch disagree")
+        if self.rtc_local_unix is not None:
+            self.rtc_local_unix = int(self.rtc_local_unix)
 
     def to_dict(self):
         data = asdict(self)
@@ -78,6 +98,9 @@ class RfEvent:
             data["device_uuid"] = data["device_id"]
         if not data.get("captured_at_utc") and data.get("captured_at"):
             data["captured_at_utc"] = data["captured_at"]
+        if not data.get("captured_at_utc") and data.get("captured_at_unix") is not None:
+            data["captured_at_utc"] = datetime.fromtimestamp(
+                float(data["captured_at_unix"]), tz=timezone.utc).isoformat()
         if "rssi_dbm" in data:
             value = float(data.get("rssi_dbm") or 0)
             data.setdefault("rssi_min_dbm", value)
