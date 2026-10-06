@@ -47,8 +47,8 @@ def validate_capture_blob(value: str, root: str = "") -> str:
     if normalized in (".", "") or normalized == os.pardir or normalized.startswith(os.pardir + os.sep):
         raise ValueError("unsafe RF capture path")
     if root:
-        root_abs = os.path.abspath(os.fspath(root))
-        candidate = os.path.abspath(os.path.join(root_abs, normalized))
+        root_abs = os.path.realpath(os.path.abspath(os.fspath(root)))
+        candidate = os.path.realpath(os.path.join(root_abs, normalized))
         try:
             common = os.path.commonpath((root_abs, candidate))
         except ValueError:
