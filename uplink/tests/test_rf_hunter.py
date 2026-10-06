@@ -136,6 +136,21 @@ def test_store_loads_api_889_per_event_journal_and_ack_receipt(tmp_path):
     assert loaded.events[uploaded.event_id].upload_state == "uploaded"
 
 
+def test_receipt_only_event_is_not_resurrected_on_per_event_flush(tmp_path):
+    events_dir = tmp_path / "events"
+    receipts_dir = tmp_path / "receipts"
+    events_dir.mkdir()
+    receipts_dir.mkdir()
+    uploaded = _event(11)
+    uploaded.upload_state = "uploaded"
+    receipt = receipts_dir / f"{uploaded.event_id}.ack"
+    receipt.write_text(__import__("json").dumps(uploaded.to_dict()), encoding="utf-8")
+    loaded = EventStore(tmp_path)
+    loaded._flush()
+    assert not (events_dir / f"{uploaded.event_id}.json").exists()
+    assert receipt.exists()
+
+
 def test_store_rejects_capture_path_traversal(tmp_path):
     event = _event(10, capture_blob="../outside.bin")
     with pytest.raises(ValueError, match="unsafe RF capture path"):

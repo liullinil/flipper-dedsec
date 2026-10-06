@@ -395,6 +395,11 @@ class EventStore:
                 except ValueError:
                     continue
                 path = os.path.join(self.events_dir, event_id_value + ".json")
+                # A reclaimed FAP event may survive only as a compact ACK
+                # receipt.  Do not resurrect a full event file merely because
+                # another record in the same store was flushed.
+                if event.upload_state == "uploaded" and not os.path.exists(path):
+                    continue
                 fd, tmp = tempfile.mkstemp(prefix=event_id_value + ".", suffix=".tmp", dir=self.events_dir)
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
