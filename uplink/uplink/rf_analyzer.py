@@ -257,7 +257,8 @@ class AnalyzerProject:
     def export_csv(self, path, events: Optional[Iterable[RfEvent]] = None):
         rows = list(events if events is not None else self.events.values())
         fields = ["event_id", "device_uuid", "session_id", "sequence_number", "captured_at_utc",
-                  "source_type", "frequency_hz", "modulation", "rssi_avg_dbm", "duration_us",
+                  "source_type", "frequency_hz", "modulation", "nfc_technology", "nfc_protocol",
+                  "nfc_field_duration_ms", "rssi_avg_dbm", "duration_us",
                   "family_id", "fingerprint_id", "classification", "upload_state"]
         with open(path, "w", encoding="utf-8", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=fields)
@@ -490,8 +491,15 @@ class RfHunterApp:
 
     def show_event(self, event):
         self._selected_event = event.event_id
+        nfc_details = ""
+        if event.source_type == "nfc":
+            nfc_details = (f"NFC {event.nfc_technology or 'unknown'} / "
+                           f"{event.nfc_protocol or 'unknown'}\n"
+                           f"Field interval {event.nfc_field_duration_ms} ms · "
+                           f"observations {event.nfc_field_count}\n")
         data = (f"Event {event.event_id}\nDevice {event.device_uuid}\nSession {event.session_id}\n"
                 f"{event.captured_at_utc}\n{event.frequency_hz / 1e6:.3f} MHz · {event.modulation}\n"
+                f"{nfc_details}"
                 f"RSSI {event.rssi_avg_dbm:.1f} dBm · duration {event.duration_us} us\n"
                 f"Family {self.project.family_key(event)}\nPulse timings {len(event.pulse_timings_us)} samples\n"
                 f"Raw capture {len(self.project.capture_bytes(event))} bytes\n"
