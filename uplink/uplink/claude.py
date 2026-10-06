@@ -14,7 +14,8 @@ import os
 import time
 
 from .common import (Session, JsonlTail, AttentionCounter, parse_ts, recent_files, utf8_text,
-                     strip_md, short_key, WORKING, APPROVAL, YOUR_TURN, IDLE, ORDER)
+                     strip_md, short_key, revision_token, join_text, WORKING, APPROVAL,
+                     YOUR_TURN, IDLE, ORDER)
 
 HOOK_EVENTS = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "DedSecUplink", "claude_events.jsonl")
@@ -61,6 +62,16 @@ def _first_line(text):
     return out
 
 
+def _report(text, limit=220):
+    """Keep the useful body of the latest agent report for the detail view."""
+    parts = []
+    for line in (text or "").splitlines():
+        line = line.strip(" #*-")
+        if line:
+            parts.append(line)
+    return " ".join(parts)[:limit]
+
+
 def describe_tool(name, inp):
     inp = inp if isinstance(inp, dict) else {}
     if name == "Bash" or name == "PowerShell":
@@ -90,10 +101,14 @@ class ClaudeSession:
         self.mode = ""
         self.turn_open = False
         self.turn_end = 0.0
+        self.turn_id = ""
+        self.turn_serial = 0
         self.last_ts = 0.0
         self.pending = {}       # tool_use id -> (name, input, ts)
         self.activity = ""
         self.last_text = ""
+        self.text_parts = []
+        self.final_text = ""
         self.todo = (0, 0, "")
 
     def feed(self, entries):
@@ -125,6 +140,8 @@ class ClaudeSession:
         self.turn_open = False
         self.turn_end = ts or self.last_ts
         self.pending.clear()
+        self.final_text = join_text(self.text_parts) or self.final_text
+        self.last_text = self.final_text
 
     def _user(self, o, ts):
         content = (o.get("message") or {}).get("content")
@@ -142,14 +159,24 @@ class ClaudeSession:
             return
         if o.get("isMeta"):
             return
+        self.turn_serial += 1
+        self.turn_id = str(o.get("turn_id") or self.turn_serial)
         self.turn_open = True
         self.pending.clear()
+        self.text_parts = []
+        self.activity = ""
         if text and not text.lstrip().startswith("<"):
             self.last_prompt = text
 
     def _assistant(self, o, ts):
         msg = o.get("message") or {}
-        for b in msg.get("content") or []:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        blocks = list(content) if isinstance(content, list) else ([content] if content else [])
+        if isinstance(msg, dict) and msg.get("text"):
+            blocks.append({"type": "text", "text": msg["text"]})
+        for b in blocks:
+            if isinstance(b, str):
+                b = {"type": "text", "text": b}
             if not isinstance(b, dict):
                 continue
             if b.get("type") == "tool_use":
@@ -165,7 +192,8 @@ class ClaudeSession:
                     self.activity = describe_tool(name, inp)
                 self.turn_open = True
             elif b.get("type") == "text" and b.get("text", "").strip():
-                self.last_text = b["text"]
+                self.text_parts.append(b["text"])
+                self.last_text = join_text(self.text_parts)
         if msg.get("stop_reason") == "end_turn":
             self._end(ts)
 
@@ -208,7 +236,14 @@ class ClaudeSession:
             return self.asking() or self.permission_wait(now)
         if st == WORKING:
             return self.todo[2] or self.activity or "thinking"
-        return _first_line(strip_md(self.last_text)) or self.activity
+        return _report(strip_md(self.final_text or self.last_text)) or self.activity
+
+    def body(self, st):
+        if st == APPROVAL:
+            return self.asking() or self.permission_wait(time.time())
+        if st == WORKING:
+            return self.todo[2] or self.activity or "thinking"
+        return strip_md(self.final_text or self.last_text) or self.activity
 
 
 class ClaudeWatcher:
@@ -228,7 +263,7 @@ class ClaudeWatcher:
         event, ts, message = ev
         moved_on = cs.last_ts > ts + 3   # Claude did things after the hook fired -> hook is stale
         if event == "Stop" and not moved_on and now - ts < YOUR_TURN_FOR:
-            return YOUR_TURN, detail
+            return YOUR_TURN, cs.body(YOUR_TURN) or detail
         if event == "Notification" and not moved_on:
             return APPROVAL, strip_md(message) or "needs your attention"
         if event == "UserPromptSubmit" and not moved_on:
@@ -260,12 +295,20 @@ class ClaudeWatcher:
             st = cs.state(now)
             detail = cs.detail(st, now)
             st, detail = self._hook_state(cs, st, detail, now)
-            s = Session(key=short_key(cs.id), name=utf8_text(cs.name(), 24), state=st,
-                        detail=utf8_text(detail, 60), last_ts=cs.last_ts)
+            full_name = cs.name()
+            body = detail if st == APPROVAL and detail else cs.body(st)
+            s = Session(key=short_key(cs.id), name=utf8_text(full_name, 24), state=st,
+                        detail=utf8_text(body, 220), last_ts=cs.last_ts,
+                        body=body, revision=revision_token(cs.turn_id or cs.id, body),
+                        full_name=full_name)
             s.done, s.total = cs.todo[0], cs.todo[1]
             if st not in (WORKING, APPROVAL) and s.done == s.total:
                 s.done = s.total = 0     # finished checklist: show age instead
             s.attn = self.attn.update(s.key, st)
+            # Keep idle state in the counter so a later attention transition is
+            # still detected, but omit quiet sessions from the Flipper list.
+            if st == IDLE:
+                continue
             rows.append(s)
         rows.sort(key=lambda s: (ORDER.get(s.state, 9), -s.last_ts))
         return rows

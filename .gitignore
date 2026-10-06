@@ -5,6 +5,8 @@ backup/
 # Build artifacts
 apps/dedsec_uplink/dist/
 apps/dedsec_uplink/.vscode/
+apps/*/dist/
+apps/*/.vscode/
 **/__pycache__/
 *.pyc
 
@@ -15,3 +17,6 @@ scratchpad/
 # companion build output (the .exe is attached to releases)
 uplink/build/
 uplink/dist_exe/
+uplink/dist/
+uplink/DedSecUplink.spec
+uplink/DedSecUplinkConsole.spec

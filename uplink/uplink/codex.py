@@ -13,7 +13,8 @@ import os
 import time
 
 from .common import (Session, JsonlTail, AttentionCounter, parse_ts, recent_files, utf8_text,
-                     strip_md, short_key, WORKING, APPROVAL, YOUR_TURN, IDLE, ORDER)
+                     strip_md, short_key, revision_token, join_text, WORKING, APPROVAL,
+                     YOUR_TURN, IDLE, ORDER)
 
 ACTIVE_WINDOW = 3 * 3600    # rollout files touched within this window are watched
 YOUR_TURN_FOR = 20 * 60     # a finished turn counts as "your turn" this long
@@ -34,6 +35,16 @@ def _first_line(text):
     return out
 
 
+def _report(text, limit=220):
+    """Keep the useful body of the latest agent report for the detail view."""
+    parts = []
+    for line in (text or "").splitlines():
+        line = line.strip(" #*-")
+        if line:
+            parts.append(line)
+    return " ".join(parts)[:limit]
+
+
 class Thread:
     def __init__(self, path):
         self.tail = JsonlTail(path)
@@ -45,11 +56,14 @@ class Thread:
         self.cwd = ""
         self.turn_open = False
         self.turn_end = 0.0
+        self.turn_id = ""
+        self.turn_serial = 0
         self.last_ts = 0.0
         self.question = ""
         self.approval = ""
         self.activity = ""
         self.final = ""
+        self.response_parts = []
 
     @property
     def is_sub(self):
@@ -84,12 +98,15 @@ class Thread:
         t = p.get("type", "")
         if t == "task_started":
             self.turn_open = True
+            self.turn_serial += 1
+            self.turn_id = str(p.get("turn_id") or p.get("root_turn_id") or self.turn_serial)
             self.question = ""
             self.final = ""
+            self.response_parts = []
         elif t == "task_complete":
             self.turn_open = False
             self.turn_end = ts or self.last_ts
-            self.final = strip_md(p.get("last_agent_message") or "")
+            self.final = join_text(self.response_parts + [p.get("last_agent_message") or ""])
             self.approval = ""
         elif t == "turn_aborted":
             self.turn_open = False
@@ -125,7 +142,21 @@ class Thread:
 
     def _response(self, p):
         t = p.get("type")
-        if t == "reasoning":
+        if t == "message" and p.get("role", "assistant") == "assistant":
+            content = p.get("content")
+            parts = []
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") in ("output_text", "text") and block.get("text"):
+                        parts.append(block["text"])
+            elif isinstance(content, str):
+                parts.append(content)
+            elif p.get("text"):
+                parts.append(p["text"])
+            self.response_parts.extend(parts)
+        elif t == "reasoning":
             summary = p.get("summary") or []
             if summary and isinstance(summary[-1], dict):
                 self.activity = strip_md(summary[-1].get("text", ""))
@@ -226,15 +257,27 @@ class CodexWatcher:
                         last_ts=max([t.last_ts] + [k.last_ts for k in children]))
             s.total = len(children)
             s.done = len(children) - len(busy)
-            s.detail = utf8_text(self._detail(t, st, busy), 60)
+            body = self._body(t, st, busy)
+            s.detail = utf8_text(body, 220)
+            s.body = body
+            s.revision = revision_token(t.turn_id or t.id, body)
+            s.full_name = name
             s.attn = self.attn.update(s.key, st)
+            # Idle sessions stay tracked for attention transitions, but do not
+            # consume one of the small Flipper list slots.
+            if st == IDLE:
+                continue
             subs = []
             for k in busy:
                 ks = Session(key=short_key(k.id),
                              name=utf8_text("- " + (k.agent_path.rsplit("/", 1)[-1] or "agent")
                                             + (" " + k.nickname if k.nickname else ""), 24),
                              state=k.state(now), last_ts=k.last_ts,
-                             detail=utf8_text(k.activity, 60))
+                             detail=utf8_text(k.activity, 220))
+                ks.body = k.activity
+                ks.revision = revision_token(k.turn_id or k.id, k.activity)
+                ks.full_name = "- " + (k.agent_path.rsplit("/", 1)[-1] or "agent") + (
+                    " " + k.nickname if k.nickname else "")
                 ks.attn = self.attn.update(ks.key, ks.state)
                 subs.append(ks)
             rows.append((s, subs))
@@ -247,7 +290,7 @@ class CodexWatcher:
         return out
 
     @staticmethod
-    def _detail(t, st, busy):
+    def _body(t, st, busy):
         if t.question:
             return "Q: " + t.question
         if t.approval:
@@ -259,4 +302,4 @@ class CodexWatcher:
                 return "agents: " + ", ".join(
                     (k.nickname or k.agent_path.rsplit("/", 1)[-1]) for k in busy)
             return t.activity or "working"
-        return _first_line(t.final) or t.activity
+        return t.final or t.activity

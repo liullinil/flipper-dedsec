@@ -1,130 +1,136 @@
-"""Persistent shell for the remote-cmd mode: one cmd.exe/PowerShell keeps cwd and env.
+"""Persistent interactive terminal for the remote CMD tab.
 
-Each command is wrapped with a unique sentinel echo so we can tell where its output ends and
-read its exit code. Output lines are pushed to a callback as they arrive; a KILL restarts the
-shell. ASCII-only, since the Flipper fonts can't show anything else.
-
-SECURITY: this runs whatever the Flipper sends as a shell command on this PC. The BLE link has
-no pairing, so anyone in Bluetooth range who knows the protocol could drive it. It is disabled
-unless explicitly enabled (Feed/app gate it), every command is logged, and output is capped.
+``Shell`` keeps the legacy callback API used by :mod:`uplink.app`, while ``Terminal`` owns
+the Windows ConPTY and pyte virtual screen.  There are no sentinel commands or setup writes
+queued into the child: an interactive program receives exactly the bytes the user sends.
 """
+
+from __future__ import annotations
+
 import logging
 import os
-import subprocess
 import threading
-import time
-import uuid
 
 from .common import utf8_text
+from .terminal import KEY_BYTES, Terminal
 
 log = logging.getLogger("uplink.shell")
 
-MAX_OUTPUT_LINES = 400       # per command, then we stop forwarding (process keeps running)
-MAX_RUNTIME = 120.0          # seconds before we auto-kill a command
 LINE_CHARS = 120
-PROMPT_ARG = "UPLINKPROMPT$G"   # cmd `prompt` argument; $G renders as ">"
-PROMPT_MARK = "UPLINKPROMPT>"   # what that prompt prints; filtered from output
+PROMPT_MARK = "UPLINKPROMPT>"
 
 
 class Shell:
+    """A persistent ConPTY shell with the old run/write/cancel surface."""
+
     def __init__(self, kind="cmd", on_output=None, on_exit=None, on_cwd=None):
         self.kind = kind
         self.on_output = on_output or (lambda seq, text: None)
         self.on_exit = on_exit or (lambda seq, code: None)
         self.on_cwd = on_cwd or (lambda cwd: None)
-        self.proc = None
+        self.terminal = None
+        self.proc = None  # compatibility alias; updated after ensure()
         self.reader = None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.seq = None
-        self.sentinel = ""
         self.started = 0.0
         self.lines = 0
         self.alive = False
         self.ready = threading.Event()
+        self.interactive = True
+        self._text_buffer = ""
+        self._await_prompt = False
+        self._prompt_seen = False
+        self._initial_prompt_pending = False
+        self._generation = 0
 
     # ------------------------------------------------------------------ process
     def _spawn(self):
-        if self.kind == "powershell":
-            argv = ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"]
-        else:
-            # marker prompt (filtered out below) so the ">" never glues onto real output;
-            # the sentinel echo is sent as its own line so %ERRORLEVEL% is the command's own
-            argv = ["cmd.exe", "/q", "/k", "prompt " + PROMPT_ARG + "$_"]
-        self.proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            cwd=os.path.expanduser("~"),
-            bufsize=1,
-            universal_newlines=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=0x08000000,  # CREATE_NO_WINDOW
+        terminal = Terminal(
+            self.kind,
+            on_output=self._on_terminal_output,
+            on_exit=self._on_terminal_exit,
         )
-        self.alive = True
-        self.ready.clear()
-        self.reader = threading.Thread(target=self._read_loop, daemon=True)
-        self.reader.start()
-        # prime: swallow the shell banner up to our sentinel before any real command
-        self.sentinel = "UPLINKxxPRIMExx"
-        self.seq = None
-        if self.kind == "powershell":
-            self.proc.stdin.write("Write-Output \"%s 0 $($PWD.Path)\"\n" % self.sentinel)
-        else:
-            # UTF-8 code page, so Cyrillic file names and messages reach the Flipper intact
-            self.proc.stdin.write("chcp 65001>nul\r\necho %s 0 %%CD%%\r\n" % self.sentinel)
-        self.proc.stdin.flush()
-        log.info("shell started (%s) pid %s", self.kind, self.proc.pid)
+        self.terminal = terminal
+        self._generation += 1
+        self._initial_prompt_pending = True
+        terminal.start()
+        self.proc = terminal.proc
+        self.alive = terminal.alive
+        self._text_buffer = ""
+        self._await_prompt = False
+        self._prompt_seen = True  # Terminal.start waits for cmd's environment prompt.
+        self.ready.set()
+        self.on_cwd(utf8_text(os.path.expanduser("~"), 120))
+        log.info("shell started (%s) (ConPTY)", self.kind)
 
     def ensure(self):
         with self.lock:
-            if self.proc is None or self.proc.poll() is not None:
+            if self.terminal is None or not self.terminal.alive:
                 self._spawn()
+            self.proc = self.terminal.proc if self.terminal else None
+            self.alive = bool(self.terminal and self.terminal.alive)
         self.ready.wait(3.0)
 
-    def _read_loop(self):
-        proc = self.proc
-        try:
-            for raw in proc.stdout:
-                line = raw.rstrip("\r\n")
-                if line == PROMPT_MARK:
-                    continue  # our own prompt line, never shown
-                with self.lock:
-                    seq, sentinel = self.seq, self.sentinel
-                if sentinel and sentinel in line:
-                    rest = line.split(sentinel, 1)[1].strip().split(None, 1)
-                    try:
-                        code = int(rest[0]) if rest else 0
-                    except ValueError:
-                        code = 0
-                    cwd = rest[1].strip() if len(rest) > 1 else ""
-                    with self.lock:
-                        was_seq = self.seq
-                        self.seq = None
-                        self.sentinel = ""
-                    if cwd:
-                        self.on_cwd(utf8_text(cwd, 120))
-                    if was_seq is None:
-                        self.ready.set()  # prime sentinel: banner consumed, ready for commands
-                    else:
-                        self.on_exit(was_seq, code)
+    # ------------------------------------------------------------------ output
+    def _on_terminal_output(self, text):
+        """Consume coalesced printable output and detect our environment prompt."""
+        with self.lock:
+            self._text_buffer += text
+            marker = PROMPT_MARK
+            while marker in self._text_buffer:
+                before, self._text_buffer = self._text_buffer.split(marker, 1)
+                # Terminal.start waits for this prompt, but the coalescing callback may
+                # deliver its bytes just after run() has assigned a sequence.  Consume
+                # that first prompt as startup output so it cannot finish the first command.
+                was_initial = self._initial_prompt_pending
+                self._initial_prompt_pending = False
+                if not was_initial:
+                    self._emit_text(before)
+                if was_initial:
                     continue
-                if seq is None:
-                    continue  # banner / idle output between commands
-                if not line.strip():
-                    continue  # collapse blank lines (the tiny console has no room for them)
-                with self.lock:
-                    self.lines += 1
-                    if self.lines > MAX_OUTPUT_LINES:
-                        if self.lines == MAX_OUTPUT_LINES + 1:
-                            self.on_output(seq, "...output truncated...")
-                        continue
-                for chunk in _wrap(utf8_text(line, 4000), LINE_CHARS):
-                    self.on_output(seq, chunk)
-        except Exception as exc:  # pipe closed on kill/restart
-            log.debug("reader stopped: %s", exc)
-        self.alive = False
+                if self._await_prompt and self.seq is not None:
+                    seq = self.seq
+                    self.seq = None
+                    self._await_prompt = False
+                    self._prompt_seen = True
+                    # Without writing a status query into stdin, cmd's prompt can only
+                    # provide a completion boundary; retain the stable success code.
+                    self.on_exit(seq, 0)
+                else:
+                    self._prompt_seen = True
+            if self.seq is not None:
+                # Keep a possible split prompt suffix; emit everything else immediately.
+                keep = max(0, len(marker) - 1)
+                if len(self._text_buffer) > keep:
+                    ready, self._text_buffer = self._text_buffer[:-keep], self._text_buffer[-keep:]
+                    self._emit_text(ready)
+            elif len(self._text_buffer) > 4096:
+                self._text_buffer = self._text_buffer[-(len(marker) - 1):]
+
+    def _emit_text(self, text):
+        if not text or self.seq is None:
+            return
+        text = text.replace("\r", "\n")
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line or line == ">>":
+                continue
+            for chunk in _wrap(utf8_text(line, 4000), LINE_CHARS):
+                self.lines += 1
+                self.on_output(self.seq, chunk)
+
+    def _on_terminal_exit(self, code):
+        with self.lock:
+            active = self.seq
+            self.seq = None
+            self._await_prompt = False
+            self.alive = False
+            self.proc = None
+            self.ready.set()
+        if active is not None:
+            self.on_output(active, "...shell exited...")
+            self.on_exit(active, code)
 
     # ------------------------------------------------------------------ commands
     def run(self, seq, command):
@@ -137,68 +143,103 @@ class Shell:
             if self.seq is not None:
                 self.on_output(seq, "busy: a command is already running (Back to stop)")
                 return
-            self.sentinel = "UPLINKxx%sxx" % uuid.uuid4().hex[:12]
             self.seq = seq
-            self.started = time.time()
             self.lines = 0
-            sentinel = self.sentinel
+            self._await_prompt = True
+            self._prompt_seen = False
+            terminal = self.terminal
         log.info("run seq=%s: %s", seq, command)
-        if self.kind == "powershell":
-            wrapped = "%s\nWrite-Output \"%s $LASTEXITCODE $($PWD.Path)\"\n" % (command, sentinel)
-        else:
-            # separate line for the sentinel -> %ERRORLEVEL% is THIS command's code
-            wrapped = "%s\r\necho %s %%ERRORLEVEL%% %%CD%%\r\n" % (command, sentinel)
         try:
-            self.proc.stdin.write(wrapped)
-            self.proc.stdin.flush()
+            terminal.write(command + "\r")
         except Exception as exc:
             log.warning("write failed: %s", exc)
             self.restart()
             self.on_exit(seq, -1)
 
-    def poll_timeout(self):
+    def write_input(self, seq, text):
+        """Write text followed by Enter to the active terminal command."""
         with self.lock:
-            running = self.seq is not None
-            started = self.started
-            seq = self.seq
-        if running and time.time() - started > MAX_RUNTIME:
-            log.warning("command seq=%s timed out, killing shell", seq)
-            self.on_output(seq, "...timed out, shell restarted...")
-            self.restart()
-            self.on_exit(seq, -1)
+            if self.seq != seq or self.terminal is None or not self.terminal.alive:
+                return False
+            terminal = self.terminal
+        try:
+            terminal.write(text + "\r")
+            return True
+        except Exception as exc:
+            log.warning("input write failed: %s", exc)
+            return False
+
+    def write_raw(self, seq, text):
+        """Write raw terminal bytes represented as a Python string."""
+        with self.lock:
+            if self.seq != seq or self.terminal is None or not self.terminal.alive:
+                return False
+            terminal = self.terminal
+        try:
+            terminal.write(text)
+            return True
+        except Exception as exc:
+            log.warning("raw input write failed: %s", exc)
+            return False
+
+    def write_key(self, seq, key):
+        if key not in KEY_BYTES:
+            raise ValueError(f"unknown terminal key: {key}")
+        return self.write_raw(seq, KEY_BYTES[key])
+
+    def poll_timeout(self):
+        # A terminal command may legitimately run forever.  The old two-minute watchdog
+        # would kill Codex while it is waiting for input, so this compatibility hook is now
+        # intentionally a no-op.
+        return None
 
     def cancel(self, seq):
         with self.lock:
             active = self.seq
-        if active is not None:
-            log.info("cancel seq=%s", seq)
-            self.restart()
-            self.on_output(active, "...cancelled...")
-            self.on_exit(active, -1)
+            terminal = self.terminal
+        if active is None or (seq and seq != active):
+            return
+        log.info("cancel seq=%s", active)
+        if terminal is not None:
+            try:
+                terminal.write_key("CtrlC")
+            except Exception:
+                pass
+        self.on_output(active, "...cancelled...")
+        self.restart()
+        self.on_exit(active, -1)
 
     def restart(self):
         with self.lock:
-            self.seq = None
-            self.sentinel = ""
-            proc = self.proc
+            terminal = self.terminal
+            self.terminal = None
             self.proc = None
-        if proc:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            self.alive = False
+            self.seq = None
+            self._await_prompt = False
+        if terminal is not None:
+            terminal.close(force=True)
         self.ensure()
 
     def stop(self):
         with self.lock:
-            proc = self.proc
+            terminal = self.terminal
+            self.terminal = None
             self.proc = None
             self.alive = False
-        if proc:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            self.seq = None
+            self._await_prompt = False
+        if terminal is not None:
+            terminal.close(force=True)
+
+    def terminal_page(self, top=-1, left=0, rows=5, cols=21):
+        with self.lock:
+            terminal = self.terminal
+        if terminal is None:
+            return {"lines": [""] * max(0, rows), "top": 0, "left": left,
+                    "rows": rows, "cols": cols, "total_rows": 0, "total_cols": 0,
+                    "cursor_row": 0, "cursor_col": 0, "revision": 0, "alive": False}
+        return terminal.terminal_page(top, left, rows, cols)
 
 
 def _wrap(text, width):

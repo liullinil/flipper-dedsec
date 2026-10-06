@@ -6,6 +6,8 @@ A Flipper Zero project in a Watch Dogs / DedSec style for **Unleashed firmware**
    a live PC monitor, a status board for your **Codex** and **Claude Code** sessions, and a
    pocket **cmd.exe**.
 2. **Desktop animations** — nine original 1-bit Watch Dogs style idle animations for the dolphin desktop.
+3. **RF Signal Hunter** — a passive Sub-GHz Scout vertical slice plus a desktop event store for
+   stable event IDs, structural fingerprints, family grouping and idempotent upload acknowledgements.
 
 ![DedSec Uplink screens](docs/uplink_screens.png)
 
@@ -51,6 +53,7 @@ Details, previews and how they rotate: **[assets/README.md](assets/README.md)**.
 | [`apps/dedsec_uplink`](apps/dedsec_uplink) | The Flipper app (C, built with `ufbt`) |
 | [`uplink`](uplink) | The Windows companion (Python; also built as a single `.exe`) |
 | [`assets`](assets) | Animation sources, built `.bm` frames, previews |
+| [`apps/rf_signal_hunter`](apps/rf_signal_hunter) | Passive Sub-GHz Scout FAP (RX only) |
 | [`tools`](tools) | Build scripts and Flipper USB helpers |
 
 ## Build from source

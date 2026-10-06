@@ -13,6 +13,7 @@
  *   Flipper -> PC (TX notify char):
  *     C|seq|command                            run this command
  *     K|seq                                    cancel the running command
+ *     T|seq|text                               send text to a running command's stdin
  * state: W working, A needs approval, I your turn, S idle, E error.
  */
 #include <furi.h>
@@ -39,7 +40,7 @@
 #define MAX_ITEMS    10
 #define HIST         62
 #define SEEN_MAX     40
-#define LINE_MAX     420
+#define LINE_MAX     600
 #define LAG_TICKS    (3 * 4)
 #define LINK_TICKS   (8 * 4)
 #define ALERT_TICKS  (5 * 4)
@@ -60,7 +61,7 @@ typedef struct {
     uint32_t age;
     uint32_t attn;
     char name[64];   // UTF-8
-    char detail[136]; // UTF-8
+    char detail[256]; // UTF-8
 } Item;
 
 typedef struct {
@@ -68,6 +69,7 @@ typedef struct {
     uint8_t count;
     uint8_t cursor;
     uint8_t scroll;
+    uint8_t detail_scroll;
 } List;
 
 typedef struct {
@@ -83,6 +85,7 @@ typedef struct {
 typedef struct {
     char key[8];
     uint32_t attn;
+    bool dismissed;
 } Seen;
 
 typedef struct {
@@ -182,6 +185,9 @@ static void uplink_notify(App* app, NotifyKind kind) {
     int pulses = 1;
     bool longp = false;
     bool vib = s->vibro;
+    // The LED is reserved for agent attention (approval or your turn). Other
+    // notifications may still wake the screen or vibrate, but must stay quiet.
+    bool led = s->led && (kind == NotifyApproval || kind == NotifyYourTurn);
     switch(kind) {
     case NotifyApproval:
         on = &message_red_255;
@@ -218,11 +224,11 @@ static void uplink_notify(App* app, NotifyKind kind) {
     if(s->backlight) seq[n++] = &message_display_backlight_on;
     if(vib) seq[n++] = &message_force_vibro_setting_on;
     for(int i = 0; i < pulses; i++) {
-        if(s->led) seq[n++] = on;
+        if(led) seq[n++] = on;
         if(vib) seq[n++] = &message_vibro_on;
         seq[n++] = longp ? &message_delay_250 : &message_delay_100;
         if(vib) seq[n++] = &message_vibro_off;
-        if(s->led) seq[n++] = off;
+        if(led) seq[n++] = off;
         if(i + 1 < pulses) seq[n++] = &message_delay_100;
     }
     if(vib) seq[n++] = &message_force_vibro_setting_off;
@@ -323,10 +329,20 @@ static void draw_str_fit(Canvas* c, int x, int y, const char* s, int max_w) {
     canvas_draw_str_aligned(c, x, y, AlignLeft, AlignTop, buf);
 }
 
-static void draw_wrapped(Canvas* c, int x, int y, int w, const char* text, int lines, int step) {
+static int draw_wrapped_scroll(
+    Canvas* c,
+    int x,
+    int y,
+    int w,
+    const char* text,
+    int lines,
+    int step,
+    int skip) {
     char buf[128];
     const char* p = text;
-    for(int ln = 0; ln < lines && *p; ln++) {
+    int total = 0;
+    int drawn = 0;
+    while(*p) {
         while(*p == ' ')
             p++;
         if(!*p) break;
@@ -341,12 +357,17 @@ static void draw_wrapped(Canvas* c, int x, int y, int w, const char* text, int l
             if(p[n] == ' ' || p[n] == 0) best = n;
         }
         if(n == 0) n = utf8_len_at(p); // a single glyph wider than the line: show it anyway
-        if(best == 0 || (ln == lines - 1 && p[best])) best = n;
-        memcpy(buf, p, best);
-        buf[best] = 0;
-        canvas_draw_str_aligned(c, x, y + ln * step, AlignLeft, AlignTop, buf);
+        if(best == 0 || (total >= skip && drawn == lines - 1 && p[best])) best = n;
+        if(total >= skip && drawn < lines) {
+            memcpy(buf, p, best);
+            buf[best] = 0;
+            canvas_draw_str_aligned(c, x, y + drawn * step, AlignLeft, AlignTop, buf);
+            drawn++;
+        }
         p += best;
+        total++;
     }
+    return total;
 }
 
 static const char* state_text(char st) {
@@ -368,10 +389,64 @@ static Kind screen_kind(ScreenId s) {
     return s == ScreenClaude ? KindClaude : KindCodex;
 }
 
-static bool list_attention(const List* l) {
+static Seen* seen_find(App* app, const char* key);
+
+static bool item_attention(const App* app, const Item* it) {
+    if(it->state == 'A') return true;
+    if(it->state != 'I') return false;
+    for(uint8_t i = 0; i < app->seen_n; i++) {
+        const Seen* seen = &app->seen[i];
+        if(!strcmp(seen->key, it->key)) return !seen->dismissed;
+    }
+    return true;
+}
+
+static bool list_attention(const App* app, Kind kind) {
+    const List* l = &app->lists[kind];
     for(uint8_t i = 0; i < l->count; i++)
-        if(l->items[i].state == 'A' || l->items[i].state == 'I') return true;
+        if(item_attention(app, &l->items[i])) return true;
     return false;
+}
+
+static void dismiss_item(App* app, const Item* it) {
+    if(it->state != 'I') return;
+    Seen* seen = seen_find(app, it->key);
+    if(seen) seen->dismissed = true;
+}
+
+static bool item_visible(const App* app, const Item* it) {
+    if(it->state == 'S') return false; // quiet/idle sessions do not occupy the list
+    if(it->state == 'I') {
+        const Seen* seen = seen_find((App*)app, it->key);
+        if(seen && seen->dismissed) return false;
+    }
+    return true;
+}
+
+static uint8_t visible_count(const App* app, Kind kind) {
+    const List* l = &app->lists[kind];
+    uint8_t n = 0;
+    for(uint8_t i = 0; i < l->count; i++)
+        if(item_visible(app, &l->items[i])) n++;
+    return n;
+}
+
+static int visible_raw_index(const App* app, Kind kind, uint8_t ordinal) {
+    const List* l = &app->lists[kind];
+    uint8_t n = 0;
+    for(uint8_t i = 0; i < l->count; i++) {
+        if(!item_visible(app, &l->items[i])) continue;
+        if(n++ == ordinal) return i;
+    }
+    return -1;
+}
+
+static uint8_t visible_ordinal(const App* app, Kind kind, uint8_t raw) {
+    const List* l = &app->lists[kind];
+    uint8_t n = 0;
+    for(uint8_t i = 0; i < l->count && i <= raw; i++)
+        if(item_visible(app, &l->items[i])) n++;
+    return n ? n - 1 : 0;
 }
 
 static void rebuild_tabs(App* app) {
@@ -438,11 +513,13 @@ static void track_attention(App* app, Kind kind, const Item* it) {
         s = &app->seen[app->seen_n++];
         clean_copy(s->key, sizeof(s->key), it->key);
         s->attn = it->attn;
+        s->dismissed = false;
         if(it->state == 'A') raise_alert(app, kind, it);
         return;
     }
     if(it->attn > s->attn) {
         s->attn = it->attn;
+        s->dismissed = false;
         if(it->state == 'A' || it->state == 'I') raise_alert(app, kind, it);
     }
 }
@@ -672,7 +749,7 @@ static void draw_header(Canvas* c, App* app) {
         bool active = (i == app->tab_index);
         bool attn = false;
         if(sid == ScreenCodex || sid == ScreenClaude)
-            attn = list_attention(&app->lists[screen_kind(sid)]);
+            attn = list_attention(app, screen_kind(sid));
         else if(sid == ScreenCmd)
             attn = app->cmd.unseen || app->cmd.running;
         bool lit = active || (attn && (app->tick & 2));
@@ -685,9 +762,9 @@ static void draw_header(Canvas* c, App* app) {
         if(attn && !active) canvas_draw_str_aligned(c, x + tabw - 3, 1, AlignCenter, AlignTop, "!");
     }
     bg(c);
-    bool lag = app->tick - app->last_rx_tick > LAG_TICKS;
-    canvas_draw_str_aligned(
-        c, 126, 1, AlignRight, AlignTop, !app->link ? "OFF" : (lag ? "LAG" : "LINK"));
+    // The rightmost header cell is a real settings entry point: Right from the last
+    // configured tab opens the same settings view as holding OK.
+    canvas_draw_str_aligned(c, 126, 1, AlignRight, AlignTop, "SET");
     fg(c);
 }
 
@@ -779,11 +856,14 @@ static void draw_glyph(Canvas* c, int x, int y, char st, uint32_t tick) {
 
 static void draw_list(Canvas* c, App* app, Kind k) {
     List* l = &app->lists[k];
+    uint8_t total_visible = visible_count(app, k);
+    if(l->cursor >= total_visible) l->cursor = total_visible ? total_visible - 1 : 0;
+    if(l->scroll > l->cursor) l->scroll = l->cursor;
     bool large = app->settings.font == FontLarge;
     int rows = large ? 4 : 5;
     int rh = large ? 13 : 10;
     canvas_set_font(c, FontSecondary);
-    if(!l->count) {
+    if(!total_visible) {
         canvas_draw_str_aligned(c, 64, 26, AlignCenter, AlignTop, "NO ACTIVE SESSIONS");
         canvas_draw_str_aligned(
             c, 64, 38, AlignCenter, AlignTop, k == KindCodex ? "codex is quiet" : "claude is quiet");
@@ -791,10 +871,11 @@ static void draw_list(Canvas* c, App* app, Kind k) {
     }
     if(l->cursor < l->scroll) l->scroll = l->cursor;
     if(l->cursor >= l->scroll + rows) l->scroll = l->cursor - rows + 1;
-    bool bar = l->count > rows;
+    bool bar = total_visible > rows;
     int right_edge = bar ? 123 : 126;
-    for(int r = 0; r < rows && l->scroll + r < l->count; r++) {
-        int i = l->scroll + r;
+    for(int r = 0; r < rows && l->scroll + r < total_visible; r++) {
+        int i = visible_raw_index(app, k, l->scroll + r);
+        if(i < 0) break;
         Item* it = &l->items[i];
         int y = 11 + r * rh;
         draw_glyph(c, 2, y + (large ? 3 : 1), it->state, app->tick);
@@ -808,7 +889,7 @@ static void draw_list(Canvas* c, App* app, Kind k) {
         canvas_draw_str_aligned(c, right_edge, y + 2, AlignRight, AlignTop, right);
         font_text(c);
         draw_str_fit(c, 12, y + (large ? 2 : 0), it->name, right_edge - rw - 15);
-        if(i == l->cursor) {
+        if(r == l->cursor) {
             canvas_set_color(c, ColorXOR);
             canvas_draw_box(c, 0, y, right_edge + 2, rh);
             fg(c);
@@ -816,8 +897,8 @@ static void draw_list(Canvas* c, App* app, Kind k) {
     }
     if(bar) {
         int track = rh * rows;
-        int h = track * rows / l->count;
-        int y = 11 + (track - h) * l->scroll / (l->count - rows);
+        int h = track * rows / total_visible;
+        int y = 11 + (track - h) * l->scroll / (total_visible - rows);
         canvas_draw_line(c, 126, 11, 126, 11 + track);
         canvas_draw_box(c, 125, y, 3, h);
     }
@@ -825,11 +906,17 @@ static void draw_list(Canvas* c, App* app, Kind k) {
 
 static void draw_detail(Canvas* c, App* app, Kind k) {
     List* l = &app->lists[k];
-    if(l->cursor >= l->count) {
+    uint8_t total_visible = visible_count(app, k);
+    if(l->cursor >= total_visible) {
         app->detail = false;
         return;
     }
-    Item* it = &l->items[l->cursor];
+    int raw = visible_raw_index(app, k, l->cursor);
+    if(raw < 0) {
+        app->detail = false;
+        return;
+    }
+    Item* it = &l->items[raw];
     font_text(c);
     draw_str_fit(c, 2, 11, it->name, 124);
     canvas_set_font(c, FontSecondary);
@@ -853,7 +940,18 @@ static void draw_detail(Canvas* c, App* app, Kind k) {
         y += 9;
     }
     font_text(c);
-    draw_wrapped(c, 2, y, 124, it->detail, (64 - y) / 9, 9);
+    int rows = (64 - y) / 9;
+    if(rows > 0) {
+        int total = draw_wrapped_scroll(c, 2, y, 124, it->detail, 0, 9, UINT8_MAX);
+        int max_scroll = total > rows ? total - rows : 0;
+        if(l->detail_scroll > max_scroll) l->detail_scroll = max_scroll;
+        draw_wrapped_scroll(c, 2, y, 124, it->detail, rows, 9, l->detail_scroll);
+        if(max_scroll) {
+            canvas_set_font(c, FontSecondary);
+            canvas_draw_str_aligned(c, 126, 55, AlignCenter, AlignTop,
+                                    l->detail_scroll < max_scroll ? "v" : "^");
+        }
+    }
 }
 
 static void draw_cmd(Canvas* c, App* app) {
@@ -1060,7 +1158,8 @@ static void open_alert_target(App* app) {
             for(uint8_t i = 0; i < l->count; i++)
                 if(!strcmp(l->items[i].key, app->alert_key)) {
                     app->tab_index = t;
-                    l->cursor = i;
+                    l->cursor = visible_ordinal(app, app->alert_kind, i);
+                    l->detail_scroll = 0;
                     app->detail = true;
                     break;
                 }
@@ -1123,11 +1222,22 @@ static bool main_input(InputEvent* in, void* context) {
     switch(in->key) {
     case InputKeyLeft:
         app->detail = false;
+        if(screen == ScreenCodex || screen == ScreenClaude)
+            app->lists[screen_kind(screen)].detail_scroll = 0;
         app->tab_index = (app->tab_index + app->tab_count - 1) % app->tab_count;
         break;
     case InputKeyRight:
         app->detail = false;
-        app->tab_index = (app->tab_index + 1) % app->tab_count;
+        if(screen == ScreenCodex || screen == ScreenClaude)
+            app->lists[screen_kind(screen)].detail_scroll = 0;
+        if(app->tab_index + 1 >= app->tab_count) {
+            furi_mutex_release(app->mutex);
+            build_settings(app);
+            variable_item_list_set_selected_item(app->settings_view, 0);
+            go_view(app, ViewSettings);
+            return true;
+        }
+        app->tab_index++;
         break;
     case InputKeyUp:
         if(screen == ScreenCmd) {
@@ -1135,6 +1245,9 @@ static bool main_input(InputEvent* in, void* context) {
         } else if((screen == ScreenCodex || screen == ScreenClaude) && !app->detail) {
             List* l = &app->lists[screen_kind(screen)];
             if(l->cursor > 0) l->cursor--;
+        } else if((screen == ScreenCodex || screen == ScreenClaude) && app->detail) {
+            List* l = &app->lists[screen_kind(screen)];
+            if(l->detail_scroll > 0) l->detail_scroll--;
         }
         break;
     case InputKeyDown:
@@ -1142,7 +1255,11 @@ static bool main_input(InputEvent* in, void* context) {
             if(app->cmd.scroll > 0) app->cmd.scroll--;
         } else if((screen == ScreenCodex || screen == ScreenClaude) && !app->detail) {
             List* l = &app->lists[screen_kind(screen)];
-            if(l->cursor + 1 < l->count) l->cursor++;
+            uint8_t n = visible_count(app, screen_kind(screen));
+            if(l->cursor + 1 < n) l->cursor++;
+        } else if((screen == ScreenCodex || screen == ScreenClaude) && app->detail) {
+            List* l = &app->lists[screen_kind(screen)];
+            if(l->detail_scroll < 255) l->detail_scroll++;
         }
         break;
     case InputKeyOk:
@@ -1152,13 +1269,29 @@ static bool main_input(InputEvent* in, void* context) {
             open_keyboard(app);
             return true;
         } else if(screen == ScreenCodex || screen == ScreenClaude) {
-            if(app->lists[screen_kind(screen)].count) app->detail = !app->detail;
+            List* l = &app->lists[screen_kind(screen)];
+            uint8_t n = visible_count(app, screen_kind(screen));
+            if(n) {
+                if(app->detail) {
+                    int raw = visible_raw_index(app, screen_kind(screen), l->cursor);
+                    if(raw >= 0) dismiss_item(app, &l->items[raw]);
+                    app->detail = false;
+                } else {
+                    app->detail = true;
+                    l->detail_scroll = 0;
+                }
+            }
         }
         break;
     case InputKeyBack:
-        if(app->detail)
+        if(app->detail) {
+            if(screen == ScreenCodex || screen == ScreenClaude) {
+                List* l = &app->lists[screen_kind(screen)];
+                int raw = visible_raw_index(app, screen_kind(screen), l->cursor);
+                if(raw >= 0) dismiss_item(app, &l->items[raw]);
+            }
             app->detail = false;
-        else if(screen == ScreenCmd && app->cmd.running) {
+        } else if(screen == ScreenCmd && app->cmd.running) {
             char msg[16];
             snprintf(msg, sizeof(msg), "K|%u", app->cmd.seq);
             uplink_send(app, msg);
@@ -1180,15 +1313,21 @@ static void keyboard_done(void* context) {
     App* app = context;
     furi_mutex_acquire(app->mutex, FuriWaitForever);
     if(strlen(app->cmd.input) > 0) {
-        app->cmd.seq++;
-        app->cmd.running = true;
-        app->cmd.have_exit = false;
-        app->cmd.scroll = 0;
-        char shown[CMD_INPUT + 4];
-        snprintf(shown, sizeof(shown), "> %s", app->cmd.input);
-        cmd_push(app, shown);
         char out[CMD_INPUT + 16];
-        snprintf(out, sizeof(out), "C|%u|%s", app->cmd.seq, app->cmd.input);
+        if(app->cmd.running) {
+            // A running command owns the persistent shell.  Feed the keyboard text to
+            // its stdin instead of queuing a second command (the companion appends Enter).
+            snprintf(out, sizeof(out), "T|%u|%s", app->cmd.seq, app->cmd.input);
+        } else {
+            app->cmd.seq++;
+            app->cmd.running = true;
+            app->cmd.have_exit = false;
+            app->cmd.scroll = 0;
+            char shown[CMD_INPUT + 4];
+            snprintf(shown, sizeof(shown), "> %s", app->cmd.input);
+            cmd_push(app, shown);
+            snprintf(out, sizeof(out), "C|%u|%s", app->cmd.seq, app->cmd.input);
+        }
         uplink_send(app, out);
     }
     furi_mutex_release(app->mutex);

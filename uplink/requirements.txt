@@ -2,3 +2,5 @@ bleak==0.22.3
 pystray
 psutil
 pillow
+pywinpty==2.0.15
+pyte>=0.8.2

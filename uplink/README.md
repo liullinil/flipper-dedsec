@@ -20,8 +20,11 @@ Target: Flipper Zero on Unleashed `unlshd-093c` (API 88.9), Windows 10/11 with B
   appear as `- name nickname` rows under their root; the root shows `done/total` sub-agents.
 - **CLD** — Claude Code sessions (CLI and the Code tab of Claude Desktop); progress from the todo list.
 - **CMD** — remote shell. Type a command on the Flipper, it runs on the PC, the output and `[exit N]` come back.
+  On Windows the companion uses a ConPTY pseudo-terminal, so interactive programs such as `codex`
+  can start. While a command is running, press OK again to send another line to its stdin.
 
-Status icons: spinner = working · blinking `!` = needs your answer or approval · `>_` = your turn · square = idle.
+Status icons: spinner = working · blinking `!` = needs your answer or approval · `>_` = your turn.
+Quiet idle sessions are omitted from the lists.
 Session names, details and console output support **Cyrillic**.
 
 ## Controls
@@ -62,9 +65,12 @@ persistent `cmd.exe` on the PC, so `cd` and environment changes stick between co
 line by line; at the end you get `[exit N]` and a short vibration. Back cancels a running command.
 
 - The Flipper keyboard capitalizes the first letter (`Ver`, `Dir`). Windows commands are case-insensitive.
-- Up to 400 output lines per command; a command running over 2 minutes is stopped.
+- Up to 400 output lines per command; ordinary commands running over 2 minutes are stopped.
+  Interactive commands such as Codex stay attached until you press Back.
 - The shell switches to UTF-8 (`chcp 65001`), so Cyrillic file names come through.
 - `"shell": "powershell"` in `%LOCALAPPDATA%\DedSecUplink\config.json` switches to PowerShell.
+- The Windows companion requires `pywinpty` and starts `cmd.exe`/PowerShell inside a pseudo-terminal;
+  ANSI screen control is reduced to readable text for the Flipper's small display.
 
 **Security.** The BLE link has no pairing, so anyone in Bluetooth range who knows the protocol could send
 commands. The remote shell can be turned off in the tray menu (*Allow remote shell*), every command is logged,
@@ -81,6 +87,14 @@ every 30 minutes. If the Flipper runs an older version, the app shows `>> UPDATE
 3. the app writes it next to itself, checks size and CRC-32, replaces its own `.fap` and restarts.
 
 The first version with OTA support (v1.1.0) has to be installed once by hand; later versions arrive over the air.
+
+## RF Signal Hunter
+
+The repository also contains a passive Sub-GHz Scout FAP in [`apps/rf_signal_hunter`](../apps/rf_signal_hunter)
+and a desktop event store in `uplink/uplink/rf_hunter.py`. The current vertical slice records stable
+event/session identities, structural fingerprints, provisional family grouping and idempotent upload
+acknowledgements. It never transmits or replays RF. The full product constraints and staged roadmap are
+documented in [`RF_SIGNAL_HUNTER_SPEC.md`](../RF_SIGNAL_HUNTER_SPEC.md).
 
 ## Companion
 
@@ -104,7 +118,8 @@ Log: `%LOCALAPPDATA%\DedSecUplink\uplink.log`. Only one copy runs at a time.
 ```bash
 python -m pip install pyinstaller
 python -m PyInstaller --onefile --windowed --name DedSecUplink --collect-submodules bleak \
-    --collect-submodules winrt --hidden-import pystray._win32 dedsec_uplink.pyw
+    --collect-submodules winrt --collect-all winpty --hidden-import winpty.ptyprocess \
+    --hidden-import pystray._win32 dedsec_uplink.pyw
 ```
 
 ### Where session state comes from
@@ -155,7 +170,7 @@ B                                        the PC is going away
 Flipper → PC (notify, `de5ec002-…`):
 
 ```
-C|seq|command   K|seq                    run / cancel a command
+C|seq|command   T|seq|text   K|seq       run / send stdin text / cancel a command
 V|version                                app version (on connect and every 30 s)
 U|tag   UA|written                       request an update / acknowledge bytes written
 ```

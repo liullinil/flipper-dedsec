@@ -1,0 +1,12 @@
+App(
+    appid="rf_signal_hunter",
+    name="RF Signal Hunter",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="rf_signal_hunter_app",
+    requires=["gui", "notification"],
+    stack_size=3 * 1024,
+    fap_category="Sub-GHz",
+    fap_version="0.1",
+    fap_author="DedSec",
+    fap_description="Passive Sub-GHz Scout; never transmits",
+)

@@ -22,6 +22,13 @@ class Session:
     total: int = 0
     last_ts: float = 0.0  # last activity, epoch seconds
     attn: int = 0         # grows each time the session starts waiting for the user
+    body: str = ""        # full current activity or completed report
+    revision: str = ""    # turn identity plus report hash
+    full_name: str = ""   # unshortened name for detail views
+
+    def __post_init__(self):
+        if not self.full_name:
+            self.full_name = self.name
 
     def age(self, now=None):
         return max(0, int((now or time.time()) - self.last_ts))
@@ -29,6 +36,35 @@ class Session:
 
 def short_key(text):
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:6]
+
+
+def revision_token(turn_id, body=""):
+    """Return a stable, private-content-free revision identifier.
+
+    The turn identity makes an identical report in a later turn a new revision;
+    the digest makes edits to the report or current activity visible to views.
+    """
+    identity = str(turn_id or "0")
+    digest = hashlib.sha256((body or "").encode("utf-8")).hexdigest()[:16]
+    return f"{identity}:{digest}"
+
+
+def join_text(parts):
+    """Join complete text blocks while avoiding exact/prefix duplicates."""
+    result = ""
+    for value in parts:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        if not result:
+            result = text
+        elif text == result or text in result:
+            continue
+        elif result in text:
+            result = text
+        else:
+            result += "\n\n" + text
+    return result
 
 
 class AttentionCounter:

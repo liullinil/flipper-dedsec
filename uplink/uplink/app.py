@@ -18,6 +18,7 @@ from .codex import CodexWatcher
 from .common import ascii_text
 from .link import Link
 from .shell import Shell
+from .session_views import SessionViews
 from .sysmon import SysMon
 from .updater import Updater
 
@@ -38,6 +39,7 @@ class Feed:
         self.sys = SysMon()
         self.codex = CodexWatcher()
         self.claude = ClaudeWatcher()
+        self.views = SessionViews(os.path.join(config.APP_DIR, "session_acks.json"))
         self.host = ascii_text(socket.gethostname(), 20)
         self.rows = {"X": [], "C": []}
         self.last_poll = 0.0
@@ -64,6 +66,8 @@ class Feed:
             log.exception("claude poll failed")
             claude = self.rows["C"]
         with self.lock:
+            codex = self.views.update("X", codex)
+            claude = self.views.update("C", claude)
             self.rows = {"X": codex[:MAX_ROWS], "C": claude[:MAX_ROWS]}
         self.last_poll = time.time()
 
@@ -126,6 +130,11 @@ class Feed:
                 self._emit(f"X|{seq}|-1")
                 return
             self.commands.put((seq, command))
+        elif tag == "T" and len(parts) >= 3:
+            # Text entered while an interactive command (for example Codex) owns the PTY.
+            seq = parts[1]
+            text = "|".join(parts[2:])
+            self._get_shell().write_input(seq, text)
         elif tag == "K" and len(parts) >= 2 and self.shell:
             self.shell.cancel(parts[1])
         elif tag == "V" and len(parts) >= 2:
