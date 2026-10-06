@@ -19,6 +19,13 @@ than continuous IQ.
   Event IDs include device, session and sequence components.
 - Captures use a bounded ISR-safe timing ring and durable SD records. Writes are
   staged/synchronised before the final event record is made visible.
+- Device time/storage settings are available with **Up** on the main RF screen.
+  RTC timezone offset (15-minute steps), reserve space and retention policy are
+  saved in a versioned SD record. Events include normalized UTC calendar/epoch,
+  the raw RTC epoch, the offset and a monotonic session-relative time.
+- The store refuses to replace an existing event ID. A low-space guard reports
+  an error and red LED; the explicit stop-on-full policy halts Sub-GHz RX.
+  Incomplete writes and an interrupted ACK/reclaim are recovered on restart.
 - The RF Hunter BLE profile has separate service/characteristic UUIDs. The
   desktop pull protocol supports hello, paged manifest, offset reads, CRC checks,
   durable import, resumable staging and acknowledgement-based reclamation.
@@ -57,12 +64,20 @@ than continuous IQ.
 - The analyzer is a local Tkinter investigation console. A packaged desktop
   release, richer family graph animation and multi-project collaboration are
   still pending.
-- Device timezone offset and retention policy are persisted in settings and
-  applied to event timestamps; ACK receipts and storage-full behavior are
-  durable and policy-controlled.
+- Time/storage controls and reset recovery are implemented and tested with the
+  production C code on a host storage facade. Hardware power-cut validation,
+  compact receipt fingerprint summaries and removing the legacy unbounded
+  `events.jsonl` mirror remain to be completed; see
+  [docs/RF_PERSISTENCE.md](docs/RF_PERSISTENCE.md).
 
 ## Verification
 
-The current Python suite passes with `29 passed`. The RF Hunter FAP builds with
+The RF Hunter FAP builds with
 `python -m ufbt` and reports `Target: 7, API: 88.9`. Changes are committed and
 pushed to `origin/main` after each completed slice.
+
+The native persistence test compiles the actual `rf_store.c` and
+`rf_settings.c`; injected write/sync failures and interrupted rename/ACK
+sequences verify that pending records survive and settings recover. Run it with
+`python -m pytest uplink/tests/test_rf_native_reliability.py -q` (one host test,
+three groups of fault scenarios; passed on Windows/MSVC 2022).

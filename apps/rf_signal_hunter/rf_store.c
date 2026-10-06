@@ -234,13 +234,21 @@ bool rf_store_save(RfStore* store, const char* event_id, const char* json, size_
         rf_store_set_error(store, RfStoreErrorInvalidArgument);
         return false;
     }
+    char final[160];
+    event_path(final, sizeof(final), RF_STORE_EVENTS_DIR, event_id, ".json");
+    FileInfo existing;
+    /* Event identity is immutable.  Never silently replace pending evidence
+       when a caller accidentally reuses an ID. */
+    if(storage_common_stat(store->storage, final, &existing) == FSE_OK || rf_store_is_acked(store, event_id)) {
+        rf_store_set_error(store, RfStoreErrorInvalidArgument);
+        return false;
+    }
     if(rf_store_storage_low(store, len + 512U)) {
         rf_store_set_error(store, RfStoreErrorStorageLow);
         return false;
     }
-    char tmp[160], final[160];
+    char tmp[160];
     event_path(tmp, sizeof(tmp), RF_STORE_EVENTS_DIR, event_id, ".json.part");
-    event_path(final, sizeof(final), RF_STORE_EVENTS_DIR, event_id, ".json");
     File* file = storage_file_alloc(store->storage);
     bool ok = false;
     if(storage_file_open(file, tmp, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {

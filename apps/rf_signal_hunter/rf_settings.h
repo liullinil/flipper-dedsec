@@ -22,9 +22,8 @@ typedef struct {
 typedef enum {
     /* Keep pending records until an ACK.  ACKed raw records are reclaimed. */
     RfRetentionCompactAfterAck = 0,
-    /* Keep the compact JSON/index for ACKed records; only raw captures may be
-       reclaimed.  This is useful when the user wants an on-device history. */
-    RfRetentionKeepIndex = 1,
+    /* Keep full ACKed captures on the device in addition to receipts. */
+    RfRetentionKeepCapture = 1,
     /* Stop accepting new events when the free-space guard is reached. */
     RfRetentionStopWhenFull = 2,
 } RfRetentionPolicy;

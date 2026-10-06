@@ -575,7 +575,7 @@ static void hunter_draw(Canvas* canvas, void* context) {
         int16_t offset = hunter->settings.timezone_offset_minutes;
         snprintf(line, sizeof(line), "%c RTC UTC%c%02u:%02u", hunter->setting_index == 0 ? '>' : ' ', offset < 0 ? '-' : '+', (unsigned)(abs(offset) / 60), (unsigned)(abs(offset) % 60));
         canvas_draw_str(canvas, 2, 29, line);
-        static const char* policies[] = {"ACK -> compact", "Keep ACK index", "Stop when full"};
+        static const char* policies[] = {"ACK -> compact", "Keep ACK capture", "Stop when full"};
         snprintf(line, sizeof(line), "%c %s", hunter->setting_index == 1 ? '>' : ' ', policies[hunter->settings.retention_policy]);
         canvas_draw_str(canvas, 2, 40, line);
         snprintf(line, sizeof(line), "%c Reserve: %lu KB", hunter->setting_index == 2 ? '>' : ' ', (unsigned long)(hunter->settings.min_free_bytes / 1024));
