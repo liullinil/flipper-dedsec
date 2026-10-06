@@ -13,6 +13,10 @@ $env:PYTHONPATH = "uplink"
 python -m uplink.rf_analyzer C:\path\to\flipper\apps_data\rf_signal_hunter
 ```
 
+On Windows, `rf_hunter_desktop.pyw` is the no-console launcher for the same
+window. It can be packaged with the companion using PyInstaller when a desktop
+release is prepared.
+
 The UI provides:
 
 - event and family filters by source, family ID, and text;
@@ -34,4 +38,3 @@ The waterfall is a visualization of timestamped event samples and RSSI values.
 It is not continuous IQ or a direction finder. Similarity is provisional and
 keeps the original event IDs visible so later desktop grouping can split or
 merge families without discarding evidence.
-
