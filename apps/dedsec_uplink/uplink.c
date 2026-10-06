@@ -703,7 +703,18 @@ static void drain_rx(App* app) {
 }
 
 static void uplink_send(App* app, const char* line) {
-    if(app->profile) uplink_ble_tx(app->profile, (const uint8_t*)line, strlen(line));
+    /* Always frame TX messages explicitly.  The Windows side can otherwise see a
+     * notification split at the negotiated ATT MTU as several independent protocol
+     * lines (especially for a long command typed on the Flipper keyboard).  A trailing
+     * newline is cheap, and the RX side already treats CR/LF as the line delimiter. */
+    if(!app->profile || !line) return;
+    char framed[UPLINK_TX_MAX + 1];
+    size_t n = strlen(line);
+    if(n >= sizeof(framed)) n = sizeof(framed) - 2;
+    memcpy(framed, line, n);
+    framed[n++] = '\n';
+    framed[n] = 0;
+    uplink_ble_tx(app->profile, (const uint8_t*)framed, n);
 }
 
 static void send_version(App* app) {
