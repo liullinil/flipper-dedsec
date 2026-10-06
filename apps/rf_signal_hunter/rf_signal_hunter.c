@@ -72,6 +72,7 @@ typedef struct {
     uint8_t frequency_index;
     uint32_t events_reviewed;
     uint32_t families_seen;
+    uint32_t capture_started_tick;
     float rssi_min;
     float rssi_max;
     float rssi_sum;
@@ -182,7 +183,7 @@ static void hunter_record_nfc(
         sizeof(line),
         "{\"event_id\":\"rf-%s-%s-%lu\",\"device_id\":\"%s\",\"session_id\":\"%s\",\"sequence_number\":%lu,"
         "\"captured_at_utc\":\"%04u-%02u-%02uT%02u:%02u:%02uZ\",\"captured_at_unix\":%lu,\"timezone_offset_minutes\":%d,\"rtc_local_unix\":%lu,\"monotonic_ms\":%lu,"
-        "\"source_type\":\"nfc\",\"mode\":\"NFC\",\"frequency_hz\":13560000,\"modulation\":\"NFC\","
+        "\"source_type\":\"nfc\",\"mode\":\"NFC\",\"frequency_hz\":13560000,\"modulation\":\"NFC\",\"fingerprint_id\":\"local-nfc-field\",\"family_id\":null,\"classification\":\"unknown\",\"classification_confidence\":0.0,"
         "\"nfc_technology\":\"external-field\",\"nfc_protocol\":\"carrier-presence\",\"nfc_identifier\":\"\","
         "\"nfc_field_duration_ms\":%lu,\"nfc_field_count\":%lu,\"nfc_confidence\":0.50,\"upload_state\":\"pending\"}\n",
         hunter->device_id,
@@ -266,6 +267,31 @@ static void hunter_process_nfc(Hunter* hunter) {
     }
 }
 
+/* A compact deterministic structural fingerprint for the local journal.
+ * It ignores payload bytes and RSSI so repeated observations of one
+ * transmitter can still be grouped after upload.  The desktop computes its
+ * richer SHA-256 fingerprint; this short value is retained in Flipper's
+ * receipt as a local hint. */
+static void hunter_hash_u32(uint32_t* hash, uint32_t value) {
+    for(uint8_t i = 0; i < 4; i++) {
+        *hash ^= (uint8_t)(value >> (i * 8));
+        *hash *= 16777619u;
+    }
+}
+
+static uint32_t hunter_structure_fingerprint(const Hunter* hunter) {
+    uint32_t hash = 2166136261u;
+    hunter_hash_u32(&hash, hunter_frequencies[hunter->frequency_index]);
+    hunter_hash_u32(&hash, hunter->event_timing_count);
+    uint16_t count = MIN(hunter->event_timing_count, (uint16_t)96);
+    for(uint16_t i = 0; i < count; i++) {
+        uint32_t quantized = ((hunter->event_timings[i].duration_us + 12U) / 25U) * 25U;
+        hunter_hash_u32(&hash, quantized);
+        hunter_hash_u32(&hash, hunter->event_timings[i].level ? 1U : 0U);
+    }
+    return hash;
+}
+
 static void hunter_record(Hunter* hunter) {
     /* The per-event store is the durable BLE source of truth.  Avoid a raw
      * JSONL mirror: it would grow forever after individual events are ACKed. */
@@ -280,13 +306,28 @@ static void hunter_record(Hunter* hunter) {
     DateTime now;
     datetime_timestamp_to_datetime((uint32_t)utc_epoch, &now);
     hunter->sequence++;
+    uint32_t local_fingerprint = hunter_structure_fingerprint(hunter);
+    char follow_profile_id[40] = {0};
+    float follow_similarity = 0.0f;
+    if(hunter->mode == HunterModeFollow) {
+        snprintf(
+            follow_profile_id,
+            sizeof(follow_profile_id),
+            "duration-%lu",
+            (unsigned long)hunter->follow_duration);
+        uint32_t target = hunter->follow_duration;
+        uint32_t difference = target > hunter->last_duration ?
+                                  target - hunter->last_duration :
+                                  hunter->last_duration - target;
+        follow_similarity = difference >= 500U ? 0.0f : 1.0f - ((float)difference / 500.0f);
+    }
     char line[640];
     snprintf(
         line,
         sizeof(line),
         "{\"event_id\":\"rf-%s-%s-%lu\",\"device_id\":\"%s\",\"session_id\":\"%s\",\"sequence_number\":%lu,"
         "\"captured_at_utc\":\"%04u-%02u-%02uT%02u:%02u:%02uZ\",\"captured_at_unix\":%lu,\"timezone_offset_minutes\":%d,\"rtc_local_unix\":%lu,\"monotonic_ms\":%lu,"
-        "\"source_type\":\"subghz\",\"mode\":\"%s\",\"frequency_hz\":%lu,\"rssi_min_dbm\":%.1f,\"rssi_avg_dbm\":%.1f,\"rssi_max_dbm\":%.1f,"
+        "\"source_type\":\"subghz\",\"mode\":\"%s\",\"frequency_hz\":%lu,\"fingerprint_id\":\"local-%08lx\",\"family_id\":null,\"classification\":\"unknown\",\"classification_confidence\":0.0,\"follow_profile_id\":\"%s\",\"follow_similarity\":%.3f,\"rssi_min_dbm\":%.1f,\"rssi_avg_dbm\":%.1f,\"rssi_max_dbm\":%.1f,"
         "\"pulse_count\":%lu,\"last_duration_us\":%lu,\"pulse_timings_us\":[",
         hunter->device_id,
         hunter->session_id,
@@ -306,6 +347,9 @@ static void hunter_record(Hunter* hunter) {
         (unsigned long)(furi_get_tick() - hunter->session_start_tick),
         hunter_mode_name(hunter->mode),
         (unsigned long)hunter_frequencies[hunter->frequency_index],
+        (unsigned long)local_fingerprint,
+        follow_profile_id,
+        (double)follow_similarity,
         (double)(hunter->rssi_samples ? hunter->rssi_min : 0.0f),
         (double)(hunter->rssi_samples ? hunter->rssi_sum / hunter->rssi_samples : 0.0f),
         (double)(hunter->rssi_samples ? hunter->rssi_max : 0.0f),
@@ -360,9 +404,14 @@ static void hunter_process_capture(Hunter* hunter) {
         hunter->pulses++;
         hunter->last_duration = timing.duration_us;
         if(hunter->event_timing_count < RF_CAPTURE_MAX_TIMINGS) {
+            if(hunter->event_timing_count == 0) hunter->capture_started_tick = furi_get_tick();
             hunter->event_timings[hunter->event_timing_count++] = timing;
         }
-        if(timing.duration_us > hunter->settings.silence_us && hunter->event_timing_count > 1) {
+        bool window_expired = hunter->event_timing_count > 1 &&
+                              (furi_get_tick() - hunter->capture_started_tick) >=
+                                  furi_ms_to_ticks(hunter->settings.capture_ms);
+        if((timing.duration_us > hunter->settings.silence_us || window_expired) &&
+           hunter->event_timing_count > 1) {
             hunter->bursts++;
             float avg_rssi = hunter->rssi_samples ? hunter->rssi_sum / hunter->rssi_samples : -120.0f;
             if(hunter_event_selected(hunter) && avg_rssi >= hunter->settings.rssi_threshold_dbm) {
@@ -562,15 +611,37 @@ static void hunter_draw(Canvas* canvas, void* context) {
     char line[40];
     if(hunter->settings_open) {
         canvas_draw_str(canvas, 2, 16, "TIME / STORAGE SETTINGS");
-        int16_t offset = hunter->settings.timezone_offset_minutes;
-        snprintf(line, sizeof(line), "%c RTC UTC%c%02u:%02u", hunter->setting_index == 0 ? '>' : ' ', offset < 0 ? '-' : '+', (unsigned)(abs(offset) / 60), (unsigned)(abs(offset) % 60));
-        canvas_draw_str(canvas, 2, 29, line);
-        static const char* policies[] = {"ACK -> compact", "Keep ACK capture", "Stop when full"};
-        snprintf(line, sizeof(line), "%c %s", hunter->setting_index == 1 ? '>' : ' ', policies[hunter->settings.retention_policy]);
-        canvas_draw_str(canvas, 2, 40, line);
-        snprintf(line, sizeof(line), "%c Reserve: %lu KB", hunter->setting_index == 2 ? '>' : ' ', (unsigned long)(hunter->settings.min_free_bytes / 1024));
-        canvas_draw_str(canvas, 2, 51, line);
-        canvas_draw_str(canvas, 2, 62, "Up/Dn row L/R edit Back save");
+        static const char* const names[] = {"RTC", "Dwell", "RSSI", "Capture", "Silence", "Band", "Retention", "Reserve"};
+        static const char* const bands[] = {"ALL", "433", "315", "868"};
+        static const char* const policies[] = {"COMPACT", "KEEP", "STOP"};
+        char value[24];
+        uint8_t first = hunter->setting_index > 2 ? hunter->setting_index - 2 : 0;
+        if(first > 4) first = 4;
+        for(uint8_t row = 0; row < 4 && first + row < 8; row++) {
+            uint8_t index = first + row;
+            int y = 27 + row * 9;
+            if(index == 0) {
+                int16_t offset = hunter->settings.timezone_offset_minutes;
+                snprintf(value, sizeof(value), "UTC%c%02u:%02u", offset < 0 ? '-' : '+', (unsigned)(abs(offset) / 60), (unsigned)(abs(offset) % 60));
+            } else if(index == 1) {
+                snprintf(value, sizeof(value), "%lums", (unsigned long)hunter->settings.dwell_ms);
+            } else if(index == 2) {
+                snprintf(value, sizeof(value), "%ddBm", hunter->settings.rssi_threshold_dbm);
+            } else if(index == 3) {
+                snprintf(value, sizeof(value), "%ums", (unsigned)hunter->settings.capture_ms);
+            } else if(index == 4) {
+                snprintf(value, sizeof(value), "%uus", (unsigned)hunter->settings.silence_us);
+            } else if(index == 5) {
+                snprintf(value, sizeof(value), "%s", bands[hunter->settings.band_profile]);
+            } else if(index == 6) {
+                snprintf(value, sizeof(value), "%s", policies[hunter->settings.retention_policy]);
+            } else {
+                snprintf(value, sizeof(value), "%luK", (unsigned long)(hunter->settings.min_free_bytes / 1024));
+            }
+            snprintf(line, sizeof(line), "%c %-9s %s", hunter->setting_index == index ? '>' : ' ', names[index], value);
+            canvas_draw_str(canvas, 2, y, line);
+        }
+        canvas_draw_str(canvas, 2, 62, "Up/Dn select L/R edit Back save");
         return;
     }
     snprintf(line, sizeof(line), "%s  %s", hunter_mode_name(hunter->mode), hunter->running ? "RUN" : "STOP");
@@ -603,15 +674,25 @@ static void hunter_input(InputEvent* event, void* context) {
             } else {
                 notification_message(hunter->notifications, &sequence_set_only_red_255);
             }
-        } else if(event->key == InputKeyUp) hunter->setting_index = (hunter->setting_index + 2) % 3;
-        else if(event->key == InputKeyDown) hunter->setting_index = (hunter->setting_index + 1) % 3;
+        } else if(event->key == InputKeyUp) hunter->setting_index = (hunter->setting_index + 7) % 8;
+        else if(event->key == InputKeyDown) hunter->setting_index = (hunter->setting_index + 1) % 8;
         else if(event->key == InputKeyLeft || event->key == InputKeyRight) {
             int delta = event->key == InputKeyRight ? 1 : -1;
             if(hunter->setting_index == 0) {
                 int value = hunter->settings.timezone_offset_minutes + delta * 15;
                 hunter->settings.timezone_offset_minutes = CLAMP(value, 14 * 60, -14 * 60);
             } else if(hunter->setting_index == 1) {
-                hunter->settings.retention_policy = (hunter->settings.retention_policy + delta + 3) % 3;
+                hunter->settings.dwell_ms = CLAMP((int)hunter->settings.dwell_ms + delta * 50, 10000, 50);
+            } else if(hunter->setting_index == 2) {
+                hunter->settings.rssi_threshold_dbm = CLAMP((int)hunter->settings.rssi_threshold_dbm + delta, -30, -110);
+            } else if(hunter->setting_index == 3) {
+                hunter->settings.capture_ms = CLAMP((int)hunter->settings.capture_ms + delta * 100, 2000, 200);
+            } else if(hunter->setting_index == 4) {
+                hunter->settings.silence_us = CLAMP((int)hunter->settings.silence_us + delta * 500, 30000, 1000);
+            } else if(hunter->setting_index == 5) {
+                hunter->settings.band_profile = (uint8_t)(((int)hunter->settings.band_profile + delta + 4) % 4);
+            } else if(hunter->setting_index == 6) {
+                hunter->settings.retention_policy = (uint8_t)(((int)hunter->settings.retention_policy + delta + 3) % 3);
             } else {
                 int value = (int)hunter->settings.min_free_bytes + delta * 16384;
                 hunter->settings.min_free_bytes = CLAMP(value, 4 * 1024 * 1024, 16384);
@@ -655,6 +736,10 @@ static void hunter_input(InputEvent* event, void* context) {
             view_port_update(hunter->viewport);
             return;
         }
+        /* Mode changes are marshalled to the app thread so the NFC mutex is
+         * released by its owner. Do not start Sub-GHz RX in the short window
+         * before that release is processed. */
+        if(hunter->nfc_detect_active || hunter->nfc_requested) return;
         hunter->receiver_active = !hunter->receiver_active;
         if(hunter->receiver_active) {
             furi_hal_subghz_set_frequency(hunter_frequencies[hunter->frequency_index]);
