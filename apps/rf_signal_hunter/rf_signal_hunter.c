@@ -19,6 +19,7 @@
 #include "rf_hunter_ble.h"
 #include "rf_store.h"
 #include "rf_capture.h"
+#include "rf_settings.h"
 
 #define HUNTER_EVENTS_DIR APP_DATA_PATH("rf_signal_hunter")
 #define HUNTER_EVENTS_PATH HUNTER_EVENTS_DIR "/events.jsonl"
@@ -26,6 +27,7 @@
 #define HUNTER_FREQUENCY_HZ 433920000U
 #define HUNTER_PULSE_RING_SIZE 16U
 static const uint32_t hunter_frequencies[] = {315000000U, 433920000U, 868350000U};
+
 
 typedef enum {
     HunterModeScout,
@@ -42,6 +44,7 @@ typedef struct {
     Storage* storage;
     File* events_file;
     RfStore* store;
+    RfHunterSettings settings;
     volatile uint32_t pulses;
     volatile uint32_t bursts;
     volatile uint32_t last_duration;
@@ -71,6 +74,14 @@ typedef struct {
     char ble_line[1024];
     uint16_t ble_line_len;
 } Hunter;
+
+static bool hunter_frequency_allowed(const Hunter* hunter, uint8_t index) {
+    if(hunter->settings.band_profile == 0) return true;
+    if(hunter->settings.band_profile == 1) return index == 1;
+    if(hunter->settings.band_profile == 2) return index == 0;
+    if(hunter->settings.band_profile == 3) return index == 2;
+    return true;
+}
 
 static void hunter_hex_random(char* out, size_t chars) {
     uint8_t bytes[8] = {0};
@@ -176,9 +187,10 @@ static void hunter_process_capture(Hunter* hunter) {
         if(hunter->event_timing_count < RF_CAPTURE_MAX_TIMINGS) {
             hunter->event_timings[hunter->event_timing_count++] = timing;
         }
-        if(timing.duration_us > 8000 && hunter->event_timing_count > 1) {
+        if(timing.duration_us > hunter->settings.silence_us && hunter->event_timing_count > 1) {
             hunter->bursts++;
-            if(hunter_event_selected(hunter)) {
+            float avg_rssi = hunter->rssi_samples ? hunter->rssi_sum / hunter->rssi_samples : -120.0f;
+            if(hunter_event_selected(hunter) && avg_rssi >= hunter->settings.rssi_threshold_dbm) {
                 notification_message(hunter->notifications, &sequence_audiovisual_alert);
                 notification_message(hunter->notifications, &sequence_set_only_green_255);
                 hunter_record(hunter);
@@ -349,7 +361,7 @@ static void hunter_draw(Canvas* canvas, void* context) {
     } else {
         snprintf(line, sizeof(line), "Events: %lu  New fam: %lu", (unsigned long)(hunter->bursts - hunter->events_reviewed), (unsigned long)hunter->families_seen);
         canvas_draw_str(canvas, 2, 29, line);
-        snprintf(line, sizeof(line), "Pulses: %lu", (unsigned long)hunter->pulses);
+        snprintf(line, sizeof(line), "Pending: %lu  Free: %luM", (unsigned long)rf_store_pending_count(hunter->store), (unsigned long)(rf_store_free_bytes(hunter->store) / (1024 * 1024)));
         canvas_draw_str(canvas, 2, 40, line);
         snprintf(line, sizeof(line), "Last: %lu us RSSI %.0f", (unsigned long)hunter->last_duration, (double)(hunter->rssi_samples ? hunter->rssi_sum / hunter->rssi_samples : 0.0f));
         canvas_draw_str(canvas, 2, 51, line);
@@ -408,6 +420,7 @@ int32_t rf_signal_hunter_app(void* context) {
     hunter.ble_rx = furi_stream_buffer_alloc(4096, 1);
     hunter.storage = furi_record_open(RECORD_STORAGE);
     hunter.store = rf_store_alloc(hunter.storage);
+    rf_settings_load(hunter.storage, &hunter.settings);
     hunter.event_timings = malloc(sizeof(RfCaptureTiming) * RF_CAPTURE_MAX_TIMINGS);
     rf_capture_init(&hunter.capture);
     storage_common_mkdir(hunter.storage, HUNTER_EVENTS_DIR);
@@ -435,7 +448,7 @@ int32_t rf_signal_hunter_app(void* context) {
     view_port_update(hunter.viewport);
 
     while(hunter.running) {
-        furi_delay_ms(250);
+        furi_delay_ms(hunter.settings.dwell_ms);
         hunter_process_capture(&hunter);
         hunter_ble_drain(&hunter);
         if(hunter.receiver_active) {
@@ -445,7 +458,9 @@ int32_t rf_signal_hunter_app(void* context) {
             hunter.rssi_sum += rssi;
             hunter.rssi_samples++;
             if(hunter.mode == HunterModeScout) {
-                hunter.frequency_index = (hunter.frequency_index + 1) % (sizeof(hunter_frequencies) / sizeof(hunter_frequencies[0]));
+                do {
+                    hunter.frequency_index = (hunter.frequency_index + 1) % (sizeof(hunter_frequencies) / sizeof(hunter_frequencies[0]));
+                } while(!hunter_frequency_allowed(&hunter, hunter.frequency_index));
                 furi_hal_subghz_set_frequency(hunter_frequencies[hunter.frequency_index]);
             }
         }
