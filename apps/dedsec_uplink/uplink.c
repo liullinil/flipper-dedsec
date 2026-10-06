@@ -307,9 +307,11 @@ static void clean_copy(char* dst, size_t size, const char* src) {
 }
 
 static void font_text(Canvas* c, const App* app) {
-    /* Keep all four persisted choices meaningful.  The custom 6x12 font is
-     * the largest readable mode and is also the only bundled Cyrillic font.
-     * The SDK fonts provide the two compact modes and the normal 5x8 mode. */
+    /* Keep all four persisted choices meaningful. The bundled 6x12 font is
+     * used for Normal/Large so Cyrillic session names remain readable; the
+     * two SDK fonts provide genuinely denser Small and Micro modes. The list
+     * layout changes with every choice, so Large still shows fewer, taller
+     * rows while Normal keeps the same Cyrillic glyph set. */
     switch(app->settings.font) {
     case FontLarge:
         canvas_set_custom_u8g2_font(c, u8g2_font_uplink_cyr);
@@ -322,7 +324,7 @@ static void font_text(Canvas* c, const App* app) {
         break;
     case FontNormal:
     default:
-        canvas_set_font(c, FontPrimary);
+        canvas_set_custom_u8g2_font(c, u8g2_font_uplink_cyr);
         break;
     }
 }
