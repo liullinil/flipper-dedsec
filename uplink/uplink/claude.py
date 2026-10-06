@@ -13,7 +13,7 @@ import json
 import os
 import time
 
-from .common import (Session, JsonlTail, AttentionCounter, parse_ts, recent_files, ascii_text,
+from .common import (Session, JsonlTail, AttentionCounter, parse_ts, recent_files, utf8_text,
                      strip_md, short_key, WORKING, APPROVAL, YOUR_TURN, IDLE, ORDER)
 
 HOOK_EVENTS = os.path.join(
@@ -260,8 +260,8 @@ class ClaudeWatcher:
             st = cs.state(now)
             detail = cs.detail(st, now)
             st, detail = self._hook_state(cs, st, detail, now)
-            s = Session(key=short_key(cs.id), name=ascii_text(cs.name(), 30), state=st,
-                        detail=ascii_text(detail, 70), last_ts=cs.last_ts)
+            s = Session(key=short_key(cs.id), name=utf8_text(cs.name(), 24), state=st,
+                        detail=utf8_text(detail, 60), last_ts=cs.last_ts)
             s.done, s.total = cs.todo[0], cs.todo[1]
             if st not in (WORKING, APPROVAL) and s.done == s.total:
                 s.done = s.total = 0     # finished checklist: show age instead

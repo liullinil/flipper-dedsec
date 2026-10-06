@@ -12,7 +12,7 @@ import json
 import os
 import time
 
-from .common import (Session, JsonlTail, AttentionCounter, parse_ts, recent_files, ascii_text,
+from .common import (Session, JsonlTail, AttentionCounter, parse_ts, recent_files, utf8_text,
                      strip_md, short_key, WORKING, APPROVAL, YOUR_TURN, IDLE, ORDER)
 
 ACTIVE_WINDOW = 3 * 3600    # rollout files touched within this window are watched
@@ -222,19 +222,19 @@ class CodexWatcher:
             name = self.names.get(t.session) or self.names.get(t.id) or os.path.basename(t.cwd)
             if t.is_sub:
                 name = (t.agent_path.rsplit("/", 1)[-1] or "agent") + " (sub)"
-            s = Session(key=short_key(t.id), name=ascii_text(name, 30), state=st,
+            s = Session(key=short_key(t.id), name=utf8_text(name, 24), state=st,
                         last_ts=max([t.last_ts] + [k.last_ts for k in children]))
             s.total = len(children)
             s.done = len(children) - len(busy)
-            s.detail = ascii_text(self._detail(t, st, busy), 70)
+            s.detail = utf8_text(self._detail(t, st, busy), 60)
             s.attn = self.attn.update(s.key, st)
             subs = []
             for k in busy:
                 ks = Session(key=short_key(k.id),
-                             name=ascii_text("- " + (k.agent_path.rsplit("/", 1)[-1] or "agent")
-                                             + (" " + k.nickname if k.nickname else ""), 30),
+                             name=utf8_text("- " + (k.agent_path.rsplit("/", 1)[-1] or "agent")
+                                            + (" " + k.nickname if k.nickname else ""), 24),
                              state=k.state(now), last_ts=k.last_ts,
-                             detail=ascii_text(k.activity, 70))
+                             detail=utf8_text(k.activity, 60))
                 ks.attn = self.attn.update(ks.key, ks.state)
                 subs.append(ks)
             rows.append((s, subs))

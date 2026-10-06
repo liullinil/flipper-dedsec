@@ -36,6 +36,7 @@ typedef struct {
     uint8_t indicators;  // Indicators
     uint8_t theme;       // Theme
     uint8_t font;        // FontSize
+    uint8_t auto_update; // 0 notify only, 1 install new releases automatically
     uint8_t tabs[4];     // ordered tab slots, each a ScreenId (ScreenOff to hide)
 } UplinkSettings;
 

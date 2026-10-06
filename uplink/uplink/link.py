@@ -15,11 +15,13 @@ log = logging.getLogger("uplink.link")
 
 
 class Link:
-    """Runs its own asyncio loop in a thread. `frame_source()` returns the lines to send each
-    cycle (telemetry + any queued command output); `on_rx(line)` receives Flipper -> PC lines."""
+    """Runs its own asyncio loop in a thread. `frame_source()` returns telemetry lines (sent every
+    `period` s); `urgent_source()` returns lines that must go out at once (command output, update
+    chunks) and is polled every few tens of ms; `on_rx(line)` receives Flipper -> PC lines."""
 
-    def __init__(self, frame_source, on_status=None, on_rx=None, period=1.0):
+    def __init__(self, frame_source, on_status=None, on_rx=None, urgent_source=None, period=1.0):
         self.frame_source = frame_source
+        self.urgent_source = urgent_source or (lambda: [])
         self.on_status = on_status or (lambda status, name: None)
         self.on_rx = on_rx or (lambda line: None)
         self.period = period
@@ -110,7 +112,7 @@ class Link:
             self._rxbuf = ""
 
             def on_tx(_handle, data):
-                self._rxbuf += bytes(data).decode("ascii", "replace")
+                self._rxbuf += bytes(data).decode("utf-8", "replace")
                 while "\n" in self._rxbuf:
                     line, self._rxbuf = self._rxbuf.split("\n", 1)
                     line = line.strip("\r")
@@ -125,13 +127,18 @@ class Link:
                 await client.start_notify(TX_UUID, on_tx)
             except Exception as exc:
                 log.warning("cannot subscribe TX (no remote cmd): %s", exc)
+            next_frame = 0.0
             while not (self._stop.is_set() or lost.is_set() or self._paused.is_set()):
-                t0 = time.time()
-                for line in self.frame_source():
-                    data = (line + "\n").encode("ascii", "replace")
+                now = time.time()
+                lines = list(self.urgent_source())
+                if now >= next_frame:
+                    lines += self.frame_source()
+                    next_frame = now + self.period
+                for line in lines:
+                    data = (line + "\n").encode("utf-8", "replace")
                     for i in range(0, len(data), chunk):
                         await client.write_gatt_char(RX_UUID, data[i:i + chunk], response=False)
-                await asyncio.sleep(max(0.05, self.period - (time.time() - t0)))
+                await asyncio.sleep(0.02 if lines else 0.05)
             if client.is_connected and (self._stop.is_set() or self._paused.is_set()):
                 try:
                     await client.write_gatt_char(RX_UUID, b"B\n", response=False)

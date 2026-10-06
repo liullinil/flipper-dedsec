@@ -153,5 +153,27 @@ def ascii_text(text, limit):
     return s[:limit]
 
 
+_PUNCT = {
+    "—": "-", "–": "-", "«": '"', "»": '"', "…": "...", "’": "'", "‘": "'",
+    "“": '"', "”": '"', "→": "->", "←": "<-", "•": "*", " ": " ",
+}
+
+
+def utf8_text(text, limit):
+    """Text for the Flipper's UTF-8 font (Latin + Cyrillic): keep ASCII and Cyrillic, map common
+    typography to ASCII, drop anything the font can't draw, squeeze spaces, cap by characters."""
+    out = []
+    for ch in text or "":
+        if ch in _PUNCT:
+            out.append(_PUNCT[ch])
+        elif ch in "\n\r\t":
+            out.append(" ")
+        elif ch == "|":
+            out.append("/")          # protocol separator
+        elif 32 <= ord(ch) < 127 or "Ѐ" <= ch <= "ӿ":
+            out.append(ch)
+    return " ".join("".join(out).split())[:limit]
+
+
 def strip_md(text):
     return (text or "").replace("**", "").replace("`", "").strip()

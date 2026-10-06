@@ -31,12 +31,15 @@
 #include "uplink_ble.h"
 #include "uplink_settings.h"
 #include "dedsec_uplink_icons.h"
+#include "uplink_cyr_font.h"
+#include "uplink_ota.h"
+#include <loader/loader.h>
 
 #define TAG          "Uplink"
 #define MAX_ITEMS    10
 #define HIST         62
 #define SEEN_MAX     40
-#define LINE_MAX     300
+#define LINE_MAX     420
 #define LAG_TICKS    (3 * 4)
 #define LINK_TICKS   (8 * 4)
 #define ALERT_TICKS  (5 * 4)
@@ -56,8 +59,8 @@ typedef struct {
     uint8_t total;
     uint32_t age;
     uint32_t attn;
-    char name[32];
-    char detail[72];
+    char name[64];   // UTF-8
+    char detail[136]; // UTF-8
 } Item;
 
 typedef struct {
@@ -133,7 +136,12 @@ typedef struct {
     Kind alert_kind;
     char alert_state;
     char alert_key[8];
-    char alert_name[32];
+    char alert_name[64];
+    bool alert_update;      // the banner is an update offer
+    Ota ota;
+    uint32_t ver_tick;      // last time we told the PC our version
+    uint32_t restart_at;    // relaunch the freshly installed .fap at this tick
+    uint32_t ota_req_tick;
 
     char line[LINE_MAX];
     uint16_t line_len;
@@ -142,6 +150,11 @@ typedef struct {
 typedef struct {
     App* app;
 } MainModel;
+
+static void uplink_send(App* app, const char* line);
+static void send_version(App* app);
+static void ota_request(App* app);
+static void build_settings(App* app);
 
 /* ------------------------------------------------------------------ theme */
 static uint8_t g_fg = ColorBlack, g_bg = ColorWhite;
@@ -154,7 +167,13 @@ static void bg(Canvas* c) {
 }
 
 /* ------------------------------------------------------------------ notifications */
-typedef enum { NotifyApproval, NotifyYourTurn, NotifyCmdDone, NotifyLink } NotifyKind;
+typedef enum {
+    NotifyApproval,
+    NotifyYourTurn,
+    NotifyCmdDone,
+    NotifyLink,
+    NotifyUpdate,
+} NotifyKind;
 
 static void uplink_notify(App* app, NotifyKind kind) {
     const UplinkSettings* s = &app->settings;
@@ -186,6 +205,12 @@ static void uplink_notify(App* app, NotifyKind kind) {
         off = &message_blue_0;
         pulses = 1;
         vib = false;
+        break;
+    case NotifyUpdate:
+        on = &message_green_255;
+        off = &message_green_0;
+        pulses = 1;
+        longp = true;
         break;
     }
     const NotificationMessage* seq[32];
@@ -226,45 +251,99 @@ static void fmt_age(char* out, size_t size, uint32_t s) {
         snprintf(out, size, "%luh", (unsigned long)(s / 3600));
 }
 
-static void clean_copy(char* dst, size_t size, const char* src) {
-    size_t i = 0;
-    for(; src && src[i] && i + 1 < size; i++) {
-        char ch = src[i];
-        dst[i] = (ch >= 32 && ch < 127) ? ch : '?';
+/* ---- UTF-8: names, details and console output can be Cyrillic (drawn with the embedded
+ * u8g2 cyrillic font; canvas_draw_str renders UTF-8). Never cut a character in half. */
+static size_t utf8_len_at(const char* p) {
+    unsigned char ch = (unsigned char)p[0];
+    if(ch >= 0xF0) return 4;
+    if(ch >= 0xE0) return 3;
+    if(ch >= 0xC0) return 2;
+    return 1;
+}
+
+/* drop a trailing incomplete sequence left by byte-level truncation */
+static void utf8_trim(char* s) {
+    size_t n = strlen(s);
+    size_t i = n;
+    while(i > 0 && (((unsigned char)s[i - 1]) & 0xC0) == 0x80)
+        i--;
+    if(i == 0) {
+        s[0] = 0;
+        return;
     }
-    dst[i] = 0;
+    if(n - (i - 1) < utf8_len_at(&s[i - 1])) s[i - 1] = 0;
+}
+
+/* remove the last whole character */
+static void utf8_pop(char* s) {
+    size_t n = strlen(s);
+    if(!n) return;
+    do {
+        n--;
+    } while(n > 0 && (((unsigned char)s[n]) & 0xC0) == 0x80);
+    s[n] = 0;
+}
+
+static void utf8_fit(Canvas* c, char* s, int max_w) {
+    while(s[0] && canvas_string_width(c, s) > max_w)
+        utf8_pop(s);
+}
+
+/* keep printable ASCII and UTF-8 bytes, drop control chars */
+static void clean_copy(char* dst, size_t size, const char* src) {
+    size_t o = 0;
+    for(size_t i = 0; src && src[i] && o + 1 < size; i++) {
+        unsigned char ch = (unsigned char)src[i];
+        if(ch >= 0x20 && ch != 0x7f) dst[o++] = (char)ch;
+    }
+    dst[o] = 0;
+    utf8_trim(dst);
+}
+
+static void font_text(Canvas* c) {
+    canvas_set_custom_u8g2_font(c, u8g2_font_uplink_cyr);
 }
 
 static void draw_str_fit(Canvas* c, int x, int y, const char* s, int max_w) {
-    char buf[80];
+    char buf[128];
     clean_copy(buf, sizeof(buf), s);
-    size_t n = strlen(buf);
-    while(n > 0 && canvas_string_width(c, buf) > max_w) {
-        buf[--n] = 0;
-        if(n > 1) buf[n - 1] = '~';
+    if(canvas_string_width(c, buf) > max_w) {
+        char tmp[132];
+        while(buf[0]) {
+            utf8_pop(buf);
+            size_t m = strlen(buf);
+            memcpy(tmp, buf, m);
+            tmp[m] = '~';
+            tmp[m + 1] = 0;
+            if(canvas_string_width(c, tmp) <= max_w) break;
+        }
+        canvas_draw_str_aligned(c, x, y, AlignLeft, AlignTop, buf[0] ? tmp : "~");
+        return;
     }
     canvas_draw_str_aligned(c, x, y, AlignLeft, AlignTop, buf);
 }
 
 static void draw_wrapped(Canvas* c, int x, int y, int w, const char* text, int lines, int step) {
-    char buf[80];
+    char buf[128];
     const char* p = text;
     for(int ln = 0; ln < lines && *p; ln++) {
         while(*p == ' ')
             p++;
+        if(!*p) break;
         size_t best = 0, n = 0;
-        while(p[n] && n < sizeof(buf) - 1) {
-            memcpy(buf, p, n + 1);
-            buf[n + 1] = 0;
+        while(p[n]) {
+            size_t cl = utf8_len_at(p + n);
+            if(n + cl >= sizeof(buf)) break;
+            memcpy(buf, p, n + cl);
+            buf[n + cl] = 0;
             if(canvas_string_width(c, buf) > w) break;
-            n++;
+            n += cl;
             if(p[n] == ' ' || p[n] == 0) best = n;
         }
-        if(best == 0) best = n ? n : 1;
-        if(ln == lines - 1 && p[best]) best = n;
+        if(n == 0) n = utf8_len_at(p); // a single glyph wider than the line: show it anyway
+        if(best == 0 || (ln == lines - 1 && p[best])) best = n;
         memcpy(buf, p, best);
         buf[best] = 0;
-        clean_copy(buf, sizeof(buf), buf);
         canvas_draw_str_aligned(c, x, y + ln * step, AlignLeft, AlignTop, buf);
         p += best;
     }
@@ -463,6 +542,51 @@ static void parse_line(App* app, char* line) {
     case 'W':
         if(n >= 2) clean_copy(app->cmd.cwd, sizeof(app->cmd.cwd), f[1]);
         break;
+    case 'N':
+        // a newer release is available on the PC side
+        if(n >= 2 && ota_newer(f[1], UPLINK_VERSION) && app->ota.state != OtaReceiving &&
+           app->ota.state != OtaDone) {
+            if(strcmp(app->ota.tag, f[1]) != 0) {
+                clean_copy(app->ota.tag, sizeof(app->ota.tag), f[1]);
+                app->ota.notified = false;
+            }
+            app->ota.available = true;
+            if(!app->ota.notified) {
+                app->ota.notified = true;
+                if(app->settings.auto_update) {
+                    ota_request(app);
+                } else {
+                    app->alert = true;
+                    app->alert_update = true;
+                    app->alert_until = app->tick + ALERT_TICKS * 3;
+                    uplink_notify(app, NotifyUpdate);
+                }
+            }
+        }
+        break;
+    case 'U':
+        if(f[0][1] == 'B' && n >= 4) {
+            char ack[24];
+            if(ota_begin(&app->ota, f[1], strtoul(f[2], NULL, 10), strtoul(f[3], NULL, 10))) {
+                uplink_send(app, "UA|0");
+            } else {
+                snprintf(ack, sizeof(ack), "UA|-1");
+                uplink_send(app, ack);
+            }
+        } else if(f[0][1] == 'D' && n >= 3) {
+            int32_t w = ota_chunk(&app->ota, strtoul(f[1], NULL, 10), f[2]);
+            char ack[24];
+            snprintf(ack, sizeof(ack), "UA|%ld", (long)w);
+            uplink_send(app, ack);
+        } else if(f[0][1] == 'E') {
+            if(ota_finish(&app->ota)) {
+                uplink_notify(app, NotifyUpdate);
+                app->restart_at = app->tick + 8; // show "updated" for 2 s, then relaunch
+            } else {
+                uplink_notify(app, NotifyApproval);
+            }
+        }
+        break;
     case 'B':
         app->host_closed = true;
         break;
@@ -481,6 +605,7 @@ static void drain_rx(App* app) {
             app->link = true;
             app->host_closed = false;
             uplink_notify(app, NotifyLink);
+            send_version(app);
         }
         for(size_t i = 0; i < got; i++) {
             char ch = buf[i];
@@ -502,6 +627,24 @@ static void drain_rx(App* app) {
 
 static void uplink_send(App* app, const char* line) {
     if(app->profile) uplink_ble_tx(app->profile, (const uint8_t*)line, strlen(line));
+}
+
+static void send_version(App* app) {
+    uplink_send(app, "V|" UPLINK_VERSION);
+    app->ver_tick = app->tick;
+}
+
+/* ask the PC to stream the newer release */
+static void ota_request(App* app) {
+    if(!app->ota.available || app->ota.state == OtaReceiving) return;
+    char line[32];
+    snprintf(line, sizeof(line), "U|%s", app->ota.tag);
+    app->ota.state = OtaRequested;
+    app->ota_req_tick = app->tick;
+    app->ota.error[0] = 0;
+    app->alert = false;
+    app->alert_update = false;
+    uplink_send(app, line);
 }
 
 static void uplink_rx_callback(const uint8_t* data, uint16_t size, void* context) {
@@ -663,8 +806,8 @@ static void draw_list(Canvas* c, App* app, Kind k) {
         canvas_set_font(c, FontSecondary);
         int rw = canvas_string_width(c, right);
         canvas_draw_str_aligned(c, right_edge, y + 2, AlignRight, AlignTop, right);
-        canvas_set_font(c, large ? FontPrimary : FontSecondary);
-        draw_str_fit(c, 12, y + 1, it->name, right_edge - rw - 15);
+        font_text(c);
+        draw_str_fit(c, 12, y + (large ? 2 : 0), it->name, right_edge - rw - 15);
         if(i == l->cursor) {
             canvas_set_color(c, ColorXOR);
             canvas_draw_box(c, 0, y, right_edge + 2, rh);
@@ -687,8 +830,8 @@ static void draw_detail(Canvas* c, App* app, Kind k) {
         return;
     }
     Item* it = &l->items[l->cursor];
-    canvas_set_font(c, FontPrimary);
-    draw_str_fit(c, 2, 12, it->name, 124);
+    font_text(c);
+    draw_str_fit(c, 2, 11, it->name, 124);
     canvas_set_font(c, FontSecondary);
     const char* st = state_text(it->state);
     int sw = canvas_string_width(c, st);
@@ -709,7 +852,8 @@ static void draw_detail(Canvas* c, App* app, Kind k) {
         canvas_draw_str_aligned(c, 127, y, AlignRight, AlignTop, buf);
         y += 9;
     }
-    draw_wrapped(c, 2, y, 124, it->detail, (64 - y) / 8, 8);
+    font_text(c);
+    draw_wrapped(c, 2, y, 124, it->detail, (64 - y) / 9, 9);
 }
 
 static void draw_cmd(Canvas* c, App* app) {
@@ -725,11 +869,12 @@ static void draw_cmd(Canvas* c, App* app) {
         snprintf(head, sizeof(head), "%s> exit %d", tail, cmd->exit_code);
     else
         snprintf(head, sizeof(head), "%s>", tail[0] ? tail : "cmd");
-    char hbuf[48];
+    char hbuf[96];
     clean_copy(hbuf, sizeof(hbuf), head);
-    size_t hn = strlen(hbuf);
-    while(hn > 0 && canvas_string_width(c, hbuf) > 126) hbuf[--hn] = 0;
-    canvas_draw_str_aligned(c, 2, 11, AlignLeft, AlignTop, hbuf);
+    font_text(c);
+    utf8_fit(c, hbuf, 126);
+    canvas_draw_str_aligned(c, 2, 10, AlignLeft, AlignTop, hbuf);
+    canvas_set_font(c, FontSecondary);
     canvas_draw_line(c, 0, 19, 128, 19);
 
     if(cmd->count == 0) {
@@ -746,13 +891,14 @@ static void draw_cmd(Canvas* c, App* app) {
     if(start < 0) start = 0;
     bool sb = total > vis;
     int right = sb ? 124 : 128;
+    font_text(c);
     for(int r = 0; start + r < bottom; r++) {
         char buf[CMD_COLW];
         clean_copy(buf, sizeof(buf), cmd_line(cmd, start + r));
-        size_t nn = strlen(buf);
-        while(nn > 0 && canvas_string_width(c, buf) > right - 2) buf[--nn] = 0;
+        utf8_fit(c, buf, right - 2);
         canvas_draw_str_aligned(c, 1, top + r * step, AlignLeft, AlignTop, buf);
     }
+    canvas_set_font(c, FontSecondary);
     if(sb) {
         int track = vis * step;
         int h = track * vis / total;
@@ -768,6 +914,16 @@ static void draw_alert(Canvas* c, App* app) {
     canvas_draw_frame(c, 5, 13, 118, 40);
     canvas_draw_box(c, 7, 15, 114, 11);
     canvas_set_font(c, FontSecondary);
+    if(app->alert_update) {
+        char line[40];
+        bg(c);
+        canvas_draw_str_aligned(c, 64, 17, AlignCenter, AlignTop, ">> UPDATE AVAILABLE <<");
+        fg(c);
+        snprintf(line, sizeof(line), "%s -> %s", UPLINK_VERSION, app->ota.tag);
+        canvas_draw_str_aligned(c, 64, 29, AlignCenter, AlignTop, line);
+        canvas_draw_str_aligned(c, 64, 40, AlignCenter, AlignTop, "OK: install   Back: later");
+        return;
+    }
     bg(c);
     canvas_draw_str_aligned(
         c, 64, 17, AlignCenter, AlignTop,
@@ -775,13 +931,50 @@ static void draw_alert(Canvas* c, App* app) {
     fg(c);
     canvas_draw_str_aligned(
         c, 64, 28, AlignCenter, AlignTop, app->alert_kind == KindCodex ? "CODEX" : "CLAUDE");
-    canvas_set_font(c, FontPrimary);
-    char name[32];
+    font_text(c);
+    char name[64];
     clean_copy(name, sizeof(name), app->alert_name);
-    size_t nn = strlen(name);
-    while(nn > 1 && canvas_string_width(c, name) > 110)
-        name[--nn] = 0;
-    canvas_draw_str_aligned(c, 64, 39, AlignCenter, AlignTop, name);
+    utf8_fit(c, name, 110);
+    canvas_draw_str_aligned(c, 64, 38, AlignCenter, AlignTop, name);
+}
+
+static void draw_ota(Canvas* c, App* app) {
+    Ota* o = &app->ota;
+    char line[48];
+    bg(c);
+    canvas_draw_box(c, 4, 12, 120, 42);
+    fg(c);
+    canvas_draw_frame(c, 4, 12, 120, 42);
+    canvas_draw_box(c, 6, 14, 116, 11);
+    canvas_set_font(c, FontSecondary);
+    bg(c);
+    if(o->state == OtaDone) {
+        canvas_draw_str_aligned(c, 64, 16, AlignCenter, AlignTop, "UPDATED - RESTARTING");
+    } else if(o->state == OtaFailed) {
+        canvas_draw_str_aligned(c, 64, 16, AlignCenter, AlignTop, "UPDATE FAILED");
+    } else {
+        canvas_draw_str_aligned(c, 64, 16, AlignCenter, AlignTop, "UPDATING");
+    }
+    fg(c);
+    if(o->state == OtaFailed) {
+        canvas_draw_str_aligned(c, 64, 28, AlignCenter, AlignTop, o->error[0] ? o->error : "error");
+        canvas_draw_str_aligned(c, 64, 40, AlignCenter, AlignTop, "any key: close");
+        return;
+    }
+    snprintf(line, sizeof(line), "%s -> %s", UPLINK_VERSION, o->tag);
+    canvas_draw_str_aligned(c, 64, 27, AlignCenter, AlignTop, line);
+    uint8_t pct = (o->state == OtaRequested) ? 0 : ota_percent(o);
+    canvas_draw_frame(c, 10, 39, 108, 9);
+    int w = 106 * pct / 100;
+    if(w) canvas_draw_box(c, 11, 40, w, 7);
+    if(o->state == OtaRequested) {
+        snprintf(line, sizeof(line), "waiting for PC...");
+    } else {
+        snprintf(line, sizeof(line), "%u%%", pct);
+    }
+    canvas_set_color(c, ColorXOR); // readable over both the filled and the empty part
+    canvas_draw_str_aligned(c, 64, 40, AlignCenter, AlignTop, line);
+    fg(c);
 }
 
 static void draw_offline(Canvas* c, App* app) {
@@ -838,6 +1031,7 @@ static void main_draw(Canvas* c, void* model) {
             draw_list(c, app, screen_kind(screen));
         if(app->alert) draw_alert(c, app);
     }
+    if(app->ota.state != OtaIdle) draw_ota(c, app);
     furi_mutex_release(app->mutex);
 }
 
@@ -883,6 +1077,7 @@ static bool main_input(InputEvent* in, void* context) {
 
     if(in->type == InputTypeLong && in->key == InputKeyOk) {
         furi_mutex_release(app->mutex);
+        build_settings(app); // refresh the Version row (an update may have arrived)
         variable_item_list_set_selected_item(app->settings_view, 0);
         go_view(app, ViewSettings);
         return true;
@@ -891,11 +1086,34 @@ static bool main_input(InputEvent* in, void* context) {
         furi_mutex_release(app->mutex);
         return handled;
     }
+    // an update in progress owns the screen
+    if(app->ota.state == OtaFailed) {
+        app->ota.state = OtaIdle; // any key closes the error
+        furi_mutex_release(app->mutex);
+        return true;
+    }
+    if(app->ota.state == OtaRequested || app->ota.state == OtaReceiving) {
+        if(in->key == InputKeyBack) ota_abort(&app->ota, "cancelled");
+        furi_mutex_release(app->mutex);
+        return true;
+    }
+    if(app->ota.state == OtaDone) {
+        furi_mutex_release(app->mutex);
+        return true;
+    }
     if(app->alert) {
-        if(in->key == InputKeyOk)
+        if(app->alert_update) {
+            if(in->key == InputKeyOk) {
+                ota_request(app);
+            } else {
+                app->alert = false;
+                app->alert_update = false;
+            }
+        } else if(in->key == InputKeyOk) {
             open_alert_target(app);
-        else
+        } else {
             app->alert = false;
+        }
         furi_mutex_release(app->mutex);
         return true;
     }
@@ -997,6 +1215,7 @@ static const char* const ind_vals[] = {"Bars", "Text"};
 static const char* const theme_vals[] = {"Normal", "Inverted"};
 static const char* const font_vals[] = {"Normal", "Large"};
 static const char* const tab_vals[] = {"SYS", "CDX", "CLD", "CMD", "Off"};
+static const char* const update_vals[] = {"Notify", "Auto"};
 
 enum {
     SetVibro,
@@ -1010,6 +1229,8 @@ enum {
     SetTab1,
     SetTab2,
     SetTab3,
+    SetAutoUpdate,
+    SetVersion, // read-only; OK installs a pending update
 };
 
 static void setting_changed(VariableItem* item) {
@@ -1033,6 +1254,11 @@ static void setting_changed(VariableItem* item) {
     case SetTab3:
         text = tab_vals[idx];
         break;
+    case SetAutoUpdate:
+        text = update_vals[idx];
+        break;
+    case SetVersion:
+        return;
     default:
         text = on_off[idx];
         break;
@@ -1068,10 +1294,27 @@ static void setting_changed(VariableItem* item) {
         app->settings.tabs[sel - SetTab0] = idx;
         rebuild_tabs(app);
         break;
+    case SetAutoUpdate:
+        app->settings.auto_update = idx;
+        break;
     default:
         break;
     }
     furi_mutex_release(app->mutex);
+}
+
+/* OK on the Version row installs a pending update */
+static void settings_enter(void* context, uint32_t index) {
+    App* app = context;
+    if(index != SetVersion) return;
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+    bool go = app->ota.available && app->ota.state != OtaReceiving;
+    if(go) ota_request(app);
+    furi_mutex_release(app->mutex);
+    if(go) {
+        uplink_settings_save(&app->settings);
+        go_view(app, ViewMain);
+    }
 }
 
 static void add_toggle(
@@ -1100,6 +1343,17 @@ static void build_settings(App* app) {
     add_toggle(app, "Tab 2", tab_vals, 5, app->settings.tabs[1]);
     add_toggle(app, "Tab 3", tab_vals, 5, app->settings.tabs[2]);
     add_toggle(app, "Tab 4", tab_vals, 5, app->settings.tabs[3]);
+    add_toggle(app, "Updates", update_vals, 2, app->settings.auto_update);
+    // Version row: shows what is installed and what can be installed
+    static char version_text[40];
+    if(app->ota.available) {
+        snprintf(version_text, sizeof(version_text), "OK: get %s", app->ota.tag);
+    } else {
+        snprintf(version_text, sizeof(version_text), "v%s", UPLINK_VERSION);
+    }
+    VariableItem* it = variable_item_list_add(app->settings_view, "Version", 1, NULL, app);
+    variable_item_set_current_value_text(it, version_text);
+    variable_item_list_set_enter_callback(app->settings_view, settings_enter, app);
 }
 
 /* ------------------------------------------------------------------ events/tick */
@@ -1109,14 +1363,34 @@ static void refresh(App* app) {
 
 static bool custom_event(void* context, uint32_t event) {
     App* app = context;
+    bool restart = false;
     if(event == EvRx) {
         drain_rx(app);
     } else if(event == EvTick) {
         furi_mutex_acquire(app->mutex, FuriWaitForever);
         app->tick++;
-        if(app->alert && app->tick > app->alert_until) app->alert = false;
+        if(app->alert && app->tick > app->alert_until) {
+            app->alert = false;
+            app->alert_update = false;
+        }
+        if(app->link && app->tick - app->ver_tick > 120) send_version(app); // every 30 s
+        if(app->ota.state == OtaReceiving && !app->link) ota_abort(&app->ota, "link lost");
+        if(app->ota.state == OtaRequested && app->tick - app->ota_req_tick > 80)
+            ota_abort(&app->ota, "no answer from PC");
+        if(app->restart_at && app->tick >= app->restart_at) {
+            app->restart_at = 0;
+            restart = true;
+        }
         if(app->link && app->tick - app->last_rx_tick > LINK_TICKS) app->link = false;
         furi_mutex_release(app->mutex);
+    }
+    if(restart) {
+        // the new .fap is on the SD card: exit and let the loader start it
+        Loader* loader = furi_record_open(RECORD_LOADER);
+        loader_enqueue_launch(loader, app->ota.self_path, NULL, LoaderDeferredLaunchFlagNone);
+        furi_record_close(RECORD_LOADER);
+        view_dispatcher_stop(app->views);
+        return true;
     }
     if(app->current_view == ViewMain) refresh(app);
     return true;
@@ -1133,6 +1407,7 @@ int32_t uplink_app(void* p) {
     App* app = malloc(sizeof(App));
     memset(app, 0, sizeof(App));
     uplink_settings_load(&app->settings);
+    ota_init(&app->ota);
     rebuild_tabs(app);
     app->sys.net_max = 64;
     app->sys.dsk_max = 256;
@@ -1199,6 +1474,7 @@ int32_t uplink_app(void* p) {
     view_dispatcher_remove_view(app->views, ViewSettings);
     view_free(app->main_view);
     text_input_free(app->keyboard);
+    ota_free(&app->ota);
     variable_item_list_free(app->settings_view);
     view_dispatcher_free(app->views);
 

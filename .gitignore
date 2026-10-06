@@ -11,3 +11,7 @@ apps/dedsec_uplink/.vscode/
 # Local scratch / logs
 *.log
 scratchpad/
+
+# companion build output (the .exe is attached to releases)
+uplink/build/
+uplink/dist_exe/

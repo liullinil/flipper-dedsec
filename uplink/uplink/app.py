@@ -12,13 +12,14 @@ import threading
 import time
 from collections import deque
 
-from . import config
+from . import config, hooks
 from .claude import ClaudeWatcher
 from .codex import CodexWatcher
 from .common import ascii_text
 from .link import Link
 from .shell import Shell
 from .sysmon import SysMon
+from .updater import Updater
 
 APP_DIR = config.APP_DIR
 LOG_PATH = os.path.join(APP_DIR, "uplink.log")
@@ -45,6 +46,8 @@ class Feed:
         self.outbox_lock = threading.Lock()
         self.commands = queue.Queue()
         self.shell = None
+        self.updater = Updater()
+        self.updater.check_async(force=True)
         self.worker = threading.Thread(target=self._command_worker, name="cmd-worker", daemon=True)
         self.worker.start()
 
@@ -79,12 +82,18 @@ class Feed:
                 for i, r in enumerate(rows):
                     lines.append(f"I|{kind}|{i}|{r.key}|{r.state}|{r.done}|{r.total}|"
                                  f"{r.age(now)}|{r.attn}|{r.name}|{r.detail}")
-        # drain pending command output
+        self.updater.check_async()
+        lines += self.updater.advert()
+        if self.shell:
+            self.shell.poll_timeout()
+        return lines
+
+    def urgent(self):
+        """Lines that go out immediately: update chunks first, then command output."""
+        lines = self.updater.urgent()
         with self.outbox_lock:
             for _ in range(min(OUTBOX_PER_FRAME, len(self.outbox))):
                 lines.append(self.outbox.popleft())
-        if self.shell:
-            self.shell.poll_timeout()
         return lines
 
     def counts(self):
@@ -119,6 +128,16 @@ class Feed:
             self.commands.put((seq, command))
         elif tag == "K" and len(parts) >= 2 and self.shell:
             self.shell.cancel(parts[1])
+        elif tag == "V" and len(parts) >= 2:
+            self.updater.set_flipper_version(parts[1])
+        elif tag == "U" and len(parts) >= 2:
+            log.info("flipper asked for update %s", parts[1])
+            threading.Thread(target=self.updater.request, args=(parts[1],), daemon=True).start()
+        elif tag == "UA" and len(parts) >= 2:
+            try:
+                self.updater.on_ack(int(parts[1]))
+            except ValueError:
+                pass
 
     def _command_worker(self):
         while True:
@@ -140,7 +159,7 @@ def setup_logging(console):
     os.makedirs(APP_DIR, exist_ok=True)
     handlers = [logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=512 * 1024,
                                                      backupCount=2, encoding="utf-8")]
-    if console:
+    if console and sys.stdout is not None:      # the windowed .exe has no console
         handlers.append(logging.StreamHandler(sys.stdout))
     logging.basicConfig(level=logging.INFO, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -162,7 +181,7 @@ def dump(feed):
 
 def run_console(feed):
     link = Link(feed.frame, on_status=lambda st, name: print(f"[link] {st} {name}"),
-                on_rx=feed.handle_rx)
+                on_rx=feed.handle_rx, urgent_source=feed.urgent)
     link.start()
     try:
         while True:
@@ -190,7 +209,7 @@ def run_tray(feed, cfg):
         icon.title = f"DedSec Uplink: {status_text()}"
         icon.update_menu()
 
-    link = Link(feed.frame, on_status=on_status, on_rx=feed.handle_rx)
+    link = Link(feed.frame, on_status=on_status, on_rx=feed.handle_rx, urgent_source=feed.urgent)
 
     def toggle_pause(_icon, _item):
         link.set_paused(not link.paused)
@@ -202,6 +221,11 @@ def run_tray(feed, cfg):
 
     def toggle_autostart(_icon, _item):
         config.set_autostart(not config.autostart_enabled())
+        icon.update_menu()
+
+    def toggle_hooks(_icon, _item):
+        hooks.install(remove=hooks.installed())
+        log.info("claude hooks %s", "installed" if hooks.installed() else "removed")
         icon.update_menu()
 
     def open_log(_icon, _item):
@@ -223,6 +247,9 @@ def run_tray(feed, cfg):
             pystray.MenuItem(
                 "Start with Windows", toggle_autostart,
                 checked=lambda _i: config.autostart_enabled()),
+            pystray.MenuItem(
+                "Claude Code hooks (precise state)", toggle_hooks,
+                checked=lambda _i: hooks.installed()),
             pystray.MenuItem("Open log", open_log),
             pystray.MenuItem("Quit", quit_app),
         ))
@@ -240,7 +267,17 @@ def main():
     ap.add_argument("--console", action="store_true", help="run without the tray icon")
     ap.add_argument("--install-autostart", action="store_true", help="enable start with Windows")
     ap.add_argument("--uninstall-autostart", action="store_true", help="disable start with Windows")
+    ap.add_argument("--install-claude-hooks", action="store_true", help="add Claude Code hooks")
+    ap.add_argument("--remove-claude-hooks", action="store_true", help="remove Claude Code hooks")
+    ap.add_argument("--hook", action="store_true", help=argparse.SUPPRESS)  # run by Claude Code
     args = ap.parse_args()
+    if args.hook:
+        hooks.record_event()
+        return
+    if args.install_claude_hooks or args.remove_claude_hooks:
+        cmd = hooks.install(remove=args.remove_claude_hooks)
+        print("claude hooks", "removed" if args.remove_claude_hooks else "installed: " + cmd)
+        return
     setup_logging(console=args.console or args.dump)
     cfg = config.load()
 

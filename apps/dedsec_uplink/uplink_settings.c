@@ -15,6 +15,7 @@ void uplink_settings_default(UplinkSettings* s) {
     s->indicators = IndicatorsBars;
     s->theme = ThemeNormal;
     s->font = FontNormal;
+    s->auto_update = 0;
     s->tabs[0] = ScreenSys;
     s->tabs[1] = ScreenCodex;
     s->tabs[2] = ScreenClaude;
@@ -48,6 +49,7 @@ void uplink_settings_load(UplinkSettings* s) {
         RD("Indicators", indicators, 1);
         RD("Theme", theme, 1);
         RD("Font", font, 1);
+        RD("AutoUpdate", auto_update, 1);
 #undef RD
         uint32_t tabs[4];
         if(flipper_format_read_uint32(ff, "Tabs", tabs, 4)) {
@@ -80,6 +82,8 @@ void uplink_settings_save(const UplinkSettings* s) {
         flipper_format_write_uint32(ff, "Theme", &v, 1);
         v = s->font;
         flipper_format_write_uint32(ff, "Font", &v, 1);
+        v = s->auto_update;
+        flipper_format_write_uint32(ff, "AutoUpdate", &v, 1);
         uint32_t tabs[4];
         for(int i = 0; i < 4; i++) tabs[i] = s->tabs[i];
         flipper_format_write_uint32(ff, "Tabs", tabs, 4);

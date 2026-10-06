@@ -1,53 +1,15 @@
-"""Claude Code hook -> DedSec Uplink.
+"""Claude Code hook -> DedSec Uplink (script form; the .exe uses `DedSecUplink.exe --hook`).
 
-Configured in ~/.claude/settings.json for the events Notification, Stop, SubagentStop and
-UserPromptSubmit (see install_claude_hooks.py). Claude pipes a JSON object on stdin; we append
-one compact event line to <LOCALAPPDATA>\\DedSecUplink\\claude_events.jsonl, which the companion
-reads to show a precise state (needs-you / your-turn / working) for each Claude session.
-
-It must never fail or block Claude: everything is wrapped, output is nothing, exit is always 0.
+Appends one event line per Notification / Stop / SubagentStop / UserPromptSubmit so the companion
+can show a precise state for each Claude session. Always exits 0 and prints nothing.
 """
-import json
 import os
 import sys
-import time
 
-APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "DedSecUplink")
-EVENTS = os.path.join(APP_DIR, "claude_events.jsonl")
-MAX_BYTES = 256 * 1024
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-
-def main():
-    try:
-        raw = sys.stdin.read()
-        data = json.loads(raw) if raw.strip() else {}
-    except Exception:
-        data = {}
-    event = data.get("hook_event_name") or (sys.argv[1] if len(sys.argv) > 1 else "")
-    rec = {
-        "ts": time.time(),
-        "session_id": data.get("session_id", ""),
-        "event": event,
-        "message": (data.get("message") or "")[:200],
-        "cwd": data.get("cwd", ""),
-    }
-    try:
-        os.makedirs(APP_DIR, exist_ok=True)
-        # keep the file bounded without locking: rewrite tail when it grows too big
-        if os.path.exists(EVENTS) and os.path.getsize(EVENTS) > MAX_BYTES:
-            try:
-                with open(EVENTS, encoding="utf-8") as fh:
-                    tail = fh.readlines()[-500:]
-                with open(EVENTS, "w", encoding="utf-8") as fh:
-                    fh.writelines(tail)
-            except Exception:
-                pass
-        with open(EVENTS, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-
+from uplink.hooks import record_event  # noqa: E402
 
 if __name__ == "__main__":
-    main()
+    record_event()
     sys.exit(0)

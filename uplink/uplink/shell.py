@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 
-from .common import ascii_text
+from .common import utf8_text
 
 log = logging.getLogger("uplink.shell")
 
@@ -72,7 +72,8 @@ class Shell:
         if self.kind == "powershell":
             self.proc.stdin.write("Write-Output \"%s 0 $($PWD.Path)\"\n" % self.sentinel)
         else:
-            self.proc.stdin.write("echo %s 0 %%CD%%\r\n" % self.sentinel)
+            # UTF-8 code page, so Cyrillic file names and messages reach the Flipper intact
+            self.proc.stdin.write("chcp 65001>nul\r\necho %s 0 %%CD%%\r\n" % self.sentinel)
         self.proc.stdin.flush()
         log.info("shell started (%s) pid %s", self.kind, self.proc.pid)
 
@@ -103,7 +104,7 @@ class Shell:
                         self.seq = None
                         self.sentinel = ""
                     if cwd:
-                        self.on_cwd(ascii_text(cwd, 120))
+                        self.on_cwd(utf8_text(cwd, 120))
                     if was_seq is None:
                         self.ready.set()  # prime sentinel: banner consumed, ready for commands
                     else:
@@ -119,7 +120,7 @@ class Shell:
                         if self.lines == MAX_OUTPUT_LINES + 1:
                             self.on_output(seq, "...output truncated...")
                         continue
-                for chunk in _wrap(ascii_text(line, 4000), LINE_CHARS):
+                for chunk in _wrap(utf8_text(line, 4000), LINE_CHARS):
                     self.on_output(seq, chunk)
         except Exception as exc:  # pipe closed on kill/restart
             log.debug("reader stopped: %s", exc)

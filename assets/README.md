@@ -1,57 +1,57 @@
-# Flipper Zero — анимации рабочего стола в стиле Watch Dogs
+# Watch Dogs style desktop animations
 
-Девять idle-анимаций 128×64, 1 бит. Сделаны по референсам из игр, это личные фан-версии логотипов
-для своего Flipper (не для распространения). Прошивка: Unleashed `unlshd-093c`, порт COM5.
+Nine 1-bit 128×64 idle animations for the Flipper Zero dolphin desktop (Unleashed `unlshd-093c`).
+Original pixel art inspired by the games — not copied Ubisoft assets. Previews include the desktop status bar.
 
-| Папка на SD (`/ext/dolphin/…`) | Что показывает |
-|---|---|
-| `WD_Wordmark_128x64` | WATCH_DOGS: курсор-подчёркивание мигает, надпись собирается из глитча, «EVERYTHING IS CONNECTED» |
-| `WD_Blume_ctOS_128x64` | Куб Blume рисуется по рёбрам над шумным горизонтом, «BLUME», «CTOS 2.0 // ONLINE» |
-| `WD_DedSec_Decrypt_128x64` | Высокие пиксельные буквы DEDSEC расшифровываются из зеркального мусора, «> JOIN US_» |
-| `WD_DedSec_Hood_128x64` | Человек в капюшоне с черепом на полутоновом фоне, граффити DEDSEC, глаза вспыхивают |
-| `WD_Legion_128x64` | W в стиле Legion собирается из вертикального «дождя», HUD-элементы |
-| `WD_Emblem_128x64` | Кольцо-мазок кисти обводится, внутри процарапывается W |
-| `WD2_Spray_128x64` | W из баллончика с подтёками, плашка WATCH_DOGS 2 |
-| `WD_Operator_128x64` | LED-маска, глаза меняют эмоции (`o o`, `> <`, `^ ^`, `x x`, `+ +`) |
-| `WD_Breach_128x64` | Терминал взлома ctOS: SCANNING → BYPASS → ACCESS GRANTED, скайлайн |
+![All animations](previews/showreel.gif)
 
-Превью: `previews/<имя>.gif` (с настоящей строкой состояния), `previews/showreel.gif` — все подряд.
+| Animation | Preview | What happens |
+|---|---|---|
+| `WD_Wordmark_128x64` | ![](previews/WD_Wordmark_128x64.gif) | The underscore blinks like a cursor, WATCH_DOGS tears into place, "EVERYTHING IS CONNECTED" |
+| `WD_Blume_ctOS_128x64` | ![](previews/WD_Blume_ctOS_128x64.gif) | The Blume cube draws itself over a noisy skyline, "BLUME", "CTOS 2.0 // ONLINE" |
+| `WD_DedSec_Decrypt_128x64` | ![](previews/WD_DedSec_Decrypt_128x64.gif) | Tall pixel DEDSEC letters decrypt out of mirrored junk, "> JOIN US_" |
+| `WD_DedSec_Hood_128x64` | ![](previews/WD_DedSec_Hood_128x64.gif) | Hooded skull over a halftone gradient, graffiti DEDSEC tag, glowing eyes |
+| `WD_Legion_128x64` | ![](previews/WD_Legion_128x64.gif) | A Legion-style W assembles from vertical glitch rain, HUD details |
+| `WD_Emblem_128x64` | ![](previews/WD_Emblem_128x64.gif) | A brush ring sweeps around, the W is scratched in |
+| `WD2_Spray_128x64` | ![](previews/WD2_Spray_128x64.gif) | A spray-painted W with drips, the WATCH_DOGS 2 banner slams in |
+| `WD_Operator_128x64` | ![](previews/WD_Operator_128x64.gif) | LED mask eyes: `o o`, `> <`, `^ ^`, `x x`, `+ +` |
+| `WD_Breach_128x64` | ![](previews/WD_Breach_128x64.gif) | ctOS breach terminal: SCANNING → BYPASS → ACCESS GRANTED |
 
-## Как устроены смена и темп
+## How pacing and rotation work
 
-- **Темп**: 2 кадра/с, как у стоковых анимаций. Паузы — повтором кадра в `Frames order`
-  (основной кадр держится 2–3 с, глитч-вспышки по 0.5 с).
-- **Чередование**: в Unleashed нет настройки «менять анимацию». Прошивка выбирает новую случайную
-  анимацию, когда истекает `Duration` текущей (у стоковых 3600 с). У наших `Duration` равна целому числу
-  циклов около 30 с, поэтому смена приходится на конец цикла.
-- **Встроенный дельфин у телевизора** (`L1_Tv_128x47`, вес 3, показывается час) всегда участвует в
-  случайном выборе, убрать его без перепрошивки нельзя. Поле веса в манифесте 8-битное (до 255), но
-  повторы записей складываются: каждая наша анимация записана 16 раз с весом 255. Шанс дельфина при
-  смене ~0.01 % вместо 6 %. Сразу после загрузки, если SD-карта ещё не готова, он всё же может выпасть;
-  лечится перезагрузкой.
-- **Строка состояния** (иконки и батарея) рисуется поверх верхних 13 строк экрана и частично прозрачна,
-  поэтому верх каждого кадра — чистый фон, а вся графика в строках 13–63.
+- **Pace**: 2 frames per second, like the stock animations. Holds come from repeating a frame in
+  `Frames order` (main frames stay 2–3 s, glitch flashes 0.5 s).
+- **Rotation**: Unleashed has no "cycle animations" setting. The firmware picks a new random idle animation
+  when the current one's `Duration` runs out (stock animations use 3600 s). Ours use a whole number of loops
+  close to 30 s, so the switch lands on the end of a loop.
+- **The built-in TV dolphin** (`L1_Tv_128x47`, weight 3, shown for an hour) is always in the random pool and
+  can't be removed without reflashing. Manifest weights are 8-bit (max 255), but repeated entries add up:
+  each animation is listed 16 times with weight 255, which cuts the dolphin's chance per switch from 6 % to
+  ~0.01 %. Right after boot, if the SD card isn't ready yet, it can still show up — a reboot fixes it.
+- **Status bar**: the desktop draws its icons and battery over the top 13 rows and is partly transparent,
+  so the top of every frame is plain background and the art lives in rows 13–63.
 
-## Пересборка и заливка
+## Build and upload
 
 ```bash
-python tools/build_anims.py       # кадры, .bm, meta.txt, манифест, превью
-python tools/upload_anims.py      # залить на Flipper (md5-сверка), без перезагрузки
+python tools/build_anims.py       # frames, .bm, meta.txt, manifest, previews
+python tools/upload_anims.py      # upload over USB with md5 checks (no reboot needed)
 ```
 
-Менеджер анимаций перечитывает манифест при каждой смене, перезагрузка не нужна.
-`--reboot` — перезагрузить сразу, `--manifest-only` — залить только манифест.
+The animation manager re-reads the manifest on every switch. `--reboot` restarts the Flipper right away,
+`--manifest-only` uploads just the manifest.
 
-Код: `tools/wdanim/` (по сцене на файл, `core.py` — эффекты, упаковка, превью). Шрифты берутся из
-Windows (Impact, Haettenschweiler), остальное нарисовано в коде через PIL.
-Длительность показа меняется в `TARGET_SHOW_S` (`core.py`), веса и повторы — в `tools/build_anims.py`.
+Code: [`tools/wdanim/`](../tools/wdanim) — one file per scene, `core.py` holds the effects, packing and
+previews. Fonts come from Windows (Impact, Haettenschweiler); everything else is drawn in code with PIL.
+Show time is `TARGET_SHOW_S` in `core.py`; weights and repeats are in `tools/build_anims.py`.
 
-## Откат
+| Folder | Contents |
+|---|---|
+| `dolphin/` | exactly what goes to `/ext/dolphin` on the SD card (`.bm` frames, `meta.txt`, `manifest.txt`) |
+| `frames/` | unique frames as PNG, for review and editing |
+| `previews/` | LCD-coloured GIFs and contact sheets |
 
-Стоковый манифест: `backup/dolphin_manifest_before_custom.txt` → залить в `/ext/dolphin/manifest.txt`.
-Стоковые папки анимаций на карте не трогались.
+## Restore the stock animations
 
-## Проверка на устройстве
-
-`python tools/screen.py 60 out_dir` пишет экран Flipper по USB (как qFlipper): PNG каждого нового кадра
-и `capture.gif`. Так проверялись смена анимаций и строка состояния.
+Upload a stock `manifest.txt` back to `/ext/dolphin/manifest.txt` (the stock animation folders are untouched),
+or reinstall the firmware.

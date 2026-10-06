@@ -38,6 +38,8 @@ def save(cfg):
 
 # --------------------------------------------------------------------------- autostart
 def _script_command():
+    if getattr(sys, "frozen", False):          # the PyInstaller .exe starts itself
+        return '"%s"' % sys.executable
     script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           "dedsec_uplink.pyw")
     base = os.path.dirname(sys.executable)
