@@ -17,8 +17,4 @@ Use Left/Right to select a mode and OK to start or stop the receiver:
   `external-field`/`carrier-presence` metadata. It never starts a poller or
   listener and never enables a carrier, sends a frame, or reads a UID.
 
-A stable random device ID is persisted in `apps_data/rf_signal_hunter/device_id`; each launch gets a random session ID, so event IDs remain unique across restarts. Events are appended to `apps_data/rf_signal_hunter/events.jsonl` with RTC
-calendar time, monotonic tick, session/sequence IDs, mode, frequency, pulse
-count, and last pulse duration. Back exits the app and always stops RX before
-returning. The implementation is intentionally narrowband and does not claim
-continuous SDR coverage.
+A stable random device ID is persisted in `apps_data/rf_signal_hunter/device_id`; each launch gets a random session ID, so event IDs remain unique across restarts. Durable event records are committed under `apps_data/rf_signal_hunter/events/` and reclaimed only after a validated BLE ACK; receipts retain compact identity/time/fingerprint metadata. Records include RTC calendar time, UTC/local epochs, a monotonic session offset, session/sequence IDs, mode, frequency, pulse count, and last pulse duration where applicable. Back exits the app and always stops RX/NFC detection before returning. The implementation is intentionally narrowband and does not claim continuous SDR coverage.
