@@ -575,6 +575,9 @@ class RfHunterApp:
             from .rf_ble import BleakRfAdapter
             adapter = BleakRfAdapter(timeout=10)
             try:
+                await adapter.connect()
+                hello = await adapter.hello()
+                self.root.after(0, self._sync_pending, hello.get("pending"))
                 progress = lambda stats: self.root.after(
                     0, self._sync_progress, stats)
                 return await adapter.sync_to(self._sync_target, progress=progress)
@@ -586,6 +589,9 @@ class RfHunterApp:
             self.root.after(0, self._sync_finished, None, exc)
         else:
             self.root.after(0, self._sync_finished, result, None)
+
+    def _sync_pending(self, pending):
+        self.status.configure(text=f"BLE connected · {pending if pending is not None else '?'} pending on Flipper")
 
     def _sync_progress(self, stats):
         self.status.configure(
