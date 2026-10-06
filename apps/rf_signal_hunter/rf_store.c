@@ -50,6 +50,23 @@ static void event_path(char* out, size_t cap, const char* dir, const char* event
     snprintf(out, cap, "%s/%s%s", dir, event_id, suffix);
 }
 
+/* Event IDs are generated locally, but the BLE pull profile accepts an ID
+ * supplied by the connected desktop.  Keep that input a filename component;
+ * allowing separators here would let an unauthenticated central traverse the
+ * app-data directory while asking for a read or ACK. */
+static bool rf_store_valid_event_id(const char* event_id) {
+    if(!event_id || !event_id[0]) return false;
+    size_t len = strlen(event_id);
+    if(len >= 96) return false;
+    for(size_t i = 0; i < len; i++) {
+        char c = event_id[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '-' || c == '_';
+        if(!ok) return false;
+    }
+    return true;
+}
+
 static bool is_json_file(const char* name);
 
 static void rf_store_set_error(RfStore* store, RfStoreError error) {
@@ -213,7 +230,7 @@ uint32_t rf_store_pending_count(RfStore* store) {
 }
 
 bool rf_store_save(RfStore* store, const char* event_id, const char* json, size_t len) {
-    if(!store || !event_id || !json || !len) {
+    if(!store || !rf_store_valid_event_id(event_id) || !json || !len) {
         rf_store_set_error(store, RfStoreErrorInvalidArgument);
         return false;
     }
@@ -262,7 +279,7 @@ bool rf_store_save(RfStore* store, const char* event_id, const char* json, size_
 
 bool rf_store_read(RfStore* store, const char* event_id, char* out, size_t cap, size_t* used) {
     if(used) *used = 0;
-    if(!store || !event_id || !out || cap < 2) return false;
+    if(!store || !rf_store_valid_event_id(event_id) || !out || cap < 2) return false;
     char path[160];
     event_path(path, sizeof(path), RF_STORE_EVENTS_DIR, event_id, ".json");
     File* file = storage_file_alloc(store->storage);
@@ -279,7 +296,7 @@ bool rf_store_read(RfStore* store, const char* event_id, char* out, size_t cap, 
 }
 
 bool rf_store_is_acked(RfStore* store, const char* event_id) {
-    if(!store || !event_id) return false;
+    if(!store || !rf_store_valid_event_id(event_id)) return false;
     char path[160];
     event_path(path, sizeof(path), RF_STORE_RECEIPTS_DIR, event_id, ".ack");
     FileInfo info;
@@ -287,7 +304,7 @@ bool rf_store_is_acked(RfStore* store, const char* event_id) {
 }
 
 bool rf_store_ack(RfStore* store, const char* event_id) {
-    if(!store || !event_id) {
+    if(!store || !rf_store_valid_event_id(event_id)) {
         rf_store_set_error(store, RfStoreErrorInvalidArgument);
         return false;
     }
