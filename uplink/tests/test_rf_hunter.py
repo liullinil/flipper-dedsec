@@ -66,6 +66,27 @@ def test_flipper_compact_record_is_normalized():
     assert event.duration_us == 900
 
 
+def test_flipper_follow_and_local_fingerprint_fields_roundtrip():
+    event = RfEvent.from_dict({
+        "event_id": "rf-device-session-3",
+        "device_id": "device",
+        "session_id": "session",
+        "sequence_number": 3,
+        "captured_at_utc": "2026-01-01T00:00:00Z",
+        "monotonic_ms": 12,
+        "frequency_hz": 433920000,
+        "fingerprint_id": "local-1234abcd",
+        "family_id": None,
+        "classification": "unknown",
+        "follow_profile_id": "duration-900",
+        "follow_similarity": 0.96,
+    })
+    assert event.fingerprint_id == "local-1234abcd"
+    assert event.follow_profile_id == "duration-900"
+    assert event.follow_similarity == 0.96
+    assert RfEvent.from_dict(event.to_dict()).follow_profile_id == "duration-900"
+
+
 def test_passive_nfc_field_record_preserves_observation_metadata():
     event = RfEvent.from_dict({
         "event_id": "rf-device-session-nfc-1",

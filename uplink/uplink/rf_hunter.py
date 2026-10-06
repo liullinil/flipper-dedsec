@@ -9,10 +9,22 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterator, Optional
+
+
+_SAFE_EVENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def validate_event_id(value: str) -> str:
+    """Validate the identifier before it can become a filesystem path."""
+    value = str(value)
+    if not _SAFE_EVENT_ID.fullmatch(value):
+        raise ValueError("unsafe RF event id")
+    return value
 
 
 def event_id(device_uuid: str, session_id: str, sequence_number: int) -> str:
@@ -54,6 +66,9 @@ class RfEvent:
     family_id: Optional[str] = None
     classification: str = "unknown"
     classification_confidence: float = 0.0
+    profile_id: str = ""
+    follow_profile_id: str = ""
+    follow_similarity: float = 0.0
     capture_blob: str = ""
     upload_state: str = "pending"
     timezone_offset_minutes: int = 0
@@ -65,7 +80,11 @@ class RfEvent:
     def __post_init__(self):
         if not self.event_id:
             self.event_id = event_id(self.device_uuid, self.session_id, self.sequence_number)
+        self.event_id = validate_event_id(self.event_id)
         self.pulse_timings_us = tuple(int(x) for x in self.pulse_timings_us)
+        self.follow_similarity = float(self.follow_similarity)
+        if not 0.0 <= self.follow_similarity <= 1.0:
+            raise ValueError("follow similarity must be between 0 and 1")
         self.timezone_offset_minutes = int(self.timezone_offset_minutes)
         if not -14 * 60 <= self.timezone_offset_minutes <= 14 * 60:
             raise ValueError("timezone offset is outside the supported UTC±14:00 range")
