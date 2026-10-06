@@ -14,6 +14,7 @@ void rf_settings_defaults(RfHunterSettings* settings) {
     settings->band_profile = 0;
     settings->timezone_offset_minutes = 0;
     settings->retention_policy = RfRetentionCompactAfterAck;
+    settings->feedback_enabled = 1;
     settings->min_free_bytes = RF_SETTINGS_DEFAULT_MIN_FREE_BYTES;
     settings->version = RF_SETTINGS_VERSION;
 }
@@ -50,12 +51,15 @@ bool rf_settings_load(Storage* storage, RfHunterSettings* settings) {
         if(n == sizeof(RfHunterSettings)) {
             RfHunterSettings candidate;
             memcpy(&candidate, raw, sizeof(candidate));
-            if(candidate.version == RF_SETTINGS_VERSION) {
+            if(candidate.version == RF_SETTINGS_VERSION || candidate.version == 2U) {
                 settings->timezone_offset_minutes = candidate.timezone_offset_minutes;
                 settings->retention_policy = candidate.retention_policy;
-                settings->reserved = candidate.reserved;
+                /* Version 2 used this byte as reserved; migrate it to the
+                 * enabled default instead of unexpectedly muting feedback. */
+                settings->feedback_enabled = candidate.version == RF_SETTINGS_VERSION ?
+                                                  (candidate.feedback_enabled ? 1 : 0) : 1;
                 settings->min_free_bytes = candidate.min_free_bytes;
-                settings->version = candidate.version;
+                settings->version = RF_SETTINGS_VERSION;
             }
         }
     }
@@ -64,7 +68,7 @@ bool rf_settings_load(Storage* storage, RfHunterSettings* settings) {
        settings->rssi_threshold_dbm < -110 || settings->rssi_threshold_dbm > -30 ||
        settings->capture_ms < 200 || settings->capture_ms > 2000 ||
        settings->silence_us < 1000 || settings->silence_us > 30000 ||
-       settings->band_profile > 3 ||
+       settings->band_profile > 3 || settings->feedback_enabled > 1 ||
        settings->timezone_offset_minutes < -14 * 60 ||
        settings->timezone_offset_minutes > 14 * 60 ||
        settings->retention_policy > RfRetentionStopWhenFull ||
@@ -83,7 +87,7 @@ bool rf_settings_save(Storage* storage, const RfHunterSettings* settings) {
        value.rssi_threshold_dbm < -110 || value.rssi_threshold_dbm > -30 ||
        value.capture_ms < 200 || value.capture_ms > 2000 ||
        value.silence_us < 1000 || value.silence_us > 30000 ||
-       value.band_profile > 3 ||
+       value.band_profile > 3 || value.feedback_enabled > 1 ||
        value.timezone_offset_minutes < -14 * 60 ||
        value.timezone_offset_minutes > 14 * 60 ||
        value.retention_policy > RfRetentionStopWhenFull ||

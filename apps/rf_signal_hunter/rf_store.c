@@ -114,12 +114,13 @@ static bool write_receipt(RfStore* store, File* file, const char* event_id, cons
     int header_len = snprintf(header, sizeof(header), "{\"event_id\":\"%s\",\"upload_state\":\"uploaded\",\"schema_version\":1", event_id);
     ok = ok && header_len > 0 && (size_t)header_len < sizeof(header) && write_exact(file, header, (size_t)header_len);
     static const char* fields[] = {
+        "battery_pct",
         "device_uuid", "device_id", "session_id", "sequence_number", "captured_at_utc",
         "captured_at_unix", "timezone_offset_minutes", "rtc_local_unix", "monotonic_ms",
-        "source_type", "frequency_hz", "modulation", "bandwidth_hz", "fingerprint_id",
-        "family_id", "profile_id", "follow_profile_id", "follow_similarity", "repeat_count",
-        "rssi_min_dbm", "rssi_avg_dbm", "rssi_max_dbm", "duration_us", "last_duration_us",
-        "nfc_technology", "nfc_protocol", "nfc_field_duration_ms", "nfc_field_count",
+        "source_type", "frequency_hz", "modulation", "bandwidth_hz", "duration_us", "repeat_count", "fingerprint_id",
+        "family_id", "profile_id", "follow_profile_id", "follow_similarity",
+        "rssi_min_dbm", "rssi_avg_dbm", "rssi_max_dbm", "last_duration_us",
+        "nfc_technology", "nfc_protocol", "nfc_identifier", "nfc_field_duration_ms", "nfc_field_count", "nfc_confidence",
         "classification", "classification_confidence"
     };
     for(size_t i = 0; ok && i < sizeof(fields) / sizeof(fields[0]); i++) {

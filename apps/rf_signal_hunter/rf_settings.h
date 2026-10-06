@@ -14,7 +14,9 @@ typedef struct {
     /* Retention is deliberately explicit: a full card must never silently
        overwrite pending evidence. */
     uint8_t retention_policy;
-    uint8_t reserved;
+    /* User feedback is enabled by default; this field replaced the old
+       reserved byte in settings version 3. */
+    uint8_t feedback_enabled;
     uint32_t min_free_bytes;
     uint32_t version;
 } RfHunterSettings;
@@ -28,7 +30,7 @@ typedef enum {
     RfRetentionStopWhenFull = 2,
 } RfRetentionPolicy;
 
-#define RF_SETTINGS_VERSION 2U
+#define RF_SETTINGS_VERSION 3U
 #define RF_SETTINGS_DEFAULT_MIN_FREE_BYTES (32U * 1024U)
 
 void rf_settings_defaults(RfHunterSettings* settings);

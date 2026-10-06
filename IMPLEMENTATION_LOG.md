@@ -17,8 +17,9 @@ physical hardware or product work.
   orientation when it changes and when the app starts.
 - Added a real RF settings page for dwell, RSSI threshold, capture window,
   silence threshold, band profile, timezone, retention and reserve space.
-  Values are clamped to safe ranges and saved atomically. The capture window
-  now closes a burst even when a long silence edge is not observed.
+  Values are clamped to safe ranges and saved atomically. A feedback toggle
+  silences alerts without stopping logging. The capture window now closes a
+  burst even when a long silence edge is not observed.
 - Implemented passive NFC field-on/field-off event persistence. The FAP uses
   only the SDK external-field detector; it never starts a poller, listener,
   transmitter or replay operation. Field events carry UTC/local epochs,
@@ -38,6 +39,10 @@ physical hardware or product work.
 - Added fragmented wire tests, NFC contract tests, analyzer sync tests and a
   native C persistence harness that compiles the production store/settings
   sources with fault injection.
+- The analyzer can open the FAP's `events/` and `receipts/` directories directly,
+  merge duplicate exports without losing a raw capture, show family evidence
+  and similarity reasons, and run BLE sync in a background thread after a
+  hello/pending-count check.
 
 ## Deliberate limits and unfinished work
 
@@ -52,7 +57,9 @@ physical hardware or product work.
   protocol and fault tests but no claim of hardware E2E validation.
 - Existing pre-feature `events.jsonl` files are retained for evidence. A
   one-time migration/archive tool and a packaged desktop analyzer are still
-  future work.
+  future work. Manual family merge/split/relabel controls and a graph-node
+  animation remain future investigation features; the current UI exposes the
+  authoritative automatic grouping, evidence, reasons and Follow export.
 
 ## Verification
 
@@ -62,7 +69,7 @@ From the repository root:
 python -m pytest -q tests uplink/tests
 ```
 
-The current result is **47 passed**. Both Flipper applications build with the
+The current result is **53 passed** with `PYTHONPATH=uplink`. Both Flipper applications build with the
 Unleashed SDK and report **Target: 7, API: 88.9**:
 
 ```text

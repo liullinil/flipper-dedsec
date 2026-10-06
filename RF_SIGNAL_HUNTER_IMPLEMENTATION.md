@@ -13,8 +13,8 @@ than continuous IQ.
   RX-only; NFC uses only the HAL external-field detector. No RF/NFC TX, replay,
   emulation, poller, or listener calls are used.
 - Scout cycles the initial 315 MHz, 433.920 MHz and 868.350 MHz profiles,
-  records RSSI min/average/max and pulse timing data, and gives immediate
-  audiovisual feedback at burst boundaries.
+  records event-scoped RSSI min/average/max and pulse timing data, and gives
+  audiovisual feedback on the first observed edge before the burst closes.
 - Device identity is persisted on the SD card and each run gets a session ID.
   Event IDs include device, session and sequence components.
 - Captures use a bounded ISR-safe timing ring and durable SD records. Writes are
@@ -25,13 +25,18 @@ than continuous IQ.
   the raw RTC epoch, the offset and a monotonic session-relative time.
 - The same settings page exposes dwell (50 ms), RSSI threshold, capture window,
   silence threshold and the ALL/433/315/868 band profile. Values are range
-  checked before saving and are applied to the live Scout/Capture loop.
+  checked before saving and are applied to the live Scout/Capture loop. A
+  feedback toggle can silence future audiovisual alerts without stopping logs;
+  settings version 2 is migrated to the enabled default.
 - The store refuses to replace an existing event ID. A low-space guard reports
   an error and red LED; the explicit stop-on-full policy halts Sub-GHz RX.
   Incomplete writes and an interrupted ACK/reclaim are recovered on restart.
 - The RF Hunter BLE profile has separate service/characteristic UUIDs. The
   desktop pull protocol supports hello, paged manifest, offset reads, CRC checks,
   durable import, resumable staging and acknowledgement-based reclamation.
+- Manifest requests are flow-controlled one item at a time; ACK is idempotent
+  after a lost response, and the hello response reports pending count, free
+  bytes and the negotiated chunk ceiling.
 - Desktop event storage is idempotent by event ID. Repeated observations remain
   separate records while structural grouping is calculated independently.
 - Desktop fingerprints use carrier, modulation, bandwidth, pulse widths/gaps,
@@ -43,7 +48,8 @@ than continuous IQ.
   observations group by this passive metadata while preserving each event.
 - The Tk analyzer supports multiple stores, date/frequency/RSSI/source/family
   filters, sampled waterfall, spectrum, timeline, similarity explanations,
-  notes/location, raw capture details and JSON/CSV export.
+  family evidence details, nearest-observation reasons, background BLE sync
+  progress, notes/location, raw capture details and versioned JSON/CSV export.
 - Tests cover terminal behavior, RF event storage, upload resume/checksums,
   BLE framing, grouping, analyzer filters and session views.
 
@@ -83,7 +89,8 @@ The RF Hunter FAP builds with
 `python -m ufbt` and reports `Target: 7, API: 88.9`. Changes are committed and
 pushed to `origin/main` after each completed slice.
 
-The Python suite currently passes with `47 passed`. The native persistence test
+The Python suite currently passes with `53 passed` when run as
+`PYTHONPATH=uplink python -m pytest -q tests uplink/tests`. The native persistence test
 compiles the actual `rf_store.c` and
 `rf_settings.c`; injected write/sync failures and interrupted rename/ACK
 sequences verify that pending records survive and settings recover. Run it with

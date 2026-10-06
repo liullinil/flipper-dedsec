@@ -88,6 +88,8 @@ class RfEvent:
     frequency_hz: int = 0
     modulation: str = "unknown"
     bandwidth_hz: int = 0
+    battery_pct: int = 0
+    firmware_version: str = ""
     rssi_min_dbm: float = 0.0
     rssi_avg_dbm: float = 0.0
     rssi_max_dbm: float = 0.0
@@ -107,11 +109,13 @@ class RfEvent:
     rtc_local_unix: Optional[int] = None
     pulse_timings_us: tuple = field(default_factory=tuple)
     event_id: str = ""
+    schema_version: int = 1
 
     def __post_init__(self):
         if not self.event_id:
             self.event_id = event_id(self.device_uuid, self.session_id, self.sequence_number)
         self.event_id = validate_event_id(self.event_id)
+        self.schema_version = int(self.schema_version or 1)
         self.pulse_timings_us = tuple(int(x) for x in self.pulse_timings_us)
         self.follow_similarity = float(self.follow_similarity)
         if not 0.0 <= self.follow_similarity <= 1.0:
