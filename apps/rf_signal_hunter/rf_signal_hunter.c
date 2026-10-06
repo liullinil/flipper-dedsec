@@ -12,6 +12,7 @@
 #include <notification/notification_messages.h>
 #include <storage/storage.h>
 #include <furi_hal_rtc.h>
+#include <datetime/datetime.h>
 #include <furi_hal_random.h>
 #include <furi_hal_nfc.h>
 #include <furi_hal_bt.h>
@@ -50,6 +51,7 @@ typedef struct {
     volatile uint32_t last_duration;
     uint32_t notified_bursts;
     uint32_t sequence;
+    uint32_t session_start_tick;
     uint32_t follow_duration;
     RfCaptureEngine capture;
     RfCaptureTiming* event_timings;
@@ -60,6 +62,9 @@ typedef struct {
     bool running;
     bool receiver_active;
     bool nfc_detect_active;
+    bool storage_full;
+    bool settings_open;
+    uint8_t setting_index;
     uint8_t frequency_index;
     uint32_t events_reviewed;
     uint32_t families_seen;
@@ -130,15 +135,22 @@ static bool hunter_event_selected(const Hunter* hunter) {
 
 static void hunter_record(Hunter* hunter) {
     if(!hunter->events_file || !storage_file_is_open(hunter->events_file)) return;
+    DateTime local;
+    furi_hal_rtc_get_datetime(&local);
+    /* RTC calendar fields are local time; apply the persisted offset before
+       labelling the instant as UTC.  Keep the raw RTC epoch for audit. */
+    uint32_t rtc_epoch = datetime_datetime_to_timestamp(&local);
+    int64_t utc_epoch = (int64_t)rtc_epoch - (int64_t)hunter->settings.timezone_offset_minutes * 60;
+    if(utc_epoch < 0) utc_epoch = 0;
     DateTime now;
-    furi_hal_rtc_get_datetime(&now);
+    datetime_timestamp_to_datetime((uint32_t)utc_epoch, &now);
     hunter->sequence++;
-    char line[448];
+    char line[640];
     snprintf(
         line,
         sizeof(line),
         "{\"event_id\":\"rf-%s-%s-%lu\",\"device_id\":\"%s\",\"session_id\":\"%s\",\"sequence_number\":%lu,"
-        "\"captured_at_utc\":\"%04u-%02u-%02uT%02u:%02u:%02uZ\",\"monotonic_ms\":%lu,"
+        "\"captured_at_utc\":\"%04u-%02u-%02uT%02u:%02u:%02uZ\",\"captured_at_unix\":%lu,\"timezone_offset_minutes\":%d,\"rtc_local_unix\":%lu,\"monotonic_ms\":%lu,"
         "\"source_type\":\"subghz\",\"mode\":\"%s\",\"frequency_hz\":%lu,\"rssi_min_dbm\":%.1f,\"rssi_avg_dbm\":%.1f,\"rssi_max_dbm\":%.1f,"
         "\"pulse_count\":%lu,\"last_duration_us\":%lu,\"pulse_timings_us\":[",
         hunter->device_id,
@@ -153,7 +165,10 @@ static void hunter_record(Hunter* hunter) {
         now.hour,
         now.minute,
         now.second,
-        (unsigned long)furi_get_tick(),
+        (unsigned long)utc_epoch,
+        hunter->settings.timezone_offset_minutes,
+        (unsigned long)rtc_epoch,
+        (unsigned long)(furi_get_tick() - hunter->session_start_tick),
         hunter_mode_name(hunter->mode),
         (unsigned long)hunter_frequencies[hunter->frequency_index],
         (double)(hunter->rssi_samples ? hunter->rssi_min : 0.0f),
@@ -162,16 +177,43 @@ static void hunter_record(Hunter* hunter) {
         (unsigned long)hunter->pulses,
         (unsigned long)hunter->last_duration);
     size_t used = strlen(line);
+    /* Leave room for the closing array and upload marker.  A capture may
+     * contain more timings than fit in the compact journal record; retaining
+     * a valid prefix is safer than writing a truncated JSON document that can
+     * never be imported or acknowledged. */
+    static const char suffix[] = "],\"upload_state\":\"pending\"}\n";
+    const size_t suffix_len = sizeof(suffix) - 1;
     uint16_t count = hunter->event_timing_count;
-    for(uint16_t i = 0; i < count && used + 24 < sizeof(line); i++) {
-        used += snprintf(line + used, sizeof(line) - used, "%s%lu", i ? "," : "", (unsigned long)hunter->event_timings[i].duration_us);
+    for(uint16_t i = 0; i < count; i++) {
+        char timing[24];
+        int written = snprintf(
+            timing,
+            sizeof(timing),
+            "%s%lu",
+            i ? "," : "",
+            (unsigned long)hunter->event_timings[i].duration_us);
+        if(written <= 0 || (size_t)written >= sizeof(timing) || used + (size_t)written + suffix_len >= sizeof(line)) break;
+        memcpy(line + used, timing, (size_t)written);
+        used += (size_t)written;
     }
-    snprintf(line + used, sizeof(line) - used, "],\"upload_state\":\"pending\"}\n");
-    storage_file_write(hunter->events_file, line, strlen(line));
-    storage_file_sync(hunter->events_file);
+    if(used + suffix_len >= sizeof(line)) return;
+    memcpy(line + used, suffix, suffix_len);
+    used += suffix_len;
+    line[used] = 0;
     char event_id[80];
     snprintf(event_id, sizeof(event_id), "rf-%s-%s-%lu", hunter->device_id, hunter->session_id, (unsigned long)hunter->sequence);
-    rf_store_save(hunter->store, event_id, line, strlen(line));
+    hunter->storage_full = !rf_store_save(hunter->store, event_id, line, used);
+    if(hunter->storage_full) {
+        notification_message(hunter->notifications, &sequence_set_only_red_255);
+        if(hunter->settings.retention_policy == RfRetentionStopWhenFull && hunter->receiver_active) {
+            furi_hal_subghz_stop_async_rx();
+            furi_hal_subghz_idle();
+            hunter->receiver_active = false;
+        }
+        return;
+    }
+    storage_file_write(hunter->events_file, line, used);
+    storage_file_sync(hunter->events_file);
 }
 
 static void hunter_capture(bool level, uint32_t duration, void* context) {
@@ -298,6 +340,10 @@ static void hunter_ble_handle(Hunter* hunter, const char* line) {
                 if(n <= 5 || strcmp(name + n - 5, ".json")) continue;
                 if(index++ < cursor) continue;
                 name[n - 5] = 0;
+                /* ACK receipts are durable tombstones.  Retention policy may
+                 * keep the JSON file for local review, but it must no longer
+                 * appear in the pending manifest. */
+                if(rf_store_is_acked(hunter->store, name)) continue;
                 char record[640]; size_t length = 0;
                 if(rf_store_read(hunter->store, name, record, sizeof(record), &length)) {
                     char item[220];
@@ -315,14 +361,43 @@ static void hunter_ble_handle(Hunter* hunter, const char* line) {
         if(hunter_extract_string(line, "event_id", id, sizeof(id))) {
             char record[640]; size_t length = 0;
             if(rf_store_read(hunter->store, id, record, sizeof(record), &length)) {
-                hunter_send_json_chunk(hunter, rid, id, record, length, hunter_json_number(line, "offset"));
+                uint32_t offset = hunter_json_number(line, "offset");
+                if(offset < length) {
+                    hunter_send_json_chunk(hunter, rid, id, record, length, offset);
+                } else {
+                    char error[180];
+                    snprintf(error, sizeof(error), "{\"v\":1,\"rid\":%lu,\"op\":\"error\",\"error\":\"offset out of range\"}\n", (unsigned long)rid);
+                    hunter_ble_send(hunter, error);
+                }
+            } else {
+                char error[180];
+                snprintf(error, sizeof(error), "{\"v\":1,\"rid\":%lu,\"op\":\"error\",\"error\":\"event not found\"}\n", (unsigned long)rid);
+                hunter_ble_send(hunter, error);
             }
+        } else {
+            char error[180];
+            snprintf(error, sizeof(error), "{\"v\":1,\"rid\":%lu,\"op\":\"error\",\"error\":\"event_id required\"}\n", (unsigned long)rid);
+            hunter_ble_send(hunter, error);
         }
     } else if(strstr(line, "\"op\":\"ack\"")) {
-        char id[80] = {0}; char reply[180];
-        if(hunter_extract_string(line, "event_id", id, sizeof(id))) rf_store_ack(hunter->store, id);
-        snprintf(reply, sizeof(reply), "{\"v\":1,\"rid\":%lu,\"op\":\"acked\",\"event_id\":\"%s\"}\n", (unsigned long)rid, id);
-        hunter_ble_send(hunter, reply);
+        char id[80] = {0};
+        char record[640];
+        size_t length = 0;
+        bool valid = hunter_extract_string(line, "event_id", id, sizeof(id)) &&
+                     rf_store_read(hunter->store, id, record, sizeof(record), &length);
+        uint32_t expected_size = hunter_json_number(line, "size");
+        uint32_t expected_crc = hunter_json_number(line, "crc32");
+        valid = valid && expected_size == length && expected_crc == hunter_crc32(record, length);
+        if(valid) valid = rf_store_ack(hunter->store, id);
+        if(valid) {
+            char reply[180];
+            snprintf(reply, sizeof(reply), "{\"v\":1,\"rid\":%lu,\"op\":\"acked\",\"event_id\":\"%s\"}\n", (unsigned long)rid, id);
+            hunter_ble_send(hunter, reply);
+        } else {
+            char error[180];
+            snprintf(error, sizeof(error), "{\"v\":1,\"rid\":%lu,\"op\":\"error\",\"error\":\"ack validation failed\"}\n", (unsigned long)rid);
+            hunter_ble_send(hunter, error);
+        }
     }
 }
 
@@ -352,6 +427,19 @@ static void hunter_draw(Canvas* canvas, void* context) {
     canvas_draw_str(canvas, 2, 2, "RF SIGNAL HUNTER");
     canvas_set_font(canvas, FontSecondary);
     char line[40];
+    if(hunter->settings_open) {
+        canvas_draw_str(canvas, 2, 16, "TIME / STORAGE SETTINGS");
+        int16_t offset = hunter->settings.timezone_offset_minutes;
+        snprintf(line, sizeof(line), "%c RTC UTC%c%02u:%02u", hunter->setting_index == 0 ? '>' : ' ', offset < 0 ? '-' : '+', (unsigned)(abs(offset) / 60), (unsigned)(abs(offset) % 60));
+        canvas_draw_str(canvas, 2, 29, line);
+        static const char* policies[] = {"ACK -> compact", "Keep ACK index", "Stop when full"};
+        snprintf(line, sizeof(line), "%c %s", hunter->setting_index == 1 ? '>' : ' ', policies[hunter->settings.retention_policy]);
+        canvas_draw_str(canvas, 2, 40, line);
+        snprintf(line, sizeof(line), "%c Reserve: %lu KB", hunter->setting_index == 2 ? '>' : ' ', (unsigned long)(hunter->settings.min_free_bytes / 1024));
+        canvas_draw_str(canvas, 2, 51, line);
+        canvas_draw_str(canvas, 2, 62, "Up/Dn row L/R edit Back save");
+        return;
+    }
     snprintf(line, sizeof(line), "%s  %s", hunter_mode_name(hunter->mode), hunter->running ? "RUN" : "STOP");
     canvas_draw_str(canvas, 2, 16, line);
     if(hunter->mode == HunterModeNfc) {
@@ -363,15 +451,46 @@ static void hunter_draw(Canvas* canvas, void* context) {
         canvas_draw_str(canvas, 2, 29, line);
         snprintf(line, sizeof(line), "Pending: %lu  Free: %luM", (unsigned long)rf_store_pending_count(hunter->store), (unsigned long)(rf_store_free_bytes(hunter->store) / (1024 * 1024)));
         canvas_draw_str(canvas, 2, 40, line);
-        snprintf(line, sizeof(line), "Last: %lu us RSSI %.0f", (unsigned long)hunter->last_duration, (double)(hunter->rssi_samples ? hunter->rssi_sum / hunter->rssi_samples : 0.0f));
+        if(hunter->storage_full) snprintf(line, sizeof(line), "%s - import now", rf_store_error_text(rf_store_last_error(hunter->store)));
+        else snprintf(line, sizeof(line), "Last: %lu us RSSI %.0f", (unsigned long)hunter->last_duration, (double)(hunter->rssi_samples ? hunter->rssi_sum / hunter->rssi_samples : 0.0f));
         canvas_draw_str(canvas, 2, 51, line);
     }
-    canvas_draw_str(canvas, 2, 62, "L/R mode  OK run  Back exit");
+    canvas_draw_str(canvas, 2, 62, "L/R mode OK run Up settings");
 }
 
 static void hunter_input(InputEvent* event, void* context) {
     Hunter* hunter = context;
     if(event->type != InputTypeShort) return;
+    if(hunter->settings_open) {
+        if(event->key == InputKeyBack || event->key == InputKeyOk) {
+            if(rf_settings_save(hunter->storage, &hunter->settings)) {
+                rf_store_configure(hunter->store, hunter->settings.retention_policy, hunter->settings.min_free_bytes);
+                hunter->settings_open = false;
+            } else {
+                notification_message(hunter->notifications, &sequence_set_only_red_255);
+            }
+        } else if(event->key == InputKeyUp) hunter->setting_index = (hunter->setting_index + 2) % 3;
+        else if(event->key == InputKeyDown) hunter->setting_index = (hunter->setting_index + 1) % 3;
+        else if(event->key == InputKeyLeft || event->key == InputKeyRight) {
+            int delta = event->key == InputKeyRight ? 1 : -1;
+            if(hunter->setting_index == 0) {
+                int value = hunter->settings.timezone_offset_minutes + delta * 15;
+                hunter->settings.timezone_offset_minutes = CLAMP(value, 14 * 60, -14 * 60);
+            } else if(hunter->setting_index == 1) {
+                hunter->settings.retention_policy = (hunter->settings.retention_policy + delta + 3) % 3;
+            } else {
+                int value = (int)hunter->settings.min_free_bytes + delta * 16384;
+                hunter->settings.min_free_bytes = CLAMP(value, 4 * 1024 * 1024, 16384);
+            }
+        }
+        view_port_update(hunter->viewport);
+        return;
+    }
+    if(event->key == InputKeyUp) {
+        hunter->settings_open = true;
+        view_port_update(hunter->viewport);
+        return;
+    }
     if(event->key == InputKeyBack) {
         hunter->running = false;
         view_port_enabled_set(hunter->viewport, false);
@@ -421,6 +540,8 @@ int32_t rf_signal_hunter_app(void* context) {
     hunter.storage = furi_record_open(RECORD_STORAGE);
     hunter.store = rf_store_alloc(hunter.storage);
     rf_settings_load(hunter.storage, &hunter.settings);
+    rf_store_configure(hunter.store, hunter.settings.retention_policy, hunter.settings.min_free_bytes);
+    hunter.session_start_tick = furi_get_tick();
     hunter.event_timings = malloc(sizeof(RfCaptureTiming) * RF_CAPTURE_MAX_TIMINGS);
     rf_capture_init(&hunter.capture);
     storage_common_mkdir(hunter.storage, HUNTER_EVENTS_DIR);

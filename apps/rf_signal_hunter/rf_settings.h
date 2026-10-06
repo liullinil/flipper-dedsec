@@ -8,9 +8,30 @@ typedef struct {
     uint16_t capture_ms;
     uint16_t silence_us;
     uint8_t band_profile;
+    /* The RTC exposes calendar fields.  This is the signed offset used to
+       turn those fields into an absolute UTC epoch in event records. */
+    int16_t timezone_offset_minutes;
+    /* Retention is deliberately explicit: a full card must never silently
+       overwrite pending evidence. */
+    uint8_t retention_policy;
+    uint8_t reserved;
+    uint32_t min_free_bytes;
+    uint32_t version;
 } RfHunterSettings;
+
+typedef enum {
+    /* Keep pending records until an ACK.  ACKed raw records are reclaimed. */
+    RfRetentionCompactAfterAck = 0,
+    /* Keep the compact JSON/index for ACKed records; only raw captures may be
+       reclaimed.  This is useful when the user wants an on-device history. */
+    RfRetentionKeepIndex = 1,
+    /* Stop accepting new events when the free-space guard is reached. */
+    RfRetentionStopWhenFull = 2,
+} RfRetentionPolicy;
+
+#define RF_SETTINGS_VERSION 2U
+#define RF_SETTINGS_DEFAULT_MIN_FREE_BYTES (32U * 1024U)
 
 void rf_settings_defaults(RfHunterSettings* settings);
 bool rf_settings_load(Storage* storage, RfHunterSettings* settings);
 bool rf_settings_save(Storage* storage, const RfHunterSettings* settings);
-
