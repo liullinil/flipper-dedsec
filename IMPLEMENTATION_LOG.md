@@ -7,9 +7,9 @@ physical hardware or product work.
 ## Completed
 
 - Restored the Flipper settings model to four font choices: **Normal**,
-  **Large**, **Small** and **Micro**. Normal uses the SDK primary font, Large
-  uses the bundled Cyrillic 6x12 font, and the two compact modes use the SDK
-  secondary and keyboard fonts. The choice is persisted in
+  **Large**, **Small** and **Micro**. Normal and Large use the bundled
+  Cyrillic 6x12 font (with different list density), while the two compact
+  modes use the SDK secondary and keyboard fonts. The choice is persisted in
   `.uplink.settings`; themes remain removed from the user-facing settings.
 - Fixed vertical orientation. `ViewDispatcher` already applies the selected
   `ViewOrientation` to the Canvas, so the extra rotation in the draw callback
