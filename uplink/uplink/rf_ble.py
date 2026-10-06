@@ -58,6 +58,9 @@ class BleakRfAdapter:
    if reply.get("op")=="end": return items
    if reply.get("op")!="item": raise ValueError("expected RF item/end")
    items.append(reply); cursor=int(reply.get("next",cursor+1))
+ async def hello(self):
+  """Return the Flipper capability/space response."""
+  return await self.request("hello")
  async def sync_to(self,store:EventStore,progress=None,device=None):
   if self.client is None: await self.connect(device)
   stats={"seen":0,"imported":0,"skipped":0}

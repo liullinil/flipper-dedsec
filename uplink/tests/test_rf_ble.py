@@ -23,6 +23,15 @@ def test_full_sync_and_ack(tmp_path):
  async def run():
   e=RfEvent("d","s",1,"2026-01-01T00:00:00Z",1,event_id="rf-d-s-1"); raw=json.dumps(e.to_dict(),separators=(",",":")).encode(); dev={"id":e.event_id,"raw":raw}; c=FakeClient(dev); a=BleakRfAdapter(client_factory=lambda d,timeout=0:c,timeout=1); await a.connect(dev); st=EventStore(tmp_path); out=await a.sync_to(st); assert out["imported"]==1 and c.acks; assert st.events[e.event_id].upload_state=="imported"; await a.close()
  asyncio.run(run())
+
+def test_golden_hello_wire_and_rid():
+ async def run():
+  e=RfEvent("d","s",3,"2026-01-01T00:00:00Z",1,event_id="rf-d-s-3")
+  raw=json.dumps(e.to_dict(),separators=(",",":")).encode(); dev={"id":e.event_id,"raw":raw}; c=FakeClient(dev)
+  a=BleakRfAdapter(client_factory=lambda d,timeout=0:c,timeout=1); await a.connect(dev)
+  reply=await a.hello(); assert reply["v"]==1 and reply["rid"]==1 and reply["op"]=="hello"
+  await a.close()
+ asyncio.run(run())
 def test_partial_unicode_fragment_and_crc_reject(tmp_path):
  async def run():
   e=RfEvent("d","s",2,"2026-01-01T00:00:00Z",1,event_id="rf-d-s-2",classification="☃"); raw=json.dumps(e.to_dict(),ensure_ascii=False).encode(); dev={"id":e.event_id,"raw":raw}; c=FakeClient(dev); a=BleakRfAdapter(client_factory=lambda d,timeout=0:c,timeout=1); await a.connect(dev); st=EventStore(tmp_path); await a.sync_to(st); assert e.event_id in st.events
