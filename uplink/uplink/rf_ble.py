@@ -3,8 +3,19 @@ from __future__ import annotations
 import asyncio, binascii, json, os, re
 from .rf_hunter import EventStore, RfEvent
 from .rf_transport import decode_frame, encode_frame
-RF_RX_UUID="f5510001-1d00-4a1e-8b5e-0f11e7ca1000"; RF_TX_UUID="f5510002-1d00-4a1e-8b5e-0f11e7ca1000"
-RF_ADV_UUID="0000ded6-0000-1000-8000-00805f9b34fb"; RF_NAME_PREFIX="RFHunter"; MAX_RX_BUFFER=8192
+
+# Keep these values in lockstep with apps/rf_signal_hunter/rf_hunter_ble.h.
+# The profile advertises the 16-bit RF Hunter marker (0xDED5) while the GATT
+# service itself uses the 128-bit UUID below.  Older builds used 0xDED6 and a
+# ``RFHunter`` name prefix, which made a real Flipper invisible to the client:
+# the C profile advertises ``<first-char>DedSec <device>``.
+RF_SERVICE_UUID = "f5510000-1d00-4a1e-8b5e-0f11e7ca1000"
+RF_RX_UUID = "f5510001-1d00-4a1e-8b5e-0f11e7ca1000"
+RF_TX_UUID = "f5510002-1d00-4a1e-8b5e-0f11e7ca1000"
+RF_ADV_UUID = "0000ded5-0000-1000-8000-00805f9b34fb"
+RF_NAME_PREFIX = "DedSec"
+RF_MAX_CHUNK = 80
+MAX_RX_BUFFER = 8192
 class BleakRfAdapter:
  def __init__(self,client_factory=None,scanner=None,timeout=10.0): self.client_factory=client_factory; self.scanner=scanner; self.timeout=float(timeout); self.client=None; self._frames=asyncio.Queue(); self._wire=b""; self._rid=0; self._lock=asyncio.Lock()
  async def discover(self):
@@ -12,7 +23,7 @@ class BleakRfAdapter:
   if scanner is None:
    from bleak import BleakScanner; scanner=BleakScanner
   def match(dev,adv):
-   name=getattr(adv,"local_name",None) or getattr(dev,"name",None) or ""; uuids=[str(u).lower() for u in (getattr(adv,"service_uuids",None) or [])]; return name.startswith(RF_NAME_PREFIX) or RF_ADV_UUID in uuids
+   name=getattr(adv,"local_name",None) or getattr(dev,"name",None) or ""; uuids=[str(u).lower() for u in (getattr(adv,"service_uuids",None) or [])]; return RF_NAME_PREFIX.lower() in name.lower() or RF_ADV_UUID in uuids
   finder=getattr(scanner,"find_device_by_filter",None)
   if finder: return await finder(match,timeout=self.timeout)
   return next((d for d in await scanner.discover(timeout=self.timeout) if match(d,d)),None)
@@ -57,7 +68,14 @@ class BleakRfAdapter:
    reply=await self.request("list",cursor=cursor)
    if reply.get("op")=="end": return items
    if reply.get("op")!="item": raise ValueError("expected RF item/end")
-   items.append(reply); cursor=int(reply.get("next",cursor+1))
+   try: next_cursor=int(reply["next"])
+   except (KeyError,TypeError,ValueError) as exc: raise ValueError("RF manifest item has no cursor") from exc
+   if next_cursor<=cursor: raise ValueError("RF manifest cursor did not advance")
+   try:
+    if not str(reply["event_id"]): raise ValueError("empty event id")
+    if int(reply["size"])<0 or int(reply["crc32"])<0: raise ValueError("negative event size/checksum")
+   except (KeyError,TypeError,ValueError) as exc: raise ValueError("invalid RF manifest item") from exc
+   items.append(reply); cursor=next_cursor
  async def hello(self):
   """Return the Flipper capability/space response."""
   return await self.request("hello")
@@ -73,10 +91,15 @@ class BleakRfAdapter:
     if event.event_id!=eid: raise ValueError("RF event identity mismatch")
     store.add(event,payload); event.upload_state="imported"; store._flush(); stats["imported"]+=1
    else:
-    path=store.events[eid].capture_blob; payload=b"" if not path else open(os.path.join(store.root,path),"rb").read()
+    path=store.events[eid].capture_blob
+    if path:
+     with open(os.path.join(store.root,path),"rb") as fh: payload=fh.read()
+    else: payload=b""
     if len(payload)!=size or (binascii.crc32(payload)&0xffffffff)!=crc: raise ValueError("existing RF event payload checksum mismatch")
     stats["skipped"]+=1
-   await self.request("ack",event_id=eid,size=size,crc32=crc)
+   ack=await self.request("ack",event_id=eid,size=size,crc32=crc)
+   if ack.get("op")!="acked" or str(ack.get("event_id",""))!=eid:
+    raise ValueError("RF acknowledgement did not match event")
    if progress: progress(stats.copy())
   return stats
  async def _read(self,eid,size,crc,store):
@@ -85,12 +108,20 @@ class BleakRfAdapter:
   with open(path,"ab" if offset else "wb") as fh:
    while offset<size:
     reply=await self.request("read",event_id=eid,offset=offset)
-    if reply.get("op")!="chunk" or int(reply.get("offset",-1))!=offset: raise ValueError("RF chunk offset mismatch")
-    data=bytes.fromhex(reply.get("hex",""))
-    if not data or len(data)>80 or offset+len(data)>size: raise ValueError("invalid RF chunk")
-    fh.write(data); fh.flush(); os.fsync(fh.fileno()); offset=int(reply.get("next",offset+len(data)))
-  payload=open(path,"rb").read()
+    if reply.get("op")!="chunk" or str(reply.get("event_id",""))!=eid or int(reply.get("offset",-1))!=offset: raise ValueError("RF chunk offset mismatch")
+    try: data=bytes.fromhex(reply.get("hex",""))
+    except (TypeError,ValueError) as exc: raise ValueError("invalid RF chunk encoding") from exc
+    if not data or len(data)>RF_MAX_CHUNK or offset+len(data)>size: raise ValueError("invalid RF chunk")
+    next_offset=int(reply.get("next",-1))
+    if next_offset!=offset+len(data): raise ValueError("RF chunk next offset mismatch")
+    fh.write(data); fh.flush(); os.fsync(fh.fileno()); offset=next_offset
+  with open(path,"rb") as fh: payload=fh.read()
   if len(payload)!=size or (binascii.crc32(payload)&0xffffffff)!=crc: raise ValueError("RF payload checksum mismatch")
+  # A completed staging file is no longer needed.  Removing it prevents a
+  # later event with the same local filename from accidentally resuming from
+  # stale bytes while preserving interrupted transfers on all earlier exits.
+  try: os.remove(path)
+  except OSError: pass
   return payload
  async def import_pending(self,store,**kwargs): return await self.sync_to(store,**kwargs)
-__all__=["BleakRfAdapter","RF_ADV_UUID","RF_NAME_PREFIX"]
+__all__=["BleakRfAdapter","RF_SERVICE_UUID","RF_ADV_UUID","RF_NAME_PREFIX","RF_MAX_CHUNK"]
