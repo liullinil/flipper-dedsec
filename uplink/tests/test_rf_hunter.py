@@ -34,6 +34,7 @@ def test_store_retries_are_idempotent_and_ack_reclaims_capture(tmp_path):
     store.add(_event(), b"different-but-duplicate-id")
     assert len(store.events) == 1
     assert store.manifest()[0]["event_id"] == event.event_id
+    assert store.manifest()[0]["size"] == len(b"pulse-data")
     assert b"pulse-data" == b"".join(chunk for _, chunk in store.chunks(event.event_id))
     assert store.acknowledge(event.event_id)
 
@@ -113,3 +114,29 @@ def test_passive_nfc_field_record_preserves_observation_metadata():
     assert event.nfc_technology == "external-field"
     assert event.nfc_protocol == "carrier-presence"
     assert event.nfc_field_duration_ms == 84
+
+
+def test_store_loads_api_889_per_event_journal_and_ack_receipt(tmp_path):
+    event = _event(8)
+    events_dir = tmp_path / "events"
+    receipts_dir = tmp_path / "receipts"
+    events_dir.mkdir()
+    receipts_dir.mkdir()
+    (events_dir / f"{event.event_id}.json").write_text(
+        __import__("json").dumps(event.to_dict()), encoding="utf-8"
+    )
+    uploaded = _event(9)
+    uploaded.upload_state = "uploaded"
+    (receipts_dir / f"{uploaded.event_id}.ack").write_text(
+        __import__("json").dumps(uploaded.to_dict()), encoding="utf-8"
+    )
+    loaded = EventStore(tmp_path)
+    assert set(loaded.events) == {event.event_id, uploaded.event_id}
+    assert loaded.events[event.event_id].upload_state == "pending"
+    assert loaded.events[uploaded.event_id].upload_state == "uploaded"
+
+
+def test_store_rejects_capture_path_traversal(tmp_path):
+    event = _event(10, capture_blob="../outside.bin")
+    with pytest.raises(ValueError, match="unsafe RF capture path"):
+        EventStore(tmp_path).add(event, b"secret")

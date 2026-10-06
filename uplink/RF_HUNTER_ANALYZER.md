@@ -1,11 +1,14 @@
 # RF Hunter desktop analyzer
 
 The analyzer is a local, offline investigation console. It accepts one or more
-Imported event-store directories (each containing `events.jsonl` and optional
+Imported event-store directories (each containing legacy `events.jsonl` or the
+API-88.9 per-event `events/<event_id>.json` journal plus optional
 `captures/`), merges them by immutable `event_id`, and keeps every observation
-even when observations belong to one signal family. The Flipper FAP keeps its
-durable per-event journal under `events/`; use the BLE importer to materialize
-that journal into this desktop format before opening the analyzer.
+even when observations belong to one signal family. Compact
+`receipts/<event_id>.ack` records are also loaded as uploaded observations when
+the FAP has reclaimed the raw event file. A copied Flipper journal can
+therefore be opened directly; the BLE importer remains available for live
+sync and durable ACK/retry handling.
 
 Run the Tkinter UI from the repository root with the source package on
 `PYTHONPATH`:

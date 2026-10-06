@@ -60,34 +60,73 @@ class AnalyzerProject:
         root = os.fspath(root)
         store = EventStore(root)
         self.sources[root] = store
-        self.events.update(store.events)
+        self._merge_store(store)
         self.rebuild_families()
         return len(store.events)
 
     def add_store(self, store: EventStore) -> int:
         self.sources[store.root] = store
-        self.events.update(store.events)
+        self._merge_store(store)
         self.rebuild_families()
         return len(store.events)
+
+    def _merge_store(self, store):
+        """Merge a journal without letting a transport duplicate replace data.
+
+        The same event ID may be present in two Flipper exports (or in a
+        copied per-event journal and its JSONL mirror).  Keep one observation,
+        preferring the representation whose capture blob is actually readable.
+        Metadata from a later source is only used when the existing record has
+        no raw capture at all.
+        """
+        for event_id, event in store.events.items():
+            current = self.events.get(event_id)
+            if current is None:
+                self.events[event_id] = event
+                continue
+            current_capture = self.capture_bytes(current)
+            incoming_capture = b""
+            try:
+                if hasattr(store, "read_capture"):
+                    incoming_capture = store.read_capture(event)
+                elif event.capture_blob:
+                    with open(os.path.join(store.root, event.capture_blob), "rb") as fh:
+                        incoming_capture = fh.read()
+            except (OSError, ValueError):
+                incoming_capture = b""
+            if incoming_capture and not current_capture:
+                self.events[event_id] = event
+            elif current.upload_state != "uploaded" and event.upload_state == "uploaded":
+                current.upload_state = "uploaded"
 
     def capture_bytes(self, event: RfEvent) -> bytes:
         """Read the optional raw capture blob from whichever source owns it."""
         for store in self.sources.values():
             if store.events.get(event.event_id) is not event and event.event_id not in store.events:
                 continue
+            if hasattr(store, "read_capture"):
+                capture = store.read_capture(event)
+                # A duplicate ID may exist in an earlier journal without its
+                # raw payload (for example after ACK reclamation).  Continue
+                # searching later sources for a durable copy.
+                if capture:
+                    return capture
+                continue
             if not event.capture_blob:
-                return b""
+                continue
             try:
                 with open(os.path.join(store.root, event.capture_blob), "rb") as fh:
                     return fh.read()
-            except OSError:
-                return b""
+            except (OSError, ValueError):
+                continue
         return b""
 
     def clear(self):
         self.sources.clear()
         self.events.clear()
         self.grouper = StructuralGrouper()
+        self.notes.clear()
+        self.settings = {"selected_family": "", "timezone": "UTC"}
 
     def rebuild_families(self):
         """Recompute authoritative structural families deterministically."""
@@ -225,10 +264,11 @@ class AnalyzerProject:
         return sorted(result, key=lambda row: (-row["observation_count"], row["family_id"]))
 
     def timeline(self, events: Optional[Iterable[RfEvent]] = None) -> list[dict]:
-        return [{"event_id": event.event_id, "when": parse_time(event.captured_at_utc),
+        rows = [{"event_id": event.event_id, "when": parse_time(event.captured_at_utc),
                  "family_id": self.family_key(event), "frequency_hz": event.frequency_hz,
                  "rssi_dbm": event.rssi_avg_dbm, "source_type": event.source_type}
                 for event in (events if events is not None else self.events.values())]
+        return sorted(rows, key=lambda row: (row["when"], row["event_id"]))
 
     def spectrum(self, events: Optional[Iterable[RfEvent]] = None, bins=96) -> list[dict]:
         """Aggregate sampled observations into frequency/RSSI bins."""

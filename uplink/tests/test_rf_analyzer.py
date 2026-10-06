@@ -94,3 +94,25 @@ def test_ble_sync_uses_durable_project_store(tmp_path):
     assert result["imported"] == 1
     assert event.event_id in project.events
     assert project.capture_bytes(event) == b"wire-event"
+
+
+def test_project_dedup_prefers_duplicate_with_raw_capture(tmp_path):
+    event = _event(50, "2026-10-06T12:00:00Z")
+    first = EventStore(tmp_path / "first")
+    first.add(event)
+    second = EventStore(tmp_path / "second")
+    second.add(RfEvent.from_dict(event.to_dict()), b"durable raw")
+    project = AnalyzerProject()
+    project.add_store(first)
+    project.add_store(second)
+    assert list(project.events) == [event.event_id]
+    assert project.capture_bytes(project.events[event.event_id]) == b"durable raw"
+
+
+def test_timeline_is_sorted_by_utc_investigation_time():
+    project = AnalyzerProject()
+    late = _event(61, "2026-10-06T12:00:00Z")
+    early = _event(62, "2026-10-06T11:00:00Z")
+    project.events = {late.event_id: late, early.event_id: early}
+    rows = project.timeline()
+    assert [row["event_id"] for row in rows] == [early.event_id, late.event_id]
