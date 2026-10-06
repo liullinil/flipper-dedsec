@@ -11,7 +11,7 @@ A Flipper Zero project in a Watch Dogs / DedSec style for **Unleashed firmware**
 
 ![DedSec Uplink screens](docs/uplink_screens.png)
 
-*SYS with autoscaled network/disk bars · CMD running a command on the PC · settings · inverted theme*
+*SYS with autoscaled network/disk bars · CMD running a command on the PC · persistent settings*
 
 ![Desktop animations](docs/animations.gif)
 
@@ -27,7 +27,7 @@ A Flipper Zero project in a Watch Dogs / DedSec style for **Unleashed firmware**
 - **Vibrates** when a session needs you (question / approval, or the agent finished its turn) and when the console replies.
 - **Cyrillic** session names, details and console output (embedded UTF-8 font).
 - **Over-the-air updates**: the companion checks GitHub releases, the Flipper offers the update and installs it over BLE, then restarts itself.
-- **Settings** on the Flipper: vibration, LED, screen wake, indicators (bars/text), theme (normal/inverted), font size, tab order, auto-update.
+- **Settings** on the Flipper: vibration, LED, screen wake, indicators (bars/text), four font sizes, orientation, tab order, auto-update.
 - Companion: tray icon, Windows autostart, optional Claude Code hooks for precise state.
 
 Full documentation: **[uplink/README.md](uplink/README.md)**.

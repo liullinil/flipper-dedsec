@@ -1,4 +1,5 @@
 from uplink.rf_hunter import EventStore, FamilyGrouper, RfEvent, UploadReceiver, event_id, fingerprint
+import pytest
 
 
 def _event(seq=1, **kw):
@@ -11,6 +12,11 @@ def _event(seq=1, **kw):
 def test_identity_preserves_repeated_observations():
     assert event_id("device", "session", 1) == event_id("device", "session", 1)
     assert event_id("device", "session", 1) != event_id("device", "session", 2)
+
+
+def test_event_ids_cannot_escape_capture_store():
+    with pytest.raises(ValueError, match="unsafe RF event id"):
+        _event(event_id="../outside")
 
 
 def test_grouping_keeps_events_separate():

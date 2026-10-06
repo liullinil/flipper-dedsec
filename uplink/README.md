@@ -52,8 +52,8 @@ Saved to `SD/apps_data/dedsec_uplink/.uplink.settings`.
 | LED alerts | on / off |
 | Wake screen on alert | on / off |
 | Indicators | Bars / Text |
-| Theme | Normal / Inverted |
-| Font size | Normal / Large |
+| Font size | Normal / Large / Small / Micro |
+| Orientation | Horizontal / Vertical (persisted per device) |
 | Tab 1…4 | SYS / CDX / CLD / CMD / Off — order and visibility of the tabs |
 | Updates | Notify / Auto |
 | Version | shows the installed version; OK installs a pending update |

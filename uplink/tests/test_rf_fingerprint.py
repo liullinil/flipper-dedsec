@@ -35,6 +35,14 @@ def test_same_carrier_different_structure_stays_separate():
     assert comparison["percent"] < 80
 
 
+def test_flipper_local_fingerprint_is_replaced_by_desktop_structure():
+    first = _event(1, fingerprint_id="local-deadbeef")
+    second = _event(2, pulses=(500, 500, 1000, 1000), fingerprint_id="local-deadbeef")
+    grouper = StructuralGrouper()
+    assert grouper.assign(first) != grouper.assign(second)
+    assert first.fingerprint_id == fingerprint(first)
+
+
 def test_rolling_payload_changes_keep_one_structural_family():
     first = _event(1, payload=b"\x01\x02\x03")
     second = _event(2, payload=b"\xa5\x5a\xc3")

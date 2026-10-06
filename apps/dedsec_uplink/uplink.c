@@ -307,9 +307,24 @@ static void clean_copy(char* dst, size_t size, const char* src) {
 }
 
 static void font_text(Canvas* c, const App* app) {
-    if(app->settings.font == FontMicro) canvas_set_font(c, FontKeyboard);
-    else if(app->settings.font == FontSmall) canvas_set_font(c, FontSecondary);
-    else canvas_set_custom_u8g2_font(c, u8g2_font_uplink_cyr);
+    /* Keep all four persisted choices meaningful.  The custom 6x12 font is
+     * the largest readable mode and is also the only bundled Cyrillic font.
+     * The SDK fonts provide the two compact modes and the normal 5x8 mode. */
+    switch(app->settings.font) {
+    case FontLarge:
+        canvas_set_custom_u8g2_font(c, u8g2_font_uplink_cyr);
+        break;
+    case FontSmall:
+        canvas_set_font(c, FontSecondary);
+        break;
+    case FontMicro:
+        canvas_set_font(c, FontKeyboard);
+        break;
+    case FontNormal:
+    default:
+        canvas_set_font(c, FontPrimary);
+        break;
+    }
 }
 
 static void draw_str_fit(Canvas* c, int x, int y, const char* s, int max_w) {
@@ -1118,9 +1133,10 @@ static void main_draw(Canvas* c, void* model) {
     // The UI uses one high-contrast palette; theme switching was removed from settings.
     g_fg = ColorBlack;
     g_bg = ColorWhite;
-    canvas_set_orientation(
-        c,
-        app->settings.orientation ? CanvasOrientationVertical : CanvasOrientationHorizontal);
+    /* ViewDispatcher applies the ViewOrientation to the canvas before this
+     * callback.  Applying canvas orientation again here rotates the already
+     * rotated canvas a second time, which made the vertical mode appear
+     * blank/misaligned on hardware. */
     canvas_clear(c);
     fg(c);
     ScreenId screen = current_screen(app);

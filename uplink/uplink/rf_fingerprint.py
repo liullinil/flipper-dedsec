@@ -566,10 +566,14 @@ class StructuralGrouper:
             for family_id, members in self._members.items():
                 if any(_identity(member) == event_id for member in members):
                     return family_id
-        fp = _text(_get(event, "fingerprint_id", "")) or fingerprint(event)
+        provided_fp = _text(_get(event, "fingerprint_id", ""))
+        # The FAP's ``local-`` hash is a compact receipt hint.  It is not the
+        # desktop SHA-256 fingerprint and must not make unrelated pulse shapes
+        # share a family merely because their short hints collide.
+        fp = fingerprint(event) if not provided_fp or provided_fp.startswith("local-") else provided_fp
         if hasattr(event, "fingerprint_id"):
             try:
-                if not _get(event, "fingerprint_id", ""):
+                if not provided_fp or provided_fp.startswith("local-"):
                     event.fingerprint_id = fp
             except Exception:
                 pass

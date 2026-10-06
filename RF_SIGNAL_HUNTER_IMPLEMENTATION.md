@@ -23,6 +23,9 @@ than continuous IQ.
   RTC timezone offset (15-minute steps), reserve space and retention policy are
   saved in a versioned SD record. Events include normalized UTC calendar/epoch,
   the raw RTC epoch, the offset and a monotonic session-relative time.
+- The same settings page exposes dwell (50 ms), RSSI threshold, capture window,
+  silence threshold and the ALL/433/315/868 band profile. Values are range
+  checked before saving and are applied to the live Scout/Capture loop.
 - The store refuses to replace an existing event ID. A low-space guard reports
   an error and red LED; the explicit stop-on-full policy halts Sub-GHz RX.
   Incomplete writes and an interrupted ACK/reclaim are recovered on restart.
@@ -50,17 +53,20 @@ than continuous IQ.
   presence, not a passive protocol/UID sniffer for this FAP. UID and raw
   exchanges are therefore left blank rather than obtained by transmitting or
   pretending to decode unavailable data.
-- The initial Sub-GHz profile list and dwell schedule are compiled defaults;
-  user-editable band profiles and threshold/duty-cycle settings remain to be
-  added.
+- The band list is intentionally limited to the three narrowband profiles
+  available in this FAP (315, 433.920 and 868.350 MHz). Arbitrary user-defined
+  frequencies and a calibrated duty-cycle scheduler are not exposed because
+  the SDK receiver is narrowband rather than an IQ scanner.
 - RSSI is sampled from the receiver and stored with events, but a full sweep
   spectrum snapshot and calibrated RSSI model are not available through the
   narrowband API.
 - Follow currently uses the stored timing/frequency structural profile. A richer
   similarity profile editor and long-running background Follow service remain.
-- The BLE profile and desktop adapter are implemented, but full end-to-end RF
-  import still needs a hardware run with a populated event journal and retry
-  interruption test. The protocol is unit-tested with fragmented mock frames.
+- The BLE profile and desktop adapter are implemented and covered by fragmented
+  C-wire tests, including CRC/ACK rejection and resumable chunks. A hardware
+  run with a populated event journal and a deliberately interrupted transfer is
+  still pending because the Flipper was not visible to `ufbt launch` in this
+  environment.
 - The analyzer is a local Tkinter investigation console. A packaged desktop
   release, richer family graph animation and multi-project collaboration are
   still pending.
@@ -77,7 +83,8 @@ The RF Hunter FAP builds with
 `python -m ufbt` and reports `Target: 7, API: 88.9`. Changes are committed and
 pushed to `origin/main` after each completed slice.
 
-The native persistence test compiles the actual `rf_store.c` and
+The Python suite currently passes with `47 passed`. The native persistence test
+compiles the actual `rf_store.c` and
 `rf_settings.c`; injected write/sync failures and interrupted rename/ACK
 sequences verify that pending records survive and settings recover. Run it with
 `python -m pytest uplink/tests/test_rf_native_reliability.py -q` (one host test,

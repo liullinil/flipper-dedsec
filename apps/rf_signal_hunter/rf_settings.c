@@ -61,8 +61,10 @@ bool rf_settings_load(Storage* storage, RfHunterSettings* settings) {
     }
 
     if(settings->dwell_ms < 50 || settings->dwell_ms > 10000 ||
+       settings->rssi_threshold_dbm < -110 || settings->rssi_threshold_dbm > -30 ||
        settings->capture_ms < 200 || settings->capture_ms > 2000 ||
        settings->silence_us < 1000 || settings->silence_us > 30000 ||
+       settings->band_profile > 3 ||
        settings->timezone_offset_minutes < -14 * 60 ||
        settings->timezone_offset_minutes > 14 * 60 ||
        settings->retention_policy > RfRetentionStopWhenFull ||
@@ -78,8 +80,10 @@ bool rf_settings_save(Storage* storage, const RfHunterSettings* settings) {
     RfHunterSettings value = *settings;
     value.version = RF_SETTINGS_VERSION;
     if(value.dwell_ms < 50 || value.dwell_ms > 10000 ||
+       value.rssi_threshold_dbm < -110 || value.rssi_threshold_dbm > -30 ||
        value.capture_ms < 200 || value.capture_ms > 2000 ||
        value.silence_us < 1000 || value.silence_us > 30000 ||
+       value.band_profile > 3 ||
        value.timezone_offset_minutes < -14 * 60 ||
        value.timezone_offset_minutes > 14 * 60 ||
        value.retention_policy > RfRetentionStopWhenFull ||
