@@ -107,7 +107,11 @@ documented in [`RF_SIGNAL_HUNTER_SPEC.md`](../RF_SIGNAL_HUNTER_SPEC.md).
 A hooded-skull icon appears in the tray (Windows may hide it under the `^` arrow next to the clock).
 The ring shows the link: green connected, yellow searching, grey paused, red error.
 
-Tray menu: *Pause uplink*, *Allow remote shell (cmd)*, *Start with Windows*, *Claude Code hooks*, *Open log*, *Quit*.
+Tray menu shows the companion version, the connected Flipper app version and the latest GitHub release.
+It includes *Check for updates*, *Install companion update* and *Install Flipper app update*, as well as
+*Pause uplink*, *Allow remote shell (cmd)*, *Start with Windows*, *Claude Code hooks*, *Open log* and *Quit*.
+The companion update downloads a replacement executable and restarts the tray process; the Flipper app
+update uses the existing BLE OTA path.
 
 Command line (`.exe` or `.pyw`): `--console` (log to the console), `--dump` (print one data frame, no BLE),
 `--install-autostart` / `--uninstall-autostart`, `--install-claude-hooks` / `--remove-claude-hooks`.

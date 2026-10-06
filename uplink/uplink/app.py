@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 from collections import deque
 
 from . import config, hooks
@@ -212,11 +213,68 @@ def run_tray(feed, cfg):
         tail = f" {state['name']}" if state["status"] == "connected" else ""
         return f"{state['status']}{tail} | codex {c['X']} | claude {c['C']}"
 
+    def version_text(_item=None):
+        return feed.updater.version_status()
+
+    def update_label(_item=None):
+        if feed.updater.companion_update_available():
+            return f"Install companion update ({feed.updater.latest_companion['tag']})"
+        return "Install companion update"
+
+    def flipper_update_label(_item=None):
+        if feed.updater.flipper_update_available():
+            return f"Install Flipper app update ({feed.updater.latest['tag']})"
+        return "Install Flipper app update"
+
     def on_status(status, name):
         state.update(status=status, name=name)
         icon.icon = make_icon(colors.get(status, "#e03030"))
         icon.title = f"DedSec Uplink: {status_text()}"
         icon.update_menu()
+
+    def check_updates(_icon, _item):
+        feed.updater.check_async(force=True)
+
+    def install_flipper_update(_icon, _item):
+        if feed.updater.request_flipper_update():
+            log.info("requested Flipper app update")
+
+    def launch_companion_update(temp_path, error):
+        if error:
+            log.warning("companion update unavailable: %s", error)
+            return
+        if not getattr(sys, "frozen", False):
+            log.warning("companion self-update is only available in the packaged EXE")
+            return
+        target = sys.executable
+        # A separate PowerShell helper waits for this process to exit, replaces the locked
+        # executable, and starts the new version. The old tray process then quits normally.
+        def quote(value):
+            return "'" + str(value).replace("'", "''") + "'"
+        script = os.path.join(tempfile.gettempdir(), "DedSecUplink-apply-update.ps1")
+        body = (
+            "$p = Get-Process -Id %d -ErrorAction SilentlyContinue; "
+            "if ($p) { $p.WaitForExit() }; "
+            "Move-Item -LiteralPath %s -Destination %s -Force; "
+            "Start-Process -FilePath %s -WindowStyle Hidden; "
+            "Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force"
+        ) % (os.getpid(), quote(temp_path), quote(target), quote(target))
+        try:
+            with open(script, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            subprocess.Popen(
+                ["powershell.exe", "-NoLogo", "-NoProfile", "-WindowStyle", "Hidden",
+                 "-ExecutionPolicy", "Bypass", "-File", script],
+                creationflags=0x08000000,
+            )
+            icon.stop()
+        except Exception:
+            log.exception("cannot start companion updater")
+
+    def install_companion_update(_icon, _item):
+        if not feed.updater.companion_update_available():
+            return
+        feed.updater.install_companion_async(sys.executable, launch_companion_update)
 
     link = Link(feed.frame, on_status=on_status, on_rx=feed.handle_rx, urgent_source=feed.urgent)
 
@@ -249,6 +307,12 @@ def run_tray(feed, cfg):
         "dedsec_uplink", make_icon("#f0b400"), "DedSec Uplink",
         menu=pystray.Menu(
             pystray.MenuItem(status_text, None, enabled=False),
+            pystray.MenuItem(version_text, None, enabled=False),
+            pystray.MenuItem("Check for updates", check_updates),
+            pystray.MenuItem(update_label, install_companion_update,
+                             enabled=lambda _i: feed.updater.companion_update_available()),
+            pystray.MenuItem(flipper_update_label, install_flipper_update,
+                             enabled=lambda _i: feed.updater.flipper_update_available()),
             pystray.MenuItem("Pause uplink", toggle_pause, checked=lambda _i: link.paused),
             pystray.MenuItem(
                 "Allow remote shell (cmd)", toggle_cmd,
@@ -265,6 +329,7 @@ def run_tray(feed, cfg):
 
     def setup(ic):
         ic.visible = True
+        feed.updater.on_change = ic.update_menu
         link.start()
 
     icon.run(setup=setup)

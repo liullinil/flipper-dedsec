@@ -21,6 +21,8 @@ import zlib
 
 REPO = "liullinil/flipper-dedsec"
 ASSET = "dedsec_uplink.fap"
+COMPANION_ASSET = "DedSecUplink.exe"
+COMPANION_VERSION = "1.1.0"
 CHECK_EVERY = 30 * 60      # seconds between release checks
 CHUNK = 192                # raw bytes per chunk (256 base64 chars, fits the Flipper's line buffer)
 WINDOW = 4                 # chunks in flight
@@ -41,8 +43,11 @@ class Updater:
         self.lock = threading.Lock()
         self.flipper_version = None
         self.latest = None          # {"tag", "url", "size"}
+        self.latest_companion = None
         self.last_check = 0.0
         self.checking = False
+        self.on_change = None
+        self.pending_flipper_request = ""
         self._reset()
 
     def _reset(self):
@@ -67,17 +72,29 @@ class Updater:
                 headers={"User-Agent": "dedsec-uplink", "Accept": "application/vnd.github+json"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 rel = json.load(resp)
-            asset = next((a for a in rel.get("assets", []) if a.get("name") == ASSET), None)
+            assets = {a.get("name"): a for a in rel.get("assets", [])}
+            asset = assets.get(ASSET)
+            companion = assets.get(COMPANION_ASSET)
             if asset:
                 with self.lock:
                     self.latest = {"tag": rel["tag_name"], "url": asset["browser_download_url"],
                                    "size": asset["size"]}
                 log.info("latest release %s (%d bytes)", rel["tag_name"], asset["size"])
+            if companion:
+                with self.lock:
+                    self.latest_companion = {
+                        "tag": rel["tag_name"], "url": companion["browser_download_url"],
+                        "size": companion["size"]}
         except Exception as exc:
             log.warning("release check failed: %s", exc)
         finally:
             self.last_check = time.time()
             self.checking = False
+            if self.on_change:
+                try:
+                    self.on_change()
+                except Exception:
+                    log.debug("update menu refresh failed", exc_info=True)
 
     def set_flipper_version(self, version):
         if version != self.flipper_version:
@@ -93,6 +110,58 @@ class Updater:
             if parse_version(latest["tag"]) <= parse_version(self.flipper_version):
                 return []
             return [f"N|{latest['tag']}|{latest['size']}"]
+
+    def flipper_update_available(self):
+        with self.lock:
+            return bool(self.latest and self.flipper_version and
+                        parse_version(self.latest["tag"]) > parse_version(self.flipper_version))
+
+    def companion_update_available(self):
+        with self.lock:
+            return bool(self.latest_companion and
+                        parse_version(self.latest_companion["tag"]) > parse_version(COMPANION_VERSION))
+
+    def version_status(self):
+        with self.lock:
+            flipper = self.flipper_version or "?"
+            latest = self.latest["tag"] if self.latest else "?"
+            companion_latest = self.latest_companion["tag"] if self.latest_companion else latest
+            return f"Companion v{COMPANION_VERSION} · Flipper v{flipper} · latest {companion_latest}"
+
+    def request_flipper_update(self):
+        with self.lock:
+            latest = self.latest
+            version = self.flipper_version
+            if not latest or not version or parse_version(latest["tag"]) <= parse_version(version):
+                return False
+            self.pending_flipper_request = latest["tag"]
+        threading.Thread(target=self.request, args=(latest["tag"],), daemon=True).start()
+        return True
+
+    def install_companion_async(self, target_path, callback):
+        """Download the release EXE and call callback(temp_path, error)."""
+        with self.lock:
+            latest = dict(self.latest_companion or {})
+        if not latest:
+            callback(None, "no companion release is known")
+            return
+
+        def worker():
+            temp_path = target_path + ".new"
+            try:
+                req = urllib.request.Request(latest["url"], headers={"User-Agent": "dedsec-uplink"})
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    data = resp.read()
+                if len(data) != latest["size"]:
+                    raise ValueError(f"download size {len(data)} != {latest['size']}")
+                with open(temp_path, "wb") as fh:
+                    fh.write(data)
+                callback(temp_path, None)
+            except Exception as exc:
+                log.warning("companion update download failed: %s", exc)
+                callback(None, str(exc))
+
+        threading.Thread(target=worker, name="companion-update", daemon=True).start()
 
     # ------------------------------------------------------------------ transfer
     def request(self, tag):
@@ -142,6 +211,9 @@ class Updater:
         """Lines to send right now (called every ~20-50 ms by the link)."""
         out = []
         with self.lock:
+            if self.pending_flipper_request:
+                out.append(f"U|{self.pending_flipper_request}")
+                self.pending_flipper_request = ""
             if not self.active:
                 return out
             now = time.time()

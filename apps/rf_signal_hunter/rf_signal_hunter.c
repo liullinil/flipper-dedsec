@@ -35,7 +35,7 @@ static void hunter_record(Hunter* hunter) {
     DateTime now;
     furi_hal_rtc_get_datetime(&now);
     hunter->sequence++;
-    char line[256];
+    char line[384];
     snprintf(
         line,
         sizeof(line),
