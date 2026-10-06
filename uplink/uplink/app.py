@@ -212,25 +212,26 @@ def run_tray(feed, cfg):
     def status_text(_item=None):
         c = feed.counts()
         tail = f" {state['name']}" if state["status"] == "connected" else ""
-        return f"{state['status']}{tail} | codex {c['X']} | claude {c['C']}"
+        marker = "●" if state["status"] == "connected" else "○"
+        return f"{marker} {state['status'].upper()}{tail}  ·  CODEX {c['X']}  ·  CLAUDE {c['C']}"
 
     def version_text(_item=None):
-        return feed.updater.version_status()
+        return "DEDSEC // UPLINK  ·  " + feed.updater.version_status()
 
     def update_label(_item=None):
         if feed.updater.companion_update_available():
-            return f"Install companion update ({feed.updater.latest_companion['tag']})"
-        return "Install companion update"
+            return f"INSTALL COMPANION UPDATE  [{feed.updater.latest_companion['tag']}]"
+        return "INSTALL COMPANION UPDATE"
 
     def flipper_update_label(_item=None):
         if feed.updater.flipper_update_available():
-            return f"Install Flipper app update ({feed.updater.latest['tag']})"
-        return "Install Flipper app update"
+            return f"INSTALL FLIPPER APP UPDATE  [{feed.updater.latest['tag']}]"
+        return "INSTALL FLIPPER APP UPDATE"
 
     def on_status(status, name):
         state.update(status=status, name=name)
         icon.icon = make_icon(colors.get(status, "#e03030"))
-        icon.title = f"DedSec Uplink: {status_text()}"
+        icon.title = f"DEDSEC // UPLINK  ·  {status_text()}"
         icon.update_menu()
 
     def check_updates(_icon, _item):
@@ -282,20 +283,6 @@ def run_tray(feed, cfg):
     def toggle_pause(_icon, _item):
         link.set_paused(not link.paused)
 
-    def toggle_cmd(_icon, _item):
-        cfg["cmd_enabled"] = not cfg.get("cmd_enabled", True)
-        config.save(cfg)
-        log.info("remote shell %s", "enabled" if cfg["cmd_enabled"] else "disabled")
-
-    def toggle_autostart(_icon, _item):
-        config.set_autostart(not config.autostart_enabled())
-        icon.update_menu()
-
-    def toggle_hooks(_icon, _item):
-        hooks.install(remove=hooks.installed())
-        log.info("claude hooks %s", "installed" if hooks.installed() else "removed")
-        icon.update_menu()
-
     def open_log(_icon, _item):
         subprocess.Popen(["notepad.exe", LOG_PATH])
 
@@ -317,13 +304,18 @@ def run_tray(feed, cfg):
             settings_window.show()
 
     icon = pystray.Icon(
-        "dedsec_uplink", make_icon("#f0b400"), "DedSec Uplink",
+        "dedsec_uplink", make_icon("#f0b400"), "DEDSEC // UPLINK",
         menu=pystray.Menu(
             pystray.MenuItem(status_text, None, enabled=False),
             pystray.MenuItem(version_text, None, enabled=False),
-            pystray.MenuItem("Open settings…", open_settings),
-            pystray.MenuItem("Pause uplink", toggle_pause, checked=lambda _i: link.paused),
-            pystray.MenuItem("Quit", quit_app),
+            pystray.MenuItem("OPEN SETTINGS…", open_settings),
+            pystray.MenuItem("CHECK FOR UPDATES", check_updates),
+            pystray.MenuItem(update_label, install_companion_update,
+                             enabled=lambda _i: feed.updater.companion_update_available()),
+            pystray.MenuItem(flipper_update_label, install_flipper_update,
+                             enabled=lambda _i: feed.updater.flipper_update_available()),
+            pystray.MenuItem("PAUSE UPLINK", toggle_pause, checked=lambda _i: link.paused),
+            pystray.MenuItem("QUIT", quit_app),
         ))
 
     settings_window = SettingsWindow(

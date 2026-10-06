@@ -70,7 +70,7 @@ class SettingsWindow:
     def _run(self):
         try:
             import tkinter as tk
-            from tkinter import messagebox, ttk
+            from tkinter import ttk
         except Exception as exc:  # pragma: no cover - only used on minimal Python installs
             self._opening = False
             log.warning("settings window unavailable: %s", exc)
@@ -85,90 +85,225 @@ class SettingsWindow:
 
         self._root = root
         self._opening = False
-        root.title("DedSec Uplink Settings")
-        root.geometry("560x500")
-        root.minsize(500, 420)
+        bg = "#071018"
+        card = "#0d1c26"
+        card_alt = "#102733"
+        border = "#1d4050"
+        text = "#d7edf2"
+        muted = "#7595a0"
+        cyan = "#27e0e8"
+        orange = "#f28a32"
+        root.title("DEDSEC // UPLINK")
+        root.geometry("700x640")
+        root.minsize(620, 560)
+        root.configure(background=bg)
         root.protocol("WM_DELETE_WINDOW", root.withdraw)
         try:
-            root.iconname("DedSec Uplink")
+            root.iconname("DEDSEC // UPLINK")
         except Exception:
             pass
 
-        outer = ttk.Frame(root, padding=18)
+        style = ttk.Style(root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("Cyber.TFrame", background=bg)
+        style.configure("Card.TFrame", background=card)
+        style.configure("AltCard.TFrame", background=card_alt)
+        style.configure("Cyber.TLabel", background=bg, foreground=text,
+                        font=("Segoe UI", 9))
+        style.configure("Muted.TLabel", background=bg, foreground=muted,
+                        font=("Segoe UI", 9))
+        style.configure("Card.TLabel", background=card, foreground=text,
+                        font=("Segoe UI", 9))
+        style.configure("CardMuted.TLabel", background=card, foreground=muted,
+                        font=("Segoe UI", 8))
+        style.configure("Value.TLabel", background=card, foreground=cyan,
+                        font=("Segoe UI", 12, "bold"))
+        style.configure("VersionTitle.TLabel", background=card, foreground=muted,
+                        font=("Segoe UI", 8, "bold"))
+        style.configure("Cyber.TLabelframe", background=card, foreground=text,
+                        bordercolor=border, lightcolor=border, darkcolor=border,
+                        relief="solid", borderwidth=1)
+        style.configure("Cyber.TLabelframe.Label", background=card, foreground=cyan,
+                        font=("Segoe UI", 9, "bold"))
+        style.configure("Cyber.TCheckbutton", background=card, foreground=text,
+                        font=("Segoe UI", 9), focuscolor=card)
+        style.map("Cyber.TCheckbutton", background=[("active", card)],
+                  foreground=[("disabled", muted), ("active", text)])
+        style.configure("Cyber.TCombobox", fieldbackground=card_alt,
+                        background=card_alt, foreground=text, arrowcolor=cyan,
+                        bordercolor=border, lightcolor=border, darkcolor=border)
+        style.map("Cyber.TCombobox", fieldbackground=[("readonly", card_alt)],
+                  foreground=[("readonly", text)])
+        style.configure("Cyber.TButton", background=card_alt, foreground=text,
+                        bordercolor=border, lightcolor=border, darkcolor=border,
+                        padding=(12, 7), font=("Segoe UI", 9, "bold"))
+        style.map("Cyber.TButton", background=[("active", border), ("disabled", card)],
+                  foreground=[("disabled", muted), ("active", cyan)])
+        style.configure("Action.TButton", background=orange, foreground="#071018",
+                        bordercolor=orange, lightcolor=orange, darkcolor=orange,
+                        padding=(15, 8), font=("Segoe UI", 9, "bold"))
+        style.map("Action.TButton", background=[("active", "#ffad57"), ("disabled", card)],
+                  foreground=[("disabled", muted), ("active", "#071018")])
+        style.configure("Close.TButton", background=bg, foreground=muted,
+                        bordercolor=border, padding=(12, 6), font=("Segoe UI", 9))
+        style.map("Close.TButton", background=[("active", card_alt)], foreground=[("active", text)])
+        style.configure("Badge.TLabel", background="#123b45", foreground=cyan,
+                        padding=(10, 4), font=("Segoe UI", 9, "bold"))
+
+        outer = ttk.Frame(root, padding=(20, 16, 20, 14), style="Cyber.TFrame")
         outer.grid(row=0, column=0, sticky="nsew")
         root.columnconfigure(0, weight=1)
         root.rowconfigure(0, weight=1)
         outer.columnconfigure(0, weight=1)
 
-        title = ttk.Label(outer, text="DedSec Uplink", font=("Segoe UI", 16, "bold"))
-        title.grid(row=0, column=0, sticky="w")
-        ttk.Label(outer, text="Companion preferences and connection status",
-                  foreground="#666666").grid(row=1, column=0, sticky="w", pady=(0, 14))
+        header = tk.Canvas(outer, height=78, background=bg, highlightthickness=0,
+                           borderwidth=0)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        self._widgets["header_canvas"] = header
+        self._scan_y = 0
+        header.bind("<Configure>", lambda _event: self._draw_header(header, bg, cyan, orange))
+        self._draw_header(header, bg, cyan, orange)
 
-        status = ttk.LabelFrame(outer, text="Status", padding=10)
-        status.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-        status.columnconfigure(1, weight=1)
+        status = ttk.LabelFrame(outer, text="  LINK STATUS  ", padding=(12, 10),
+                                style="Cyber.TLabelframe")
+        status.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        status.columnconfigure(0, weight=1)
         self._vars["connection"] = tk.StringVar(value="")
         self._vars["companion"] = tk.StringVar(value="")
         self._vars["flipper"] = tk.StringVar(value="")
         self._vars["latest"] = tk.StringVar(value="")
-        for row, (label, key) in enumerate((("Connection", "connection"),
-                                             ("Companion", "companion"),
-                                             ("Flipper app", "flipper"),
-                                             ("Latest release", "latest"))):
-            ttk.Label(status, text=label + ":").grid(row=row, column=0, sticky="w", padx=(0, 12))
-            ttk.Label(status, textvariable=self._vars[key]).grid(row=row, column=1, sticky="w")
+        self._widgets["connection"] = ttk.Label(status, textvariable=self._vars["connection"],
+                                                 style="Badge.TLabel", anchor="w")
+        self._widgets["connection"].grid(row=0, column=0, sticky="w")
 
-        terminal = ttk.LabelFrame(outer, text="Terminal access", padding=10)
-        terminal.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        versions = ttk.Frame(status, style="Card.TFrame")
+        versions.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        for col in range(3):
+            versions.columnconfigure(col, weight=1)
+        for col, (label, key) in enumerate((("COMPANION", "companion"),
+                                             ("FLIPPER APP", "flipper"),
+                                             ("LATEST RELEASE", "latest"))):
+            version_card = ttk.Frame(versions, style="AltCard.TFrame", padding=(10, 7))
+            version_card.grid(row=0, column=col, sticky="ew",
+                              padx=(0 if col == 0 else 4, 4 if col < 2 else 0))
+            ttk.Label(version_card, text=label, style="VersionTitle.TLabel").pack(anchor="w")
+            ttk.Label(version_card, textvariable=self._vars[key], style="Value.TLabel").pack(
+                anchor="w", pady=(2, 0))
+
+        controls = ttk.Frame(outer, style="Cyber.TFrame")
+        controls.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        controls.columnconfigure(0, weight=1)
+        controls.columnconfigure(1, weight=1)
+
+        terminal = ttk.LabelFrame(controls, text="  TERMINAL ACCESS  ", padding=(12, 10),
+                                  style="Cyber.TLabelframe")
+        terminal.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
         terminal.columnconfigure(1, weight=1)
         self._vars["cmd_enabled"] = tk.BooleanVar(value=bool(self.cfg.get("cmd_enabled", True)))
         ttk.Checkbutton(terminal, text="Allow commands from Flipper", variable=self._vars["cmd_enabled"],
-                        command=self._apply_shell).grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(terminal, text="Shell:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+                        command=self._apply_shell, style="Cyber.TCheckbutton").grid(
+                            row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(terminal, text="Active shell", style="CardMuted.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(10, 0))
         self._vars["shell"] = tk.StringVar(value=self.cfg.get("shell", "cmd"))
         shell = ttk.Combobox(terminal, textvariable=self._vars["shell"],
-                             values=("cmd", "powershell"), state="readonly", width=18)
-        shell.grid(row=1, column=1, sticky="w", pady=(8, 0))
+                             values=("cmd", "powershell"), state="readonly", width=18,
+                             style="Cyber.TCombobox")
+        shell.grid(row=1, column=1, sticky="ew", pady=(10, 0))
         shell.bind("<<ComboboxSelected>>", lambda _event: self._apply_shell())
         self._widgets["shell"] = shell
 
-        integration = ttk.LabelFrame(outer, text="Windows integration", padding=10)
-        integration.grid(row=4, column=0, sticky="ew", pady=(0, 10))
+        integration = ttk.LabelFrame(controls, text="  WINDOWS INTEGRATION  ", padding=(12, 10),
+                                     style="Cyber.TLabelframe")
+        integration.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
         self._vars["autostart"] = tk.BooleanVar(value=config.autostart_enabled())
         self._vars["hooks"] = tk.BooleanVar(value=hooks.installed())
         ttk.Checkbutton(integration, text="Start with Windows", variable=self._vars["autostart"],
-                        command=self._apply_autostart).grid(row=0, column=0, sticky="w")
+                        command=self._apply_autostart, style="Cyber.TCheckbutton").grid(
+                            row=0, column=0, sticky="w")
         ttk.Checkbutton(integration, text="Install Claude Code hooks", variable=self._vars["hooks"],
-                        command=self._apply_hooks).grid(row=1, column=0, sticky="w", pady=(6, 0))
+                        command=self._apply_hooks, style="Cyber.TCheckbutton").grid(
+                            row=1, column=0, sticky="w", pady=(10, 0))
 
-        updates = ttk.LabelFrame(outer, text="Updates", padding=10)
-        updates.grid(row=5, column=0, sticky="ew", pady=(0, 10))
+        updates = ttk.LabelFrame(outer, text="  UPDATE CHANNEL  ", padding=(12, 10),
+                                 style="Cyber.TLabelframe")
+        updates.grid(row=3, column=0, sticky="ew", pady=(0, 10))
         updates.columnconfigure(0, weight=1)
         self._vars["update_status"] = tk.StringVar(value="Checking for updates…")
-        ttk.Label(updates, textvariable=self._vars["update_status"]).grid(row=0, column=0, sticky="w")
-        buttons = ttk.Frame(updates)
+        ttk.Label(updates, textvariable=self._vars["update_status"], style="Card.TLabel").grid(
+            row=0, column=0, sticky="w")
+        buttons = ttk.Frame(updates, style="Card.TFrame")
         buttons.grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Button(buttons, text="Check now", command=self._check_updates).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(buttons, text="CHECK NOW", command=self._check_updates,
+                   style="Action.TButton").grid(row=0, column=0, padx=(0, 7))
         self._widgets["companion_update"] = ttk.Button(
-            buttons, text="Install companion update", command=self._install_companion)
-        self._widgets["companion_update"].grid(row=0, column=1, padx=(0, 6))
+            buttons, text="Install companion update", command=self._install_companion,
+            style="Cyber.TButton")
+        self._widgets["companion_update"].grid(row=0, column=1, padx=(0, 7))
         self._widgets["flipper_update"] = ttk.Button(
-            buttons, text="Install Flipper app update", command=self._install_flipper)
+            buttons, text="Install Flipper app update", command=self._install_flipper,
+            style="Cyber.TButton")
         self._widgets["flipper_update"].grid(row=0, column=2)
 
-        footer = ttk.Frame(outer)
-        footer.grid(row=6, column=0, sticky="ew", pady=(4, 0))
-        ttk.Button(footer, text="Open log", command=self._open_log).pack(side="left")
-        ttk.Button(footer, text="Close", command=root.withdraw).pack(side="right")
+        footer = ttk.Frame(outer, style="Cyber.TFrame")
+        footer.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+        footer.columnconfigure(0, weight=1)
+        ttk.Label(footer, text="DEDSEC // LOCAL CONTROL NODE", style="Muted.TLabel").grid(
+            row=0, column=0, sticky="w")
+        ttk.Button(footer, text="OPEN LOG", command=self._open_log,
+                   style="Close.TButton").grid(row=0, column=1, padx=(8, 5))
+        ttk.Button(footer, text="CLOSE", command=root.withdraw,
+                   style="Close.TButton").grid(row=0, column=2)
 
         self._refresh()
+        self._animate_header()
         root.after(1000, self._tick)
         try:
             root.mainloop()
         finally:
             self._root = None
             self._opening = False
+
+    def _draw_header(self, canvas, bg, cyan, orange):
+        """Paint the static wordmark and separator used by the scanline effect."""
+        try:
+            width = max(1, int(canvas.winfo_width()))
+            height = max(1, int(canvas.winfo_height()))
+            canvas.delete("all")
+            canvas.create_text(16, 25, text="DEDSEC // UPLINK", anchor="w",
+                               fill=cyan, font=("Segoe UI", 20, "bold"), tags="static")
+            canvas.create_text(18, 52, text="LOCAL COMPANION  //  CONTROL NODE",
+                               anchor="w", fill=orange, font=("Segoe UI", 8, "bold"), tags="static")
+            canvas.create_line(width - 170, height - 17, width - 2, height - 17,
+                               fill="#173542", width=1, tags="static")
+            canvas.create_text(width - 5, height - 10, text="SECURE LINK",
+                               anchor="e", fill="#4d7782", font=("Segoe UI", 7), tags="static")
+        except Exception:
+            log.debug("header redraw failed", exc_info=True)
+
+    def _animate_header(self):
+        """Move a low-contrast scanline and occasional glitch mark."""
+        root = self._root
+        canvas = self._widgets.get("header_canvas")
+        if root is None or canvas is None:
+            return
+        try:
+            width = max(1, int(canvas.winfo_width()))
+            height = max(1, int(canvas.winfo_height()))
+            y = self._scan_y % height
+            canvas.delete("scan")
+            canvas.create_line(0, y, width, y, fill="#123541", width=1, tags="scan")
+            if self._scan_y % 23 == 0:
+                x = width - 130 - ((self._scan_y // 23) % 5) * 8
+                canvas.create_rectangle(x, y, min(width - 5, x + 19), y + 1,
+                                        fill="#1e5360", outline="", tags="scan")
+            self._scan_y = (self._scan_y + 3) % height
+            root.after(90, self._animate_header)
+        except Exception:
+            log.debug("header animation stopped", exc_info=True)
 
     # ------------------------------------------------------------------ actions
     def _apply_shell(self):
