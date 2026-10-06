@@ -66,6 +66,20 @@ class AnalyzerProject:
         self.events.update(store.events)
         return len(store.events)
 
+    def capture_bytes(self, event: RfEvent) -> bytes:
+        """Read the optional raw capture blob from whichever source owns it."""
+        for store in self.sources.values():
+            if store.events.get(event.event_id) is not event and event.event_id not in store.events:
+                continue
+            if not event.capture_blob:
+                return b""
+            try:
+                with open(os.path.join(store.root, event.capture_blob), "rb") as fh:
+                    return fh.read()
+            except OSError:
+                return b""
+        return b""
+
     def clear(self):
         self.sources.clear()
         self.events.clear()
@@ -480,7 +494,9 @@ class RfHunterApp:
         data = (f"Event {event.event_id}\nDevice {event.device_uuid}\nSession {event.session_id}\n"
                 f"{event.captured_at_utc}\n{event.frequency_hz / 1e6:.3f} MHz · {event.modulation}\n"
                 f"RSSI {event.rssi_avg_dbm:.1f} dBm · duration {event.duration_us} us\n"
-                f"Family {self.project.family_key(event)}\nClassification {event.classification} "
+                f"Family {self.project.family_key(event)}\nPulse timings {len(event.pulse_timings_us)} samples\n"
+                f"Raw capture {len(self.project.capture_bytes(event))} bytes\n"
+                f"Classification {event.classification} "
                 f"({event.classification_confidence:.0%})")
         self.details.configure(state="normal"); self.details.delete("1.0", "end"); self.details.insert("end", data); self.details.configure(state="disabled")
         note = self.project.note(event.event_id)

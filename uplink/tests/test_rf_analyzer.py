@@ -1,5 +1,5 @@
 from uplink.rf_analyzer import AnalyzerProject, EventFilter
-from uplink.rf_hunter import RfEvent
+from uplink.rf_hunter import EventStore, RfEvent
 
 
 def _event(seq, when, family="family-1", freq=433920000, rssi=-50):
@@ -37,6 +37,11 @@ def test_filters_and_views_produce_timeline_spectrum_waterfall():
     assert len(project.waterfall(rows)) == 2
     assert any(point["count"] for point in project.spectrum(rows))
 
+    date_filtered = project.filtered(EventFilter(start=project.timeline(rows)[0]["when"]))
+    assert len(date_filtered) == 2
+    freq_filtered = project.filtered(EventFilter(min_frequency_hz=434000000))
+    assert not freq_filtered
+
 
 def test_similarity_explains_structural_match_and_keeps_observations_separate():
     left = _event(1, "2026-10-06T08:00:00Z")
@@ -46,3 +51,10 @@ def test_similarity_explains_structural_match_and_keeps_observations_separate():
     assert "same modulation" in result["reasons"]
     assert "payload/observation remains separate" in result["reasons"]
 
+
+def test_raw_capture_is_available_to_detail_view(tmp_path):
+    store = EventStore(tmp_path)
+    event = _event(3, "2026-10-06T10:00:00Z")
+    store.add(event, b"raw pulse capture")
+    project = AnalyzerProject(); project.add_store(store)
+    assert project.capture_bytes(event) == b"raw pulse capture"
