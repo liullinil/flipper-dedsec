@@ -1,5 +1,6 @@
 from uplink.rf_analyzer import AnalyzerProject, EventFilter
 from uplink.rf_hunter import EventStore, RfEvent
+import asyncio
 
 
 def _event(seq, when, family="family-1", freq=433920000, rssi=-50):
@@ -77,3 +78,19 @@ def test_authoritative_grouping_merges_structure_and_splits_distinct_shape():
     reverse.events = {event.event_id: event for event in (distinct, second, first)}
     reverse.rebuild_families()
     assert {key: event.family_id for key, event in reverse.events.items()} == family_map
+
+
+def test_ble_sync_uses_durable_project_store(tmp_path):
+    project = AnalyzerProject()
+    target = EventStore(tmp_path)
+    event = _event(42, "2026-10-06T11:00:00Z")
+
+    class Adapter:
+        async def sync_to(self, store):
+            store.add(event, b"wire-event")
+            return {"seen": 1, "imported": 1, "skipped": 0}
+
+    result = asyncio.run(project.sync_ble(Adapter(), target))
+    assert result["imported"] == 1
+    assert event.event_id in project.events
+    assert project.capture_bytes(event) == b"wire-event"

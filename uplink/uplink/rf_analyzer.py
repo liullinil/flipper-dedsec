@@ -114,11 +114,32 @@ class AnalyzerProject:
         self.settings.update(payload.get("settings") or {})
         self.notes.update(payload.get("notes") or {})
 
-    async def sync_ble(self, adapter, frames):
-        """Send prepared RF protocol frames through a connected Bleak adapter."""
-        await adapter.import_events(frames)
+    async def sync_ble(self, adapter, frames=None):
+        """Import the Flipper journal through the current BLE adapter.
 
-    def sync_ble_blocking(self, adapter, frames):
+        ``BleakRfAdapter`` exposes the pull API as ``sync_to(store)``.  Older
+        callers passed an iterable of prepared frames to an adapter with an
+        ``import_events`` method, so retain that fallback while making the
+        real C profile path use this project's durable :class:`EventStore`.
+        ``frames`` may be an EventStore or a project-root path; when omitted,
+        the first already-open project source is used.
+        """
+        if hasattr(adapter, "sync_to"):
+            target = frames if isinstance(frames, EventStore) else None
+            if target is None and isinstance(frames, (str, os.PathLike)):
+                target = EventStore(frames)
+            if target is None and self.sources:
+                target = next(iter(self.sources.values()))
+            if target is None:
+                raise ValueError("an EventStore or project root is required for RF BLE sync")
+            result = await adapter.sync_to(target)
+            self.add_store(target)
+            return result
+        if hasattr(adapter, "import_events"):
+            return await adapter.import_events(frames or [])
+        raise TypeError("adapter does not implement RF BLE sync")
+
+    def sync_ble_blocking(self, adapter, frames=None):
         return asyncio.run(self.sync_ble(adapter, frames))
 
     def follow_profile(self, family_id):
