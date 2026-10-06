@@ -1,4 +1,4 @@
-#include "rfhunter_ble.h"
+#include "rf_hunter_ble.h"
 
 #include <furi_hal_version.h>
 #include <furi_ble/gatt.h>

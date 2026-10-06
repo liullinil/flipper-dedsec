@@ -13,12 +13,14 @@
 #include <storage/storage.h>
 #include <furi_hal_rtc.h>
 #include <furi_hal_random.h>
+#include <furi_hal_nfc.h>
 
 #define HUNTER_EVENTS_DIR APP_DATA_PATH("rf_signal_hunter")
 #define HUNTER_EVENTS_PATH HUNTER_EVENTS_DIR "/events.jsonl"
 #define HUNTER_DEVICE_ID_PATH HUNTER_EVENTS_DIR "/device_id"
 #define HUNTER_FREQUENCY_HZ 433920000U
 #define HUNTER_PULSE_RING_SIZE 16U
+static const uint32_t hunter_frequencies[] = {315000000U, 433920000U, 868350000U};
 
 typedef enum {
     HunterModeScout,
@@ -48,6 +50,14 @@ typedef struct {
     HunterMode mode;
     bool running;
     bool receiver_active;
+    bool nfc_detect_active;
+    uint8_t frequency_index;
+    uint32_t events_reviewed;
+    uint32_t families_seen;
+    float rssi_min;
+    float rssi_max;
+    float rssi_sum;
+    uint32_t rssi_samples;
 } Hunter;
 
 static void hunter_hex_random(char* out, size_t chars) {
@@ -106,7 +116,7 @@ static void hunter_record(Hunter* hunter) {
         sizeof(line),
         "{\"event_id\":\"rf-%s-%s-%lu\",\"device_id\":\"%s\",\"session_id\":\"%s\",\"sequence_number\":%lu,"
         "\"captured_at_utc\":\"%04u-%02u-%02uT%02u:%02u:%02uZ\",\"monotonic_ms\":%lu,"
-        "\"source_type\":\"subghz\",\"mode\":\"%s\",\"frequency_hz\":%lu,\"rssi_dbm\":0,"
+        "\"source_type\":\"subghz\",\"mode\":\"%s\",\"frequency_hz\":%lu,\"rssi_min_dbm\":%.1f,\"rssi_avg_dbm\":%.1f,\"rssi_max_dbm\":%.1f,"
         "\"pulse_count\":%lu,\"last_duration_us\":%lu,\"pulse_timings_us\":[",
         hunter->device_id,
         hunter->session_id,
@@ -122,7 +132,10 @@ static void hunter_record(Hunter* hunter) {
         now.second,
         (unsigned long)furi_get_tick(),
         hunter_mode_name(hunter->mode),
-        (unsigned long)HUNTER_FREQUENCY_HZ,
+        (unsigned long)hunter_frequencies[hunter->frequency_index],
+        (double)(hunter->rssi_samples ? hunter->rssi_min : 0.0f),
+        (double)(hunter->rssi_samples ? hunter->rssi_sum / hunter->rssi_samples : 0.0f),
+        (double)(hunter->rssi_samples ? hunter->rssi_max : 0.0f),
         (unsigned long)hunter->pulses,
         (unsigned long)hunter->last_duration);
     size_t used = strlen(line);
@@ -158,15 +171,15 @@ static void hunter_draw(Canvas* canvas, void* context) {
     snprintf(line, sizeof(line), "%s  %s", hunter_mode_name(hunter->mode), hunter->running ? "RUN" : "STOP");
     canvas_draw_str(canvas, 2, 16, line);
     if(hunter->mode == HunterModeNfc) {
-        canvas_draw_str(canvas, 2, 29, "NFC observation unavailable");
-        canvas_draw_str(canvas, 2, 40, "SDK 88.9 external poller");
-        canvas_draw_str(canvas, 2, 51, "No field / no transmit");
+        canvas_draw_str(canvas, 2, 29, hunter->nfc_detect_active ? "NFC field detector" : "NFC detector stopped");
+        canvas_draw_str(canvas, 2, 40, furi_hal_nfc_field_is_present() ? "External field: present" : "External field: absent");
+        canvas_draw_str(canvas, 2, 51, "Presence only; no poller TX");
     } else {
-        snprintf(line, sizeof(line), "Bursts: %lu", (unsigned long)hunter->bursts);
+        snprintf(line, sizeof(line), "Events: %lu  New fam: %lu", (unsigned long)(hunter->bursts - hunter->events_reviewed), (unsigned long)hunter->families_seen);
         canvas_draw_str(canvas, 2, 29, line);
         snprintf(line, sizeof(line), "Pulses: %lu", (unsigned long)hunter->pulses);
         canvas_draw_str(canvas, 2, 40, line);
-        snprintf(line, sizeof(line), "Last: %lu us", (unsigned long)hunter->last_duration);
+        snprintf(line, sizeof(line), "Last: %lu us RSSI %.0f", (unsigned long)hunter->last_duration, (double)(hunter->rssi_samples ? hunter->rssi_sum / hunter->rssi_samples : 0.0f));
         canvas_draw_str(canvas, 2, 51, line);
     }
     canvas_draw_str(canvas, 2, 62, "L/R mode  OK run  Back exit");
@@ -184,12 +197,23 @@ static void hunter_input(InputEvent* event, void* context) {
         if(next < 0) next = HunterModeCount - 1;
         if(next >= HunterModeCount) next = 0;
         hunter->mode = (HunterMode)next;
+        if(hunter->mode == HunterModeNfc && !hunter->nfc_detect_active) {
+            hunter->nfc_detect_active = furi_hal_nfc_field_detect_start() == FuriHalNfcErrorNone;
+        } else if(hunter->mode != HunterModeNfc && hunter->nfc_detect_active) {
+            furi_hal_nfc_field_detect_stop();
+            hunter->nfc_detect_active = false;
+        }
         view_port_update(hunter->viewport);
     } else if(event->key == InputKeyOk) {
-        if(hunter->mode == HunterModeNfc) return;
+        if(hunter->mode == HunterModeScout) hunter->events_reviewed = hunter->bursts;
+        if(hunter->mode == HunterModeNfc) {
+            if(hunter->nfc_detect_active) furi_hal_nfc_field_detect_stop();
+            hunter->nfc_detect_active = false;
+            return;
+        }
         hunter->receiver_active = !hunter->receiver_active;
         if(hunter->receiver_active) {
-            furi_hal_subghz_set_frequency(HUNTER_FREQUENCY_HZ);
+            furi_hal_subghz_set_frequency(hunter_frequencies[hunter->frequency_index]);
             furi_hal_subghz_rx();
             furi_hal_subghz_start_async_rx(hunter_capture, hunter);
             if(hunter->mode == HunterModeFollow && hunter->follow_duration == 0) {
@@ -228,12 +252,24 @@ int32_t rf_signal_hunter_app(void* context) {
 
     while(hunter.running) {
         furi_delay_ms(250);
+        if(hunter.receiver_active) {
+            float rssi = furi_hal_subghz_get_rssi();
+            if(hunter.rssi_samples == 0 || rssi < hunter.rssi_min) hunter.rssi_min = rssi;
+            if(hunter.rssi_samples == 0 || rssi > hunter.rssi_max) hunter.rssi_max = rssi;
+            hunter.rssi_sum += rssi;
+            hunter.rssi_samples++;
+            if(hunter.mode == HunterModeScout) {
+                hunter.frequency_index = (hunter.frequency_index + 1) % (sizeof(hunter_frequencies) / sizeof(hunter_frequencies[0]));
+                furi_hal_subghz_set_frequency(hunter_frequencies[hunter.frequency_index]);
+            }
+        }
         if(hunter.bursts != hunter.notified_bursts) {
             hunter.notified_bursts = hunter.bursts;
             if(hunter_event_selected(&hunter)) {
                 notification_message(hunter.notifications, &sequence_audiovisual_alert);
                 notification_message(hunter.notifications, &sequence_set_only_green_255);
                 hunter_record(&hunter);
+                hunter.families_seen++;
                 if(hunter.mode == HunterModeFollow && hunter.follow_duration == 0) {
                     hunter.follow_duration = hunter.last_duration;
                 }
@@ -246,6 +282,7 @@ int32_t rf_signal_hunter_app(void* context) {
         furi_hal_subghz_stop_async_rx();
         furi_hal_subghz_idle();
     }
+    if(hunter.nfc_detect_active) furi_hal_nfc_field_detect_stop();
     notification_message(hunter.notifications, &sequence_reset_rgb);
     if(hunter.events_file) {
         storage_file_close(hunter.events_file);
