@@ -228,14 +228,19 @@ class Terminal:
                     pass
             self.revision += 1
             plain = _plain_text(text, self)
-            if "UPLINKPROMPT>" in plain:
+            has_prompt = "UPLINKPROMPT>" in plain
+            if has_prompt and self.on_output and plain:
+                # Deliver the startup prompt synchronously before waking start().  The
+                # shell wrapper uses this boundary to separate startup from the first
+                # command; deferring it to the coalescing thread races the first write.
+                self.on_output(plain)
+            if has_prompt:
                 self._ready.set()
-        if self.on_output:
-            if plain:
-                with self._pending_lock:
-                    self._pending += plain
-                    if len(self._pending) > OUTPUT_MAX:
-                        self._pending = self._pending[-OUTPUT_MAX:]
+        if self.on_output and plain and not has_prompt:
+            with self._pending_lock:
+                self._pending += plain
+                if len(self._pending) > OUTPUT_MAX:
+                    self._pending = self._pending[-OUTPUT_MAX:]
 
     def _flush_loop(self):
         while not self._stop.wait(OUTPUT_FLUSH):
