@@ -272,7 +272,10 @@ static void hunter_process_nfc(Hunter* hunter) {
 }
 
 static void hunter_record(Hunter* hunter) {
-    if(!hunter->events_file || !storage_file_is_open(hunter->events_file)) return;
+    /* The per-event store is the durable BLE source of truth.  The legacy
+     * JSONL stream is only a convenience export; a failure to open it must
+     * never suppress an otherwise valid pending event. */
+    if(!hunter->store) return;
     DateTime local;
     furi_hal_rtc_get_datetime(&local);
     /* RTC calendar fields are local time; apply the persisted offset before
@@ -350,8 +353,10 @@ static void hunter_record(Hunter* hunter) {
         }
         return;
     }
-    storage_file_write(hunter->events_file, line, used);
-    storage_file_sync(hunter->events_file);
+    if(hunter->events_file && storage_file_is_open(hunter->events_file)) {
+        storage_file_write(hunter->events_file, line, used);
+        storage_file_sync(hunter->events_file);
+    }
 }
 
 static void hunter_capture(bool level, uint32_t duration, void* context) {
