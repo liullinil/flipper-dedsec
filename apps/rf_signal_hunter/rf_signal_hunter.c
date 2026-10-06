@@ -275,20 +275,21 @@ static void hunter_ble_handle(Hunter* hunter, const char* line) {
         hunter_ble_send(hunter, reply);
     } else if(strstr(line, "\"op\":\"list\"")) {
         char reply[220];
-        snprintf(reply, sizeof(reply), "{\"v\":1,\"rid\":%lu,\"op\":\"list_ack\"}\n", (unsigned long)rid);
-        hunter_ble_send(hunter, reply);
         File* dir = storage_file_alloc(hunter->storage);
         char name[96];
         FileInfo info;
+        uint32_t cursor = hunter_json_number(line, "cursor");
+        uint32_t index = 0;
         if(storage_dir_open(dir, RF_STORE_EVENTS_DIR)) {
             while(storage_dir_read(dir, &info, name, sizeof(name))) {
                 size_t n = strlen(name);
                 if(n <= 5 || strcmp(name + n - 5, ".json")) continue;
+                if(index++ < cursor) continue;
                 name[n - 5] = 0;
                 char record[640]; size_t length = 0;
                 if(rf_store_read(hunter->store, name, record, sizeof(record), &length)) {
                     char item[220];
-                    snprintf(item, sizeof(item), "{\"v\":1,\"rid\":%lu,\"op\":\"item\",\"event_id\":\"%s\",\"size\":%lu,\"crc32\":%lu,\"next\":%lu}\n", (unsigned long)rid, name, (unsigned long)length, (unsigned long)hunter_crc32(record, length), (unsigned long)1);
+                    snprintf(item, sizeof(item), "{\"v\":1,\"rid\":%lu,\"op\":\"item\",\"event_id\":\"%s\",\"size\":%lu,\"crc32\":%lu,\"next\":%lu}\n", (unsigned long)rid, name, (unsigned long)length, (unsigned long)hunter_crc32(record, length), (unsigned long)index);
                     hunter_ble_send(hunter, item);
                 }
             }
