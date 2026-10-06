@@ -466,6 +466,7 @@ class RfHunterApp:
         ttk.Label(left, text="SIGNAL FAMILIES").pack(anchor="w")
         self.families = tk.Listbox(left, bg="#0a1b25", fg="#c9f5ff", selectbackground="#14515b", relief="flat")
         self.families.pack(fill="both", expand=True, pady=5); self.families.bind("<<ListboxSelect>>", self.family_selected)
+        ttk.Button(left, text="Show all families", command=self.clear_family).pack(anchor="e", pady=(0, 4))
         self.waterfall_canvas = tk.Canvas(center, bg="#041017", highlightthickness=0, height=330); self.waterfall_canvas.pack(fill="both", expand=True)
         self.timeline_canvas = tk.Canvas(center, bg="#08151d", highlightthickness=0, height=140); self.timeline_canvas.pack(fill="both", expand=True, pady=5)
         self.spectrum_canvas = tk.Canvas(center, bg="#07141c", highlightthickness=0, height=150); self.spectrum_canvas.pack(fill="both", expand=True)
@@ -615,9 +616,19 @@ class RfHunterApp:
         self._set_family_details(self._selected_family)
         self.refresh()
 
+    def clear_family(self):
+        self._selected_family = ""
+        self.families.selection_clear(0, "end")
+        self.refresh()
+
     def refresh(self):
         events = self.project.filtered(self._spec())
-        summaries = self.project.family_summary(events)
+        # Keep the navigator complete while the center view is filtered to a
+        # selected family; otherwise selecting one row makes all other
+        # families disappear and forces the user to reload the store.
+        all_spec = self._spec()
+        all_spec.family_id = ""
+        summaries = self.project.family_summary(self.project.filtered(all_spec))
         self.families.delete(0, "end")
         for summary in summaries:
             self.families.insert("end", f"{summary['family_id']}  {summary['observation_count']} obs")
