@@ -20,6 +20,7 @@ from .common import ascii_text
 from .link import Link
 from .shell import Shell
 from .session_views import SessionViews
+from .settings_window import SettingsWindow
 from .sysmon import SysMon
 from .updater import Updater
 
@@ -301,31 +302,42 @@ def run_tray(feed, cfg):
     def quit_app(_icon, _item):
         link.stop()
         feed.shutdown()
+        if settings_window:
+            settings_window.close()
         icon.stop()
+
+    # Long-lived settings live in a normal window; the tray menu remains useful
+    # for status and launching that window without burying every preference in
+    # a nested menu.  Callbacks deliberately have no pystray arguments so the
+    # same actions can be used by Tk buttons.
+    settings_window = None
+
+    def open_settings(_icon=None, _item=None):
+        if settings_window:
+            settings_window.show()
 
     icon = pystray.Icon(
         "dedsec_uplink", make_icon("#f0b400"), "DedSec Uplink",
         menu=pystray.Menu(
             pystray.MenuItem(status_text, None, enabled=False),
             pystray.MenuItem(version_text, None, enabled=False),
-            pystray.MenuItem("Check for updates", check_updates),
-            pystray.MenuItem(update_label, install_companion_update,
-                             enabled=lambda _i: feed.updater.companion_update_available()),
-            pystray.MenuItem(flipper_update_label, install_flipper_update,
-                             enabled=lambda _i: feed.updater.flipper_update_available()),
+            pystray.MenuItem("Open settings…", open_settings),
             pystray.MenuItem("Pause uplink", toggle_pause, checked=lambda _i: link.paused),
-            pystray.MenuItem(
-                "Allow remote shell (cmd)", toggle_cmd,
-                checked=lambda _i: cfg.get("cmd_enabled", True)),
-            pystray.MenuItem(
-                "Start with Windows", toggle_autostart,
-                checked=lambda _i: config.autostart_enabled()),
-            pystray.MenuItem(
-                "Claude Code hooks (precise state)", toggle_hooks,
-                checked=lambda _i: hooks.installed()),
-            pystray.MenuItem("Open log", open_log),
             pystray.MenuItem("Quit", quit_app),
         ))
+
+    settings_window = SettingsWindow(
+        feed,
+        cfg,
+        actions={
+            "check_updates": lambda: check_updates(None, None),
+            "install_companion": lambda: install_companion_update(None, None),
+            "install_flipper": lambda: install_flipper_update(None, None),
+            "open_log": lambda: open_log(None, None),
+            "status": status_text,
+            "on_changed": icon.update_menu,
+        },
+    )
 
     def setup(ic):
         ic.visible = True
