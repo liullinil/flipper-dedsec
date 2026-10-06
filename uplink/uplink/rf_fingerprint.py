@@ -40,6 +40,16 @@ def _text(value: Any, default: str = "") -> str:
     return str(value).strip()
 
 
+def _is_nfc(event: Any) -> bool:
+    """Return true for passive NFC field observations.
+
+    NFC field detection intentionally has no pulse stream in the FAP event;
+    technology/protocol metadata and the carrier frequency are the stable
+    structural evidence available for grouping.
+    """
+    return _text(_get(event, "source_type", "subghz"), "subghz").lower() == "nfc"
+
+
 def _int(value: Any, default: int = 0) -> int:
     try:
         return int(float(value))
@@ -226,6 +236,8 @@ def extract_features(event: Any) -> dict:
         "has_pulses": len(pulses) >= MIN_STRUCTURAL_PULSES,
         "has_payload": bool(payload),
         "source_type": _text(_get(event, "source_type", "subghz"), "subghz").lower(),
+        "nfc_technology": _text(_get(event, "nfc_technology", _get(event, "technology", ""))),
+        "nfc_protocol": _text(_get(event, "nfc_protocol", _get(event, "protocol", ""))),
     }
 
 
@@ -247,6 +259,9 @@ def _canonical_structure(features: dict) -> dict:
         # Payload length is structural framing, while bytes and bit order are
         # intentionally excluded so rolling code changes remain related.
         "payload_bits": features["payload"]["bit_length"] or None,
+        "source_type": features["source_type"],
+        "nfc_technology": features.get("nfc_technology", ""),
+        "nfc_protocol": features.get("nfc_protocol", ""),
     }
 
 
@@ -317,6 +332,40 @@ def compare_events(left: Any, right: Any,
             "reasons": ["same event identity"],
             "features": feature_view,
             "matched_features": ("same event identity",),
+        }
+
+    # A field detector event has no decoded frame or pulse stream.  Group
+    # repeated observations by the passive evidence that is actually present
+    # instead of manufacturing a weak pulse similarity score.
+    if _is_nfc(left) and _is_nfc(right):
+        same_technology = bool(lf["nfc_technology"] and rf["nfc_technology"] and
+                               lf["nfc_technology"].casefold() == rf["nfc_technology"].casefold())
+        same_protocol = bool(lf["nfc_protocol"] and rf["nfc_protocol"] and
+                             lf["nfc_protocol"].casefold() == rf["nfc_protocol"].casefold())
+        frequency_score = _frequency_similarity(lf["frequency_hz"], rf["frequency_hz"],
+                                                 frequency_tolerance_hz)
+        same_carrier = frequency_score is not None and frequency_score >= 0.75
+        score = 0.0
+        reasons = []
+        if same_technology:
+            score += 0.40; reasons.append("same NFC technology")
+        if same_protocol:
+            score += 0.30; reasons.append("same NFC protocol")
+        if same_carrier:
+            score += 0.30; reasons.append("same NFC carrier")
+        if score >= 0.70:
+            return {
+                "score": round(score, 3), "percent": int(round(score * 100)),
+                "confidence": round(score, 3), "relationship": "same_structure",
+                "relationship_text": "same NFC field source", "reasons": reasons,
+                "features": feature_view, "matched_features": tuple(reasons),
+            }
+        return {
+            "score": round(score, 3), "percent": int(round(score * 100)),
+            "confidence": round(score * 0.55, 3), "relationship": "unknown",
+            "relationship_text": "unknown", "reasons": reasons or ["insufficient NFC metadata"],
+            "features": feature_view,
+            "matched_features": tuple(reasons),
         }
 
     reasons = []
@@ -441,7 +490,10 @@ class StructuralGrouper:
         family_id = "family-" + hashlib.sha256(fp.encode("ascii")).hexdigest()[:12]
         # A missing-data event gets a unique provisional family even when a
         # coincident fingerprint is present; it cannot be forced into a group.
-        if not extract_features(event)["has_pulses"]:
+        # Pulse-less Sub-GHz observations remain provisional and unique. NFC
+        # field events are a deliberate exception: field presence plus the
+        # 13.56 MHz technology/protocol metadata is the available structure.
+        if not extract_features(event)["has_pulses"] and not _is_nfc(event):
             family_id = family_id + "-" + hashlib.sha256(_identity(event).encode()).hexdigest()[:6]
         features = extract_features(event)
         classification = classify(event)
@@ -450,8 +502,8 @@ class StructuralGrouper:
             "event_ids": [], "fingerprints": set(), "first_seen": when,
             "last_seen": when, "frequency_hz": features["frequency_hz"],
             "modulation": features["modulation"], "representative": event,
-            "confidence": 0.0 if not features["has_pulses"] else 1.0,
-            "provisional": not features["has_pulses"],
+            "confidence": 0.0 if (not features["has_pulses"] and not _is_nfc(event)) else 1.0,
+            "provisional": not features["has_pulses"] and not _is_nfc(event),
             "classification": classification["classification"],
             "classification_confidence": classification["confidence"],
         }
@@ -481,12 +533,17 @@ class StructuralGrouper:
 
     def _candidate(self, event: Any) -> Optional[tuple[str, float]]:
         features = extract_features(event)
-        if not features["has_pulses"]:
+        if not features["has_pulses"] and not _is_nfc(event):
             return None
         best = None
         for family_id in sorted(self.families):
             members = self._members.get(family_id, ())
-            if not members or not all(extract_features(member)["has_pulses"] for member in members):
+            if not members:
+                continue
+            if _is_nfc(event):
+                if not all(_is_nfc(member) for member in members):
+                    continue
+            elif not all(extract_features(member)["has_pulses"] for member in members):
                 continue
             comparisons = [compare_events(event, member,
                                            frequency_tolerance_hz=self.frequency_tolerance_hz)
@@ -500,7 +557,7 @@ class StructuralGrouper:
         return best
 
     def assign(self, event: Any) -> str:
-        """Assign one observation; never merges a pulse-less event by force."""
+        """Assign one observation; NFC field metadata can group without pulses."""
         event_id = _identity(event)
         if event_id and event_id in self._events:
             for family_id, members in self._members.items():

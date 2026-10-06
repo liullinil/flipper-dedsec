@@ -1,8 +1,8 @@
 /* RF Signal Hunter: passive Scout/Capture/Follow/NFC modes.
  *
  * This FAP deliberately uses only the public RX Sub-GHz API available in SDK
- * 88.9.  NFC is exposed as a safe observation screen because the low-level
- * NFC poller API is not stable for external FAPs; no NFC field is enabled.
+ * 88.9.  NFC uses the HAL's field-detector only: it observes an external
+ * 13.56 MHz carrier and never starts a poller, listener, or carrier output.
  * There are no TX, replay, or emulation calls in this application.
  */
 #include <furi.h>
@@ -62,6 +62,11 @@ typedef struct {
     bool running;
     bool receiver_active;
     bool nfc_detect_active;
+    bool nfc_hal_acquired;
+    bool nfc_field_present;
+    uint32_t nfc_field_started_tick;
+    uint32_t nfc_field_count;
+    DateTime nfc_field_started_rtc;
     bool storage_full;
     bool settings_open;
     uint8_t setting_index;
@@ -131,6 +136,139 @@ static bool hunter_event_selected(const Hunter* hunter) {
         return target == 0 || (d > (target > 500 ? target - 500 : 0) && d < target + 500);
     }
     return false;
+}
+
+/* The HAL field detector only samples the external carrier detector.  Keep
+ * the NFC lock for the lifetime of the detector so no other service can
+ * reconfigure the chip while we are reading its status bit.  No poller,
+ * listener, field-on, TX, or RX operation is used here. */
+static bool hunter_nfc_start(Hunter* hunter) {
+    if(hunter->nfc_detect_active) return true;
+    if(!hunter->nfc_hal_acquired) {
+        if(furi_hal_nfc_acquire() != FuriHalNfcErrorNone) return false;
+        hunter->nfc_hal_acquired = true;
+        if(furi_hal_nfc_low_power_mode_stop() != FuriHalNfcErrorNone) {
+            furi_hal_nfc_release();
+            hunter->nfc_hal_acquired = false;
+            return false;
+        }
+    }
+    if(furi_hal_nfc_field_detect_start() != FuriHalNfcErrorNone) {
+        furi_hal_nfc_low_power_mode_start();
+        furi_hal_nfc_release();
+        hunter->nfc_hal_acquired = false;
+        return false;
+    }
+    hunter->nfc_detect_active = true;
+    hunter->nfc_field_present = false;
+    return true;
+}
+
+static void hunter_record_nfc(
+    Hunter* hunter,
+    const DateTime* captured,
+    uint32_t start_tick,
+    uint32_t duration_ms) {
+    if(!captured) return;
+    DateTime local = *captured;
+    uint32_t rtc_epoch = datetime_datetime_to_timestamp(&local);
+    int64_t utc_epoch = (int64_t)rtc_epoch - (int64_t)hunter->settings.timezone_offset_minutes * 60;
+    if(utc_epoch < 0) utc_epoch = 0;
+    DateTime utc;
+    datetime_timestamp_to_datetime((uint32_t)utc_epoch, &utc);
+    hunter->sequence++;
+    char line[640];
+    int written = snprintf(
+        line,
+        sizeof(line),
+        "{\"event_id\":\"rf-%s-%s-%lu\",\"device_id\":\"%s\",\"session_id\":\"%s\",\"sequence_number\":%lu,"
+        "\"captured_at_utc\":\"%04u-%02u-%02uT%02u:%02u:%02uZ\",\"captured_at_unix\":%lu,\"timezone_offset_minutes\":%d,\"rtc_local_unix\":%lu,\"monotonic_ms\":%lu,"
+        "\"source_type\":\"nfc\",\"mode\":\"NFC\",\"frequency_hz\":13560000,\"modulation\":\"NFC\","
+        "\"nfc_technology\":\"external-field\",\"nfc_protocol\":\"carrier-presence\",\"nfc_identifier\":\"\","
+        "\"nfc_field_duration_ms\":%lu,\"nfc_field_count\":%lu,\"nfc_confidence\":0.50,\"upload_state\":\"pending\"}\n",
+        hunter->device_id,
+        hunter->session_id,
+        (unsigned long)hunter->sequence,
+        hunter->device_id,
+        hunter->session_id,
+        (unsigned long)hunter->sequence,
+        utc.year,
+        utc.month,
+        utc.day,
+        utc.hour,
+        utc.minute,
+        utc.second,
+        (unsigned long)utc_epoch,
+        hunter->settings.timezone_offset_minutes,
+        (unsigned long)rtc_epoch,
+        (unsigned long)(start_tick - hunter->session_start_tick),
+        (unsigned long)duration_ms,
+        (unsigned long)hunter->nfc_field_count);
+    if(written <= 0 || (size_t)written >= sizeof(line)) return;
+    char event_id[80];
+    snprintf(
+        event_id,
+        sizeof(event_id),
+        "rf-%s-%s-%lu",
+        hunter->device_id,
+        hunter->session_id,
+        (unsigned long)hunter->sequence);
+    hunter->storage_full = !rf_store_save(hunter->store, event_id, line, (size_t)written);
+    if(hunter->storage_full) {
+        notification_message(hunter->notifications, &sequence_set_only_red_255);
+        return;
+    }
+    if(hunter->events_file && storage_file_is_open(hunter->events_file)) {
+        storage_file_write(hunter->events_file, line, (size_t)written);
+        storage_file_sync(hunter->events_file);
+    }
+    hunter->bursts++;
+    hunter->families_seen++;
+    notification_message(hunter->notifications, &sequence_audiovisual_alert);
+    notification_message(hunter->notifications, &sequence_set_only_green_255);
+}
+
+static void hunter_nfc_finish_event(Hunter* hunter) {
+    if(!hunter->nfc_field_present) return;
+    uint32_t now = furi_get_tick();
+    hunter_record_nfc(
+        hunter,
+        &hunter->nfc_field_started_rtc,
+        hunter->nfc_field_started_tick,
+        now - hunter->nfc_field_started_tick);
+    hunter->nfc_field_present = false;
+}
+
+static void hunter_nfc_stop(Hunter* hunter) {
+    if(hunter->nfc_detect_active) {
+        /* Finalize a field that is still present when the user leaves NFC
+         * mode, preserving its start timestamp and observed duration. */
+        hunter_nfc_finish_event(hunter);
+        furi_hal_nfc_field_detect_stop();
+        hunter->nfc_detect_active = false;
+    }
+    if(hunter->nfc_hal_acquired) {
+        furi_hal_nfc_low_power_mode_start();
+        furi_hal_nfc_release();
+        hunter->nfc_hal_acquired = false;
+    }
+}
+
+static void hunter_process_nfc(Hunter* hunter) {
+    if(!hunter->nfc_detect_active) return;
+    bool present = furi_hal_nfc_field_is_present();
+    if(present && !hunter->nfc_field_present) {
+        hunter->nfc_field_present = true;
+        hunter->nfc_field_started_tick = furi_get_tick();
+        furi_hal_rtc_get_datetime(&hunter->nfc_field_started_rtc);
+        hunter->nfc_field_count++;
+        /* Feedback is intentionally emitted at field-on, before persistence
+         * waits for field-off and its final duration. */
+        notification_message(hunter->notifications, &sequence_audiovisual_alert);
+        notification_message(hunter->notifications, &sequence_set_only_green_255);
+    } else if(!present && hunter->nfc_field_present) {
+        hunter_nfc_finish_event(hunter);
+    }
 }
 
 static void hunter_record(Hunter* hunter) {
@@ -444,8 +582,9 @@ static void hunter_draw(Canvas* canvas, void* context) {
     canvas_draw_str(canvas, 2, 16, line);
     if(hunter->mode == HunterModeNfc) {
         canvas_draw_str(canvas, 2, 29, hunter->nfc_detect_active ? "NFC field detector" : "NFC detector stopped");
-        canvas_draw_str(canvas, 2, 40, furi_hal_nfc_field_is_present() ? "External field: present" : "External field: absent");
-        canvas_draw_str(canvas, 2, 51, "Presence only; no poller TX");
+        canvas_draw_str(canvas, 2, 40, hunter->nfc_field_present ? "External field: present" : "External field: absent");
+        snprintf(line, sizeof(line), "Fields: %lu  no poller TX", (unsigned long)hunter->nfc_field_count);
+        canvas_draw_str(canvas, 2, 51, line);
     } else {
         snprintf(line, sizeof(line), "Events: %lu  New fam: %lu", (unsigned long)(hunter->bursts - hunter->events_reviewed), (unsigned long)hunter->families_seen);
         canvas_draw_str(canvas, 2, 29, line);
@@ -499,19 +638,26 @@ static void hunter_input(InputEvent* event, void* context) {
         int next = (int)hunter->mode + delta;
         if(next < 0) next = HunterModeCount - 1;
         if(next >= HunterModeCount) next = 0;
+        HunterMode previous_mode = hunter->mode;
         hunter->mode = (HunterMode)next;
-        if(hunter->mode == HunterModeNfc && !hunter->nfc_detect_active) {
-            hunter->nfc_detect_active = furi_hal_nfc_field_detect_start() == FuriHalNfcErrorNone;
-        } else if(hunter->mode != HunterModeNfc && hunter->nfc_detect_active) {
-            furi_hal_nfc_field_detect_stop();
-            hunter->nfc_detect_active = false;
+        if(hunter->mode == HunterModeNfc) {
+            /* Never leave Sub-GHz RX running while taking the NFC HAL lock. */
+            if(hunter->receiver_active) {
+                furi_hal_subghz_stop_async_rx();
+                furi_hal_subghz_idle();
+                hunter->receiver_active = false;
+            }
+            if(!hunter_nfc_start(hunter)) hunter->mode = previous_mode;
+        } else if(previous_mode == HunterModeNfc) {
+            hunter_nfc_stop(hunter);
         }
         view_port_update(hunter->viewport);
     } else if(event->key == InputKeyOk) {
         if(hunter->mode == HunterModeScout) hunter->events_reviewed = hunter->bursts;
         if(hunter->mode == HunterModeNfc) {
-            if(hunter->nfc_detect_active) furi_hal_nfc_field_detect_stop();
-            hunter->nfc_detect_active = false;
+            if(hunter->nfc_detect_active) hunter_nfc_stop(hunter);
+            else hunter_nfc_start(hunter);
+            view_port_update(hunter->viewport);
             return;
         }
         hunter->receiver_active = !hunter->receiver_active;
@@ -571,6 +717,7 @@ int32_t rf_signal_hunter_app(void* context) {
     while(hunter.running) {
         furi_delay_ms(hunter.settings.dwell_ms);
         hunter_process_capture(&hunter);
+        hunter_process_nfc(&hunter);
         hunter_ble_drain(&hunter);
         if(hunter.receiver_active) {
             float rssi = furi_hal_subghz_get_rssi();
@@ -592,7 +739,7 @@ int32_t rf_signal_hunter_app(void* context) {
         furi_hal_subghz_stop_async_rx();
         furi_hal_subghz_idle();
     }
-    if(hunter.nfc_detect_active) furi_hal_nfc_field_detect_stop();
+    hunter_nfc_stop(&hunter);
     bt_disconnect(hunter.bt);
     furi_delay_ms(200);
     bt_keys_storage_set_default_path(hunter.bt);

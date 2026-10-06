@@ -64,3 +64,25 @@ def test_flipper_compact_record_is_normalized():
     assert event.device_uuid == "device"
     assert event.rssi_min_dbm == event.rssi_avg_dbm == event.rssi_max_dbm == -52
     assert event.duration_us == 900
+
+
+def test_passive_nfc_field_record_preserves_observation_metadata():
+    event = RfEvent.from_dict({
+        "event_id": "rf-device-session-nfc-1",
+        "device_id": "device",
+        "session_id": "session",
+        "sequence_number": 3,
+        "captured_at_utc": "2026-10-06T08:02:00Z",
+        "monotonic_ms": 1200,
+        "source_type": "nfc",
+        "frequency_hz": 13560000,
+        "modulation": "NFC",
+        "nfc_technology": "external-field",
+        "nfc_protocol": "carrier-presence",
+        "field_duration_ms": 84,
+        "nfc_field_count": 1,
+    })
+    assert event.source_type == "nfc"
+    assert event.nfc_technology == "external-field"
+    assert event.nfc_protocol == "carrier-presence"
+    assert event.nfc_field_duration_ms == 84

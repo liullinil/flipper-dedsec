@@ -32,6 +32,16 @@ class RfEvent:
     captured_at_utc: str
     monotonic_ms: int
     source_type: str = "subghz"
+    # NFC field observations are intentionally metadata-only.  The Flipper
+    # field detector reports carrier presence without polling or transmitting,
+    # so a record can describe the technology source even when no UID or raw
+    # frame was available.
+    nfc_technology: str = ""
+    nfc_protocol: str = ""
+    nfc_identifier: str = ""
+    nfc_field_duration_ms: int = 0
+    nfc_field_count: int = 0
+    nfc_confidence: float = 0.0
     frequency_hz: int = 0
     modulation: str = "unknown"
     bandwidth_hz: int = 0
@@ -77,6 +87,13 @@ class RfEvent:
             data["duration_us"] = int(data["last_duration_us"])
         if not data.get("source_type"):
             data["source_type"] = "nfc" if data.get("mode") == "NFC" else "subghz"
+        # Accept the compact FAP names while keeping a stable desktop schema.
+        if not data.get("nfc_technology") and data.get("technology"):
+            data["nfc_technology"] = data["technology"]
+        if not data.get("nfc_protocol") and data.get("protocol"):
+            data["nfc_protocol"] = data["protocol"]
+        if not data.get("nfc_field_duration_ms") and data.get("field_duration_ms"):
+            data["nfc_field_duration_ms"] = int(data["field_duration_ms"])
         event = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
         return event
 

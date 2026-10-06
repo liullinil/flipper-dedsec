@@ -75,6 +75,21 @@ def test_repeated_observations_keep_event_identity_but_group_together():
     assert len(family["fingerprints"]) == 1
 
 
+def test_passive_nfc_field_events_group_by_carrier_metadata():
+    first = _event(1, pulses=(), source_type="nfc", frequency_hz=13_560_000,
+                   modulation="NFC", nfc_technology="external-field",
+                   nfc_protocol="carrier-presence")
+    second = _event(2, pulses=(), source_type="nfc", frequency_hz=13_560_000,
+                    modulation="NFC", nfc_technology="external-field",
+                    nfc_protocol="carrier-presence")
+    grouper = StructuralGrouper()
+    assert grouper.assign(first) == grouper.assign(second)
+    assert not grouper.families[first.family_id]["provisional"]
+    result = compare_events(first, second)
+    assert result["relationship"] == "same_structure"
+    assert "same NFC carrier" in result["reasons"]
+
+
 def test_rebuild_is_deterministic_and_splits_wrong_old_family():
     first = _event(1, pulses=(400, 800, 400, 1200), family_id="old-wrong-family")
     second = _event(2, pulses=(400, 800, 400, 1200), family_id="old-wrong-family")
@@ -95,4 +110,3 @@ def test_classification_is_a_conservative_hypothesis():
     assert result["classification"] == "remote-like"
     assert result["confidence"] < 1.0
     assert classify(_event(2, pulses=(), payload=b""))["classification"] == "unknown"
-
