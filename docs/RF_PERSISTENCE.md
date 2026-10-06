@@ -38,8 +38,12 @@ prefix. A temporary write is synced before replacement; a backup lets startup
 recover the previous settings when reset interrupts replacement. Partial event
 writes are uncommitted and removed at startup. Backup event records from an
 interrupted replacement are restored when no committed record is present.
-ACK receipts are synced and renamed before capture reclamation; interrupted
-reclamation resumes on startup using the receipt as the commit marker.
+ACK receipts are compact JSON containing event identity, timestamp and available
+fingerprint/family/scalar capture metadata. Raw pulse arrays are omitted. They
+are synced and renamed before capture reclamation; interrupted reclamation
+resumes on startup using the receipt as the commit marker. Newly recorded
+events have only one raw copy under `events/`; the app no longer appends a
+second copy to `events.jsonl`.
 
 ## Verification and remaining work
 
@@ -50,10 +54,12 @@ preservation, ACK sync failure, unknown-ACK rejection, duplicate-ID rejection,
 retention selection and recovery after interrupted replacement/reclamation.
 The same source builds as FAP API 88.9.
 
-Hardware power-cut validation has not been performed. An ACK receipt currently
-identifies the event but does not yet retain the timestamp/fingerprint summary
-required by specification section 9.2. The legacy `events.jsonl` mirror also
-still duplicates raw data; its removal or migration is required before claiming
-bounded post-ACK SD reclamation. These are explicit remaining work, not covered
-by the native tests above. Desktop time conversion and epoch consistency are
-covered by `uplink/tests/test_rf_time.py`.
+Hardware power-cut validation has not been performed. Existing legacy
+`events.jsonl` files are deliberately left untouched because they may contain
+observations created before the per-event store was introduced. A one-time
+legacy import/archive flow remains; these historical files will not grow.
+Receipt summaries retain a fingerprint/family when present in the event; the
+local Scout/Follow grouping work must produce those fields consistently.
+The native test verifies compact receipt content and exclusion of pulse arrays.
+Desktop time conversion and epoch consistency are covered by
+`uplink/tests/test_rf_time.py`.

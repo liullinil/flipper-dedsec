@@ -69,6 +69,67 @@ static bool rf_store_valid_event_id(const char* event_id) {
 
 static bool is_json_file(const char* name);
 
+static bool write_exact(File* file, const char* text, size_t length) {
+    return storage_file_write(file, text, length) == length;
+}
+
+static bool receipt_field(File* file, const char* record, const char* key) {
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\":", key);
+    const char* start = strstr(record, needle);
+    if(!start) return true; /* Fields vary between Sub-GHz and NFC records. */
+    const char* value = start + strlen(needle);
+    while(*value == ' ') value++;
+    const char* end = value;
+    if(*value == '\"') {
+        end++;
+        while(*end && *end != '\"') {
+            if(*end == '\\' && end[1]) end++;
+            end++;
+        }
+        if(!*end) return true; /* A partial value is never committed. */
+        end++;
+    } else {
+        while(*end && *end != ',' && *end != '}' && *end != '\n') end++;
+        if(!*end || end == value || *value == '[' || *value == '{') return true;
+    }
+    return write_exact(file, ",", 1) && write_exact(file, start, (size_t)(end - start));
+}
+
+static bool write_receipt(RfStore* store, File* file, const char* event_id, const char* event_path) {
+    /* Capture metadata is at the beginning of the version-1 record.  Copy
+       only scalar identity/time/fingerprint fields, never pulse arrays. */
+    char* record = malloc(4096);
+    if(!record) return false;
+    File* source = storage_file_alloc(store->storage);
+    bool ok = storage_file_open(source, event_path, FSAM_READ, FSOM_OPEN_EXISTING);
+    if(ok) {
+        size_t length = storage_file_read(source, record, 4095);
+        record[length] = 0;
+        ok = length > 0;
+        storage_file_close(source);
+    }
+    storage_file_free(source);
+    char header[160];
+    int header_len = snprintf(header, sizeof(header), "{\"event_id\":\"%s\",\"upload_state\":\"uploaded\",\"schema_version\":1", event_id);
+    ok = ok && header_len > 0 && (size_t)header_len < sizeof(header) && write_exact(file, header, (size_t)header_len);
+    static const char* fields[] = {
+        "device_uuid", "device_id", "session_id", "sequence_number", "captured_at_utc",
+        "captured_at_unix", "timezone_offset_minutes", "rtc_local_unix", "monotonic_ms",
+        "source_type", "frequency_hz", "modulation", "bandwidth_hz", "fingerprint_id",
+        "family_id", "profile_id", "follow_profile_id", "follow_similarity", "repeat_count",
+        "rssi_min_dbm", "rssi_avg_dbm", "rssi_max_dbm", "duration_us", "last_duration_us",
+        "nfc_technology", "nfc_protocol", "nfc_field_duration_ms", "nfc_field_count",
+        "classification", "classification_confidence"
+    };
+    for(size_t i = 0; ok && i < sizeof(fields) / sizeof(fields[0]); i++) {
+        ok = receipt_field(file, record, fields[i]);
+    }
+    if(ok) ok = write_exact(file, "}\n", 2);
+    free(record);
+    return ok;
+}
+
 static void rf_store_set_error(RfStore* store, RfStoreError error) {
     if(store) store->last_error = error;
 }
@@ -338,7 +399,7 @@ bool rf_store_ack(RfStore* store, const char* event_id) {
     File* file = storage_file_alloc(store->storage);
     bool ok = storage_file_open(file, receipt_tmp, FSAM_WRITE, FSOM_CREATE_ALWAYS);
     if(ok) {
-        ok = storage_file_sync(file);
+        ok = write_receipt(store, file, event_id, path) && storage_file_sync(file);
         storage_file_close(file);
     }
     storage_file_free(file);

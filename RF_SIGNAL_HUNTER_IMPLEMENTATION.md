@@ -65,9 +65,10 @@ than continuous IQ.
   release, richer family graph animation and multi-project collaboration are
   still pending.
 - Time/storage controls and reset recovery are implemented and tested with the
-  production C code on a host storage facade. Hardware power-cut validation,
-  compact receipt fingerprint summaries and removing the legacy unbounded
-  `events.jsonl` mirror remain to be completed; see
+  production C code on a host storage facade. ACK receipts retain scalar
+  identity/time/fingerprint metadata and omit raw arrays; new events no longer
+  grow the legacy `events.jsonl` mirror. Hardware power-cut validation and
+  migration of existing legacy journals remain; see
   [docs/RF_PERSISTENCE.md](docs/RF_PERSISTENCE.md).
 
 ## Verification

@@ -105,7 +105,9 @@ static void settings_roundtrip_and_failure(void) {
 static void preserve_pending_and_receipts(void) {
     reset(); RfStore* store = rf_store_alloc(&storage);
     rf_store_configure(store, RfRetentionCompactAfterAck, 32768);
-    assert(rf_store_save(store, "one", "{\"value\":1}", 11));
+    static const char record[] = "{\"event_id\":\"one\",\"captured_at_utc\":\"2026-10-06T08:00:00Z\",\"fingerprint_id\":\"structural-1\",\"frequency_hz\":433920000,\"pulse_timings_us\":[10,20]}";
+    assert(rf_store_save(store, "one", record, sizeof(record) - 1));
+    assert(!rf_store_save(store, "one", "changed", 7));
     available = 100;
     assert(!rf_store_save(store, "two", "{}", 2));
     assert(rf_store_last_error(store) == RfStoreErrorStorageLow);
@@ -118,6 +120,13 @@ static void preserve_pending_and_receipts(void) {
     assert(rf_store_ack(store, "one"));
     assert(rf_store_is_acked(store, "one") && rf_store_pending_count(store) == 0);
     assert(lookup(RF_STORE_EVENTS_DIR "/one.json") < 0);
+    int receipt_index = lookup(RF_STORE_RECEIPTS_DIR "/one.ack");
+    assert(receipt_index >= 0);
+    const char* receipt = (const char*)entries[receipt_index].bytes;
+    assert(strstr(receipt, "2026-10-06T08:00:00Z"));
+    assert(strstr(receipt, "structural-1"));
+    assert(strstr(receipt, "uploaded"));
+    assert(!strstr(receipt, "pulse_timings_us"));
     assert(!rf_store_ack(store, "never-recorded"));
     rf_store_free(store);
 }
