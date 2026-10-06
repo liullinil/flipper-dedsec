@@ -84,7 +84,12 @@ class AnalyzerProject:
             if current is None:
                 self.events[event_id] = event
                 continue
-            current_capture = self.capture_bytes(current)
+            # ``store`` is already registered by add_root/add_store. Exclude
+            # it while checking the existing event, otherwise a duplicate's
+            # new capture would make the old metadata look complete.
+            existing_sources = [candidate for root, candidate in self.sources.items()
+                                if root != store.root]
+            current_capture = self._capture_bytes_from(current, existing_sources)
             incoming_capture = b""
             try:
                 if hasattr(store, "read_capture"):
@@ -101,7 +106,11 @@ class AnalyzerProject:
 
     def capture_bytes(self, event: RfEvent) -> bytes:
         """Read the optional raw capture blob from whichever source owns it."""
-        for store in self.sources.values():
+        return self._capture_bytes_from(event, self.sources.values())
+
+    @staticmethod
+    def _capture_bytes_from(event: RfEvent, stores) -> bytes:
+        for store in stores:
             if store.events.get(event.event_id) is not event and event.event_id not in store.events:
                 continue
             if hasattr(store, "read_capture"):
