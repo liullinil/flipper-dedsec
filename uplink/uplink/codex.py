@@ -179,11 +179,68 @@ class Thread:
         return IDLE
 
 
+class HistoryWatcher:
+    """Recent Codex app/API conversations from CODEX_HOME/history.jsonl.
+
+    These conversations do not always have a rollout file, but the history journal still
+    gives us a stable session id, the first user message as a name, and the latest prompt
+    as useful activity. They are treated as working until they have been quiet for the
+    normal stall window, then omitted with other idle sessions.
+    """
+
+    def __init__(self, home):
+        self.path = os.path.join(home, "history.jsonl")
+        self.tail = JsonlTail(self.path, initial_tail=512 * 1024)
+        self.sessions = {}
+        self.attn = AttentionCounter()
+
+    def poll(self, now, known_ids):
+        if self.tail.changed():
+            for obj in self.tail.read():
+                sid = str(obj.get("session_id") or "")
+                text = str(obj.get("text") or "").strip()
+                if not sid or not text:
+                    continue
+                try:
+                    ts = float(obj.get("ts") or 0)
+                except (TypeError, ValueError):
+                    ts = 0.0
+                item = self.sessions.setdefault(sid, {"first": text, "last": text, "ts": ts})
+                item["first"] = item.get("first") or text
+                if ts >= item.get("ts", 0):
+                    item["last"], item["ts"] = text, ts
+
+        rows = []
+        for sid, item in self.sessions.items():
+            if sid in known_ids:
+                continue
+            ts = float(item.get("ts") or 0)
+            if not ts or now - ts > ACTIVE_WINDOW:
+                continue
+            state = WORKING if now - ts < STALL_AFTER else IDLE
+            key = short_key(sid)
+            body = "chat: " + item["last"]
+            row = Session(
+                key=key,
+                name=utf8_text(_first_line(item["first"]) or "Codex chat", 24),
+                state=state,
+                detail=utf8_text(body, 220),
+                last_ts=ts,
+                body=body,
+                revision=revision_token(sid, body),
+                full_name=item["first"],
+            )
+            row.attn = self.attn.update(key, state)
+            if state != IDLE:
+                rows.append(row)
+        return rows
+
 class CodexWatcher:
     def __init__(self, home=None):
         self.home = home or os.environ.get("CODEX_HOME") or os.path.join(
             os.path.expanduser("~"), ".codex")
         self.threads = {}
+        self.history = HistoryWatcher(self.home)
         self.names = {}
         self.names_mtime = 0.0
         self.attn = AttentionCounter()
@@ -287,6 +344,9 @@ class CodexWatcher:
         for s, subs in rows:
             out.append(s)
             out.extend(sorted(subs, key=lambda k: -k.last_ts))
+        known_ids = {t.id for t in threads}
+        out.extend(self.history.poll(now, known_ids))
+        out.sort(key=lambda s: (ORDER.get(s.state, 9), -s.last_ts))
         return out
 
     @staticmethod
