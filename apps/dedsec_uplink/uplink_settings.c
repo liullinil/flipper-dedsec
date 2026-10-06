@@ -14,7 +14,7 @@ void uplink_settings_default(UplinkSettings* s) {
     s->cmd_vibro = 1;
     s->indicators = IndicatorsBars;
     s->theme = ThemeNormal;
-    s->font = FontSmall;
+    s->font = FontNormal;
     s->orientation = OrientationHorizontal;
     s->auto_update = 0;
     s->tabs[0] = ScreenSys;
@@ -49,7 +49,7 @@ void uplink_settings_load(UplinkSettings* s) {
         RD("CmdVibro", cmd_vibro, 1);
         RD("Indicators", indicators, 1);
         RD("Theme", theme, 1);
-        RD("Font", font, 1);
+        RD("Font", font, 3);
         RD("Orientation", orientation, 1);
         RD("AutoUpdate", auto_update, 1);
 #undef RD

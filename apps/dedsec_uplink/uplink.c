@@ -307,7 +307,8 @@ static void clean_copy(char* dst, size_t size, const char* src) {
 }
 
 static void font_text(Canvas* c, const App* app) {
-    if(app->settings.font == FontMicro) canvas_set_font(c, FontSecondary);
+    if(app->settings.font == FontMicro) canvas_set_font(c, FontKeyboard);
+    else if(app->settings.font == FontSmall) canvas_set_font(c, FontSecondary);
     else canvas_set_custom_u8g2_font(c, u8g2_font_uplink_cyr);
 }
 
@@ -871,9 +872,11 @@ static void draw_list(Canvas* c, App* app, Kind k) {
     uint8_t total_visible = visible_count(app, k);
     if(l->cursor >= total_visible) l->cursor = total_visible ? total_visible - 1 : 0;
     if(l->scroll > l->cursor) l->scroll = l->cursor;
+    bool large = app->settings.font == FontLarge;
+    bool small = app->settings.font == FontSmall;
     bool micro = app->settings.font == FontMicro;
-    int rows = micro ? 6 : 4;
-    int rh = micro ? 8 : 13;
+    int rows = large ? 4 : (micro ? 7 : (small ? 6 : 5));
+    int rh = large ? 13 : (micro ? 7 : (small ? 8 : 10));
     canvas_set_font(c, FontSecondary);
     if(!total_visible) {
         canvas_draw_str_aligned(c, 64, 26, AlignCenter, AlignTop, "NO ACTIVE SESSIONS");
@@ -890,7 +893,7 @@ static void draw_list(Canvas* c, App* app, Kind k) {
         if(i < 0) break;
         Item* it = &l->items[i];
         int y = 11 + r * rh;
-        draw_glyph(c, 2, y + (micro ? 1 : 3), it->state, app->tick);
+        draw_glyph(c, 2, y + (large ? 3 : 1), it->state, app->tick);
         char right[12];
         if(it->total)
             snprintf(right, sizeof(right), "%u/%u", it->done, it->total);
@@ -900,7 +903,7 @@ static void draw_list(Canvas* c, App* app, Kind k) {
         int rw = canvas_string_width(c, right);
         canvas_draw_str_aligned(c, right_edge, y + 2, AlignRight, AlignTop, right);
         font_text(c, app);
-        draw_str_fit(c, 12, y + (micro ? 1 : 2), it->name, right_edge - rw - 15);
+        draw_str_fit(c, 12, y + (large ? 2 : 0), it->name, right_edge - rw - 15);
         if(r == l->cursor) {
             canvas_set_color(c, ColorXOR);
             canvas_draw_box(c, 0, y, right_edge + 2, rh);
@@ -1115,6 +1118,9 @@ static void main_draw(Canvas* c, void* model) {
     // The UI uses one high-contrast palette; theme switching was removed from settings.
     g_fg = ColorBlack;
     g_bg = ColorWhite;
+    canvas_set_orientation(
+        c,
+        app->settings.orientation ? CanvasOrientationVertical : CanvasOrientationHorizontal);
     canvas_clear(c);
     fg(c);
     ScreenId screen = current_screen(app);
@@ -1358,7 +1364,7 @@ static bool nav_event(void* context) {
 /* ------------------------------------------------------------------ settings view */
 static const char* const on_off[] = {"OFF", "ON"};
 static const char* const ind_vals[] = {"Bars", "Text"};
-static const char* const font_vals[] = {"Small", "Micro"};
+static const char* const font_vals[] = {"Normal", "Large", "Small", "Micro"};
 static const char* const orientation_vals[] = {"Horizontal", "Vertical"};
 static const char* const tab_vals[] = {"SYS", "CDX", "CLD", "CMD", "Off"};
 static const char* const update_vals[] = {"Notify", "Auto"};
@@ -1490,7 +1496,7 @@ static void build_settings(App* app) {
     add_toggle(app, "LED alerts", on_off, 2, app->settings.led);
     add_toggle(app, "Wake screen on alert", on_off, 2, app->settings.backlight);
     add_toggle(app, "Indicators", ind_vals, 2, app->settings.indicators);
-    add_toggle(app, "Font", font_vals, 2, app->settings.font);
+    add_toggle(app, "Font", font_vals, 4, app->settings.font);
     add_toggle(app, "Orientation", orientation_vals, 2, app->settings.orientation);
     add_toggle(app, "Tab 1", tab_vals, 5, app->settings.tabs[0]);
     add_toggle(app, "Tab 2", tab_vals, 5, app->settings.tabs[1]);

@@ -24,8 +24,10 @@ typedef enum {
 } Theme;
 
 typedef enum {
-    FontSmall = 0,
-    FontMicro = 1,
+    FontNormal = 0,
+    FontLarge = 1,
+    FontSmall = 2,
+    FontMicro = 3,
 } FontSize;
 
 typedef enum {

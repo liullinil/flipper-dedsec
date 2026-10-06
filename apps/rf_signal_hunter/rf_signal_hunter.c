@@ -195,37 +195,88 @@ static bool hunter_extract_string(const char* line, const char* key, char* out, 
     return true;
 }
 
+static void hunter_send_event_parts(Hunter* hunter, const char* event_id, const char* record) {
+    static const char hex[] = "0123456789abcdef";
+    const size_t part_bytes = 72; // keeps JSON frame under the 243-byte ATT payload
+    size_t total = strlen(record);
+    uint16_t part = 0;
+    if(total == 0) total = 1;
+    for(size_t offset = 0; offset < total; offset += part_bytes, part++) {
+        size_t count = MIN(part_bytes, total - offset);
+        char frame[243];
+        size_t used = snprintf(
+            frame,
+            sizeof(frame),
+            "{\"v\":1,\"op\":\"event_part\",\"event_id\":\"%s\",\"part\":%u,\"last\":%u,\"hex\":\"",
+            event_id,
+            (unsigned)part,
+            (unsigned)(offset + count >= total));
+        for(size_t i = 0; i < count && used + 2 < sizeof(frame); i++) {
+            uint8_t byte = (uint8_t)record[offset + i];
+            frame[used++] = hex[byte >> 4];
+            frame[used++] = hex[byte & 0xF];
+        }
+        if(used + 3 < sizeof(frame)) {
+            frame[used++] = '"';
+            frame[used++] = '}';
+            frame[used++] = '\n';
+            frame[used] = 0;
+            hunter_ble_send(hunter, frame);
+        }
+    }
+}
+
 static void hunter_ble_handle(Hunter* hunter, const char* line) {
     if(strstr(line, "\"op\":\"hello\"")) {
         hunter_ble_send(hunter, "{\"v\":1,\"op\":\"hello_ack\",\"protocol\":1,\"chunk_size\":192}\n");
     } else if(strstr(line, "\"op\":\"manifest\"")) {
-        // The event stream is newline JSON already; advertise its presence and let the
-        // desktop request individual records by event_id. This keeps BLE frames bounded.
-        hunter_ble_send(hunter, "{\"v\":1,\"op\":\"manifest_ack\",\"events_file\":\"events.jsonl\"}\n");
+        // The event stream is newline JSON already; advertise each immutable event id and
+        // let the desktop request individual records. This keeps manifest frames bounded.
+        hunter_ble_send(hunter, "{\"v\":1,\"op\":\"manifest_ack\"}\n");
+        File* file = storage_file_alloc(hunter->storage);
+        if(storage_file_open(file, HUNTER_EVENTS_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+            char record[640];
+            size_t length = 0;
+            char ch = 0;
+            while(storage_file_read(file, &ch, 1) == 1) {
+                if(ch == '\n') {
+                    record[length] = 0;
+                    char id[80];
+                    if(hunter_extract_string(record, "event_id", id, sizeof(id))) {
+                        char item[180];
+                        snprintf(item, sizeof(item), "{\"v\":1,\"op\":\"manifest_item\",\"event_id\":\"%s\"}\n", id);
+                        hunter_ble_send(hunter, item);
+                    }
+                    length = 0;
+                } else if(length + 1 < sizeof(record)) {
+                    record[length++] = ch;
+                }
+            }
+            storage_file_close(file);
+        }
+        storage_file_free(file);
+        hunter_ble_send(hunter, "{\"v\":1,\"op\":\"manifest_end\"}\n");
     } else if(strstr(line, "\"op\":\"event_get\"")) {
         char id[80];
         if(hunter_extract_string(line, "event_id", id, sizeof(id))) {
             // Individual metadata delivery is implemented by scanning the compact JSONL
-            // index. Raw timing data is already embedded in each event record.
+            // index. Raw timing data is already embedded in each event record. Hex parts
+            // avoid needing a JSON/base64 library in the FAP and stay below the BLE MTU.
             File* file = storage_file_alloc(hunter->storage);
             if(storage_file_open(file, HUNTER_EVENTS_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
-                char buf[448];
-                size_t n;
-                while((n = storage_file_read(file, buf, sizeof(buf) - 1)) > 0) {
-                    buf[n] = 0;
-                    char* line_start = buf;
-                    for(char* e = buf; e < buf + n; e++) {
-                        if(*e != '\n' && e != buf + n - 1) continue;
-                        char saved = *e;
-                        *e = 0;
-                        if(strstr(line_start, "\"event_id\":\"") && strstr(line_start, id)) {
-                            char frame[640];
-                            snprintf(frame, sizeof(frame), "{\"v\":1,\"op\":\"event_record\",\"event_id\":\"%s\",\"metadata\":%s}\n", id, line_start);
-                            hunter_ble_send(hunter, frame);
+                char record[640];
+                size_t length = 0;
+                char ch = 0;
+                while(storage_file_read(file, &ch, 1) == 1) {
+                    if(ch == '\n') {
+                        record[length] = 0;
+                        if(strstr(record, "\"event_id\":\"") && strstr(record, id)) {
+                            hunter_send_event_parts(hunter, id, record);
                             break;
                         }
-                        *e = saved;
-                        line_start = e + 1;
+                        length = 0;
+                    } else if(length + 1 < sizeof(record)) {
+                        record[length++] = ch;
                     }
                 }
                 storage_file_close(file);
