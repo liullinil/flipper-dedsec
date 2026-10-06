@@ -306,8 +306,9 @@ static void clean_copy(char* dst, size_t size, const char* src) {
     utf8_trim(dst);
 }
 
-static void font_text(Canvas* c) {
-    canvas_set_custom_u8g2_font(c, u8g2_font_uplink_cyr);
+static void font_text(Canvas* c, const App* app) {
+    if(app->settings.font == FontMicro) canvas_set_font(c, FontSecondary);
+    else canvas_set_custom_u8g2_font(c, u8g2_font_uplink_cyr);
 }
 
 static void draw_str_fit(Canvas* c, int x, int y, const char* s, int max_w) {
@@ -870,9 +871,9 @@ static void draw_list(Canvas* c, App* app, Kind k) {
     uint8_t total_visible = visible_count(app, k);
     if(l->cursor >= total_visible) l->cursor = total_visible ? total_visible - 1 : 0;
     if(l->scroll > l->cursor) l->scroll = l->cursor;
-    bool large = app->settings.font == FontLarge;
-    int rows = large ? 4 : 5;
-    int rh = large ? 13 : 10;
+    bool micro = app->settings.font == FontMicro;
+    int rows = micro ? 6 : 4;
+    int rh = micro ? 8 : 13;
     canvas_set_font(c, FontSecondary);
     if(!total_visible) {
         canvas_draw_str_aligned(c, 64, 26, AlignCenter, AlignTop, "NO ACTIVE SESSIONS");
@@ -889,7 +890,7 @@ static void draw_list(Canvas* c, App* app, Kind k) {
         if(i < 0) break;
         Item* it = &l->items[i];
         int y = 11 + r * rh;
-        draw_glyph(c, 2, y + (large ? 3 : 1), it->state, app->tick);
+        draw_glyph(c, 2, y + (micro ? 1 : 3), it->state, app->tick);
         char right[12];
         if(it->total)
             snprintf(right, sizeof(right), "%u/%u", it->done, it->total);
@@ -898,8 +899,8 @@ static void draw_list(Canvas* c, App* app, Kind k) {
         canvas_set_font(c, FontSecondary);
         int rw = canvas_string_width(c, right);
         canvas_draw_str_aligned(c, right_edge, y + 2, AlignRight, AlignTop, right);
-        font_text(c);
-        draw_str_fit(c, 12, y + (large ? 2 : 0), it->name, right_edge - rw - 15);
+        font_text(c, app);
+        draw_str_fit(c, 12, y + (micro ? 1 : 2), it->name, right_edge - rw - 15);
         if(r == l->cursor) {
             canvas_set_color(c, ColorXOR);
             canvas_draw_box(c, 0, y, right_edge + 2, rh);
@@ -928,7 +929,7 @@ static void draw_detail(Canvas* c, App* app, Kind k) {
         return;
     }
     Item* it = &l->items[raw];
-    font_text(c);
+    font_text(c, app);
     draw_str_fit(c, 2, 11, it->name, 124);
     canvas_set_font(c, FontSecondary);
     const char* st = state_text(it->state);
@@ -950,7 +951,7 @@ static void draw_detail(Canvas* c, App* app, Kind k) {
         canvas_draw_str_aligned(c, 127, y, AlignRight, AlignTop, buf);
         y += 9;
     }
-    font_text(c);
+    font_text(c, app);
     int rows = (64 - y) / 9;
     if(rows > 0) {
         int total = draw_wrapped_scroll(c, 2, y, 124, it->detail, 0, 9, UINT8_MAX);
@@ -980,7 +981,7 @@ static void draw_cmd(Canvas* c, App* app) {
         snprintf(head, sizeof(head), "%s>", tail[0] ? tail : "cmd");
     char hbuf[96];
     clean_copy(hbuf, sizeof(hbuf), head);
-    font_text(c);
+    font_text(c, app);
     utf8_fit(c, hbuf, 126);
     canvas_draw_str_aligned(c, 2, 10, AlignLeft, AlignTop, hbuf);
     canvas_set_font(c, FontSecondary);
@@ -1000,7 +1001,7 @@ static void draw_cmd(Canvas* c, App* app) {
     if(start < 0) start = 0;
     bool sb = total > vis;
     int right = sb ? 124 : 128;
-    font_text(c);
+    font_text(c, app);
     for(int r = 0; start + r < bottom; r++) {
         char buf[CMD_COLW];
         clean_copy(buf, sizeof(buf), cmd_line(cmd, start + r));
@@ -1040,7 +1041,7 @@ static void draw_alert(Canvas* c, App* app) {
     fg(c);
     canvas_draw_str_aligned(
         c, 64, 28, AlignCenter, AlignTop, app->alert_kind == KindCodex ? "CODEX" : "CLAUDE");
-    font_text(c);
+    font_text(c, app);
     char name[64];
     clean_copy(name, sizeof(name), app->alert_name);
     utf8_fit(c, name, 110);
@@ -1111,15 +1112,10 @@ static void main_draw(Canvas* c, void* model) {
     MainModel* m = model;
     App* app = m->app;
     furi_mutex_acquire(app->mutex, FuriWaitForever);
-    bool inv = app->settings.theme == ThemeInverted;
-    // inverted theme = swap the palette and paint a dark background; every draw uses fg()/bg()
-    g_fg = inv ? ColorWhite : ColorBlack;
-    g_bg = inv ? ColorBlack : ColorWhite;
+    // The UI uses one high-contrast palette; theme switching was removed from settings.
+    g_fg = ColorBlack;
+    g_bg = ColorWhite;
     canvas_clear(c);
-    if(inv) {
-        canvas_set_color(c, ColorBlack);
-        canvas_draw_box(c, 0, 0, 128, 64);
-    }
     fg(c);
     ScreenId screen = current_screen(app);
     bool offline = (!app->link || app->host_closed) && screen != ScreenCmd;
@@ -1362,8 +1358,8 @@ static bool nav_event(void* context) {
 /* ------------------------------------------------------------------ settings view */
 static const char* const on_off[] = {"OFF", "ON"};
 static const char* const ind_vals[] = {"Bars", "Text"};
-static const char* const theme_vals[] = {"Normal", "Inverted"};
-static const char* const font_vals[] = {"Normal", "Large"};
+static const char* const font_vals[] = {"Small", "Micro"};
+static const char* const orientation_vals[] = {"Horizontal", "Vertical"};
 static const char* const tab_vals[] = {"SYS", "CDX", "CLD", "CMD", "Off"};
 static const char* const update_vals[] = {"Notify", "Auto"};
 
@@ -1373,8 +1369,8 @@ enum {
     SetLed,
     SetBacklight,
     SetIndicators,
-    SetTheme,
     SetFont,
+    SetOrientation,
     SetTab0,
     SetTab1,
     SetTab2,
@@ -1392,11 +1388,11 @@ static void setting_changed(VariableItem* item) {
     case SetIndicators:
         text = ind_vals[idx];
         break;
-    case SetTheme:
-        text = theme_vals[idx];
-        break;
     case SetFont:
         text = font_vals[idx];
+        break;
+    case SetOrientation:
+        text = orientation_vals[idx];
         break;
     case SetTab0:
     case SetTab1:
@@ -1431,11 +1427,18 @@ static void setting_changed(VariableItem* item) {
     case SetIndicators:
         app->settings.indicators = idx;
         break;
-    case SetTheme:
-        app->settings.theme = idx;
-        break;
     case SetFont:
         app->settings.font = idx;
+        break;
+    case SetOrientation:
+        app->settings.orientation = idx;
+        view_set_orientation(
+            app->main_view, idx ? ViewOrientationVertical : ViewOrientationHorizontal);
+        view_set_orientation(
+            text_input_get_view(app->keyboard), idx ? ViewOrientationVertical : ViewOrientationHorizontal);
+        view_set_orientation(
+            variable_item_list_get_view(app->settings_view),
+            idx ? ViewOrientationVertical : ViewOrientationHorizontal);
         break;
     case SetTab0:
     case SetTab1:
@@ -1487,8 +1490,8 @@ static void build_settings(App* app) {
     add_toggle(app, "LED alerts", on_off, 2, app->settings.led);
     add_toggle(app, "Wake screen on alert", on_off, 2, app->settings.backlight);
     add_toggle(app, "Indicators", ind_vals, 2, app->settings.indicators);
-    add_toggle(app, "Theme", theme_vals, 2, app->settings.theme);
-    add_toggle(app, "Font size", font_vals, 2, app->settings.font);
+    add_toggle(app, "Font", font_vals, 2, app->settings.font);
+    add_toggle(app, "Orientation", orientation_vals, 2, app->settings.orientation);
     add_toggle(app, "Tab 1", tab_vals, 5, app->settings.tabs[0]);
     add_toggle(app, "Tab 2", tab_vals, 5, app->settings.tabs[1]);
     add_toggle(app, "Tab 3", tab_vals, 5, app->settings.tabs[2]);
@@ -1579,15 +1582,24 @@ int32_t uplink_app(void* p) {
     view_set_input_callback(app->main_view, main_input);
     view_allocate_model(app->main_view, ViewModelTypeLocking, sizeof(MainModel));
     with_view_model(app->main_view, MainModel * m, { m->app = app; }, false);
+    view_set_orientation(
+        app->main_view,
+        app->settings.orientation ? ViewOrientationVertical : ViewOrientationHorizontal);
     view_dispatcher_add_view(app->views, ViewMain, app->main_view);
 
     app->keyboard = text_input_alloc();
     text_input_set_result_callback(
         app->keyboard, keyboard_done, app, app->cmd.input, sizeof(app->cmd.input), false);
+    view_set_orientation(
+        text_input_get_view(app->keyboard),
+        app->settings.orientation ? ViewOrientationVertical : ViewOrientationHorizontal);
     view_dispatcher_add_view(app->views, ViewKeyboard, text_input_get_view(app->keyboard));
 
     app->settings_view = variable_item_list_alloc();
     build_settings(app);
+    view_set_orientation(
+        variable_item_list_get_view(app->settings_view),
+        app->settings.orientation ? ViewOrientationVertical : ViewOrientationHorizontal);
     view_dispatcher_add_view(
         app->views, ViewSettings, variable_item_list_get_view(app->settings_view));
 

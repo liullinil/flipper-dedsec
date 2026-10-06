@@ -7,6 +7,8 @@ apps/dedsec_uplink/dist/
 apps/dedsec_uplink/.vscode/
 apps/*/dist/
 apps/*/.vscode/
+build/
+dist/
 **/__pycache__/
 *.pyc
 

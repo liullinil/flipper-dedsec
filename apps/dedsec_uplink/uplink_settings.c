@@ -14,7 +14,8 @@ void uplink_settings_default(UplinkSettings* s) {
     s->cmd_vibro = 1;
     s->indicators = IndicatorsBars;
     s->theme = ThemeNormal;
-    s->font = FontNormal;
+    s->font = FontSmall;
+    s->orientation = OrientationHorizontal;
     s->auto_update = 0;
     s->tabs[0] = ScreenSys;
     s->tabs[1] = ScreenCodex;
@@ -49,6 +50,7 @@ void uplink_settings_load(UplinkSettings* s) {
         RD("Indicators", indicators, 1);
         RD("Theme", theme, 1);
         RD("Font", font, 1);
+        RD("Orientation", orientation, 1);
         RD("AutoUpdate", auto_update, 1);
 #undef RD
         uint32_t tabs[4];
@@ -82,6 +84,8 @@ void uplink_settings_save(const UplinkSettings* s) {
         flipper_format_write_uint32(ff, "Theme", &v, 1);
         v = s->font;
         flipper_format_write_uint32(ff, "Font", &v, 1);
+        v = s->orientation;
+        flipper_format_write_uint32(ff, "Orientation", &v, 1);
         v = s->auto_update;
         flipper_format_write_uint32(ff, "AutoUpdate", &v, 1);
         uint32_t tabs[4];
