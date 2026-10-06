@@ -1,0 +1,13 @@
+# Personal device backup: NFC/RFID/SubGHz dumps, badusb, apps_data incl. TOTP secrets.
+# NEVER publish this.
+backup/
+
+# Build artifacts
+apps/dedsec_uplink/dist/
+apps/dedsec_uplink/.vscode/
+**/__pycache__/
+*.pyc
+
+# Local scratch / logs
+*.log
+scratchpad/

@@ -1,0 +1,14 @@
+App(
+    appid="dedsec_uplink",
+    name="DedSec Uplink",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="uplink_app",
+    requires=["gui", "bt", "notification", "storage"],
+    stack_size=4 * 1024,
+    fap_category="Bluetooth",
+    fap_icon="uplink_10px.png",
+    fap_icon_assets="images",
+    fap_version="1.0",
+    fap_author="DedSec",
+    fap_description="PC load, Codex and Claude sessions over BLE from the uplink PC companion",
+)
