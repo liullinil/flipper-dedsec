@@ -20,7 +20,10 @@ from datetime import datetime
 from typing import Any, Iterable, Mapping, Optional
 
 
-FINGERPRINT_VERSION = 2
+# Version 3 includes source/NFC technology metadata in the canonical shape;
+# old fingerprints remain valid evidence but are intentionally not silently
+# treated as equivalent to the new schema.
+FINGERPRINT_VERSION = 3
 FREQUENCY_TOLERANCE_HZ = 150_000
 PULSE_LIMIT = 256
 MIN_STRUCTURAL_PULSES = 3
