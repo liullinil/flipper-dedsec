@@ -17,6 +17,7 @@
 #include <furi_hal_bt.h>
 #include <bt/bt_service/bt.h>
 #include "rf_hunter_ble.h"
+#include "rf_store.h"
 
 #define HUNTER_EVENTS_DIR APP_DATA_PATH("rf_signal_hunter")
 #define HUNTER_EVENTS_PATH HUNTER_EVENTS_DIR "/events.jsonl"
@@ -39,6 +40,7 @@ typedef struct {
     NotificationApp* notifications;
     Storage* storage;
     File* events_file;
+    RfStore* store;
     volatile uint32_t pulses;
     volatile uint32_t bursts;
     volatile uint32_t last_duration;
@@ -157,6 +159,9 @@ static void hunter_record(Hunter* hunter) {
     snprintf(line + used, sizeof(line) - used, "],\"upload_state\":\"pending\"}\n");
     storage_file_write(hunter->events_file, line, strlen(line));
     storage_file_sync(hunter->events_file);
+    char event_id[80];
+    snprintf(event_id, sizeof(event_id), "rf-%s-%s-%lu", hunter->device_id, hunter->session_id, (unsigned long)hunter->sequence);
+    rf_store_save(hunter->store, event_id, line, strlen(line));
 }
 
 static void hunter_capture(bool level, uint32_t duration, void* context) {
@@ -195,99 +200,97 @@ static bool hunter_extract_string(const char* line, const char* key, char* out, 
     return true;
 }
 
-static void hunter_send_event_parts(Hunter* hunter, const char* event_id, const char* record) {
+static uint32_t hunter_json_number(const char* line, const char* key) {
+    char needle[32];
+    snprintf(needle, sizeof(needle), "\"%s\":", key);
+    const char* p = strstr(line, needle);
+    return p ? strtoul(p + strlen(needle), NULL, 10) : 0;
+}
+
+static uint32_t hunter_crc32(const char* data, size_t len) {
+    uint32_t crc = 0xffffffffu;
+    for(size_t i = 0; i < len; i++) {
+        crc ^= (uint8_t)data[i];
+        for(uint8_t bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ (0xedb88320u & (-(int32_t)(crc & 1)));
+    }
+    return ~crc;
+}
+
+static void hunter_send_json_chunk(
+    Hunter* hunter,
+    uint32_t rid,
+    const char* event_id,
+    const char* record,
+    size_t length,
+    size_t offset) {
     static const char hex[] = "0123456789abcdef";
-    const size_t part_bytes = 72; // keeps JSON frame under the 243-byte ATT payload
-    size_t total = strlen(record);
-    uint16_t part = 0;
-    if(total == 0) total = 1;
-    for(size_t offset = 0; offset < total; offset += part_bytes, part++) {
-        size_t count = MIN(part_bytes, total - offset);
-        char frame[243];
-        size_t used = snprintf(
-            frame,
-            sizeof(frame),
-            "{\"v\":1,\"op\":\"event_part\",\"event_id\":\"%s\",\"part\":%u,\"last\":%u,\"hex\":\"",
-            event_id,
-            (unsigned)part,
-            (unsigned)(offset + count >= total));
-        for(size_t i = 0; i < count && used + 2 < sizeof(frame); i++) {
-            uint8_t byte = (uint8_t)record[offset + i];
-            frame[used++] = hex[byte >> 4];
-            frame[used++] = hex[byte & 0xF];
-        }
-        if(used + 3 < sizeof(frame)) {
-            frame[used++] = '"';
-            frame[used++] = '}';
-            frame[used++] = '\n';
-            frame[used] = 0;
-            hunter_ble_send(hunter, frame);
-        }
+    size_t count = MIN((size_t)80, length > offset ? length - offset : 0);
+    char frame[243];
+    size_t used = snprintf(
+        frame,
+        sizeof(frame),
+        "{\"v\":1,\"rid\":%lu,\"op\":\"chunk\",\"event_id\":\"%s\",\"offset\":%lu,\"next\":%lu,\"hex\":\"",
+        (unsigned long)rid,
+        event_id,
+        (unsigned long)offset,
+        (unsigned long)(offset + count));
+    for(size_t i = 0; i < count && used + 2 < sizeof(frame); i++) {
+        uint8_t byte = (uint8_t)record[offset + i];
+        frame[used++] = hex[byte >> 4];
+        frame[used++] = hex[byte & 0xf];
+    }
+    if(used + 3 < sizeof(frame)) {
+        frame[used++] = '"';
+        frame[used++] = '}';
+        frame[used++] = '\n';
+        frame[used] = 0;
+        hunter_ble_send(hunter, frame);
     }
 }
 
 static void hunter_ble_handle(Hunter* hunter, const char* line) {
+    uint32_t rid = hunter_json_number(line, "rid");
     if(strstr(line, "\"op\":\"hello\"")) {
-        hunter_ble_send(hunter, "{\"v\":1,\"op\":\"hello_ack\",\"protocol\":1,\"chunk_size\":192}\n");
-    } else if(strstr(line, "\"op\":\"manifest\"")) {
-        // The event stream is newline JSON already; advertise each immutable event id and
-        // let the desktop request individual records. This keeps manifest frames bounded.
-        hunter_ble_send(hunter, "{\"v\":1,\"op\":\"manifest_ack\"}\n");
-        File* file = storage_file_alloc(hunter->storage);
-        if(storage_file_open(file, HUNTER_EVENTS_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
-            char record[640];
-            size_t length = 0;
-            char ch = 0;
-            while(storage_file_read(file, &ch, 1) == 1) {
-                if(ch == '\n') {
-                    record[length] = 0;
-                    char id[80];
-                    if(hunter_extract_string(record, "event_id", id, sizeof(id))) {
-                        char item[180];
-                        snprintf(item, sizeof(item), "{\"v\":1,\"op\":\"manifest_item\",\"event_id\":\"%s\"}\n", id);
-                        hunter_ble_send(hunter, item);
-                    }
-                    length = 0;
-                } else if(length + 1 < sizeof(record)) {
-                    record[length++] = ch;
+        char reply[180];
+        snprintf(reply, sizeof(reply), "{\"v\":1,\"rid\":%lu,\"op\":\"hello_ack\",\"device_uuid\":\"%s\",\"pending\":%lu}\n", (unsigned long)rid, hunter->device_id, (unsigned long)rf_store_pending_count(hunter->store));
+        hunter_ble_send(hunter, reply);
+    } else if(strstr(line, "\"op\":\"list\"")) {
+        char reply[220];
+        snprintf(reply, sizeof(reply), "{\"v\":1,\"rid\":%lu,\"op\":\"list_ack\"}\n", (unsigned long)rid);
+        hunter_ble_send(hunter, reply);
+        File* dir = storage_file_alloc(hunter->storage);
+        char name[96];
+        FileInfo info;
+        if(storage_dir_open(dir, RF_STORE_EVENTS_DIR)) {
+            while(storage_dir_read(dir, &info, name, sizeof(name))) {
+                size_t n = strlen(name);
+                if(n <= 5 || strcmp(name + n - 5, ".json")) continue;
+                name[n - 5] = 0;
+                char record[640]; size_t length = 0;
+                if(rf_store_read(hunter->store, name, record, sizeof(record), &length)) {
+                    char item[220];
+                    snprintf(item, sizeof(item), "{\"v\":1,\"rid\":%lu,\"op\":\"item\",\"event_id\":\"%s\",\"size\":%lu,\"crc32\":%lu,\"next\":%lu}\n", (unsigned long)rid, name, (unsigned long)length, (unsigned long)hunter_crc32(record, length), (unsigned long)1);
+                    hunter_ble_send(hunter, item);
                 }
             }
-            storage_file_close(file);
+            storage_dir_close(dir);
         }
-        storage_file_free(file);
-        hunter_ble_send(hunter, "{\"v\":1,\"op\":\"manifest_end\"}\n");
-    } else if(strstr(line, "\"op\":\"event_get\"")) {
+        storage_file_free(dir);
+        snprintf(reply, sizeof(reply), "{\"v\":1,\"rid\":%lu,\"op\":\"end\"}\n", (unsigned long)rid);
+        hunter_ble_send(hunter, reply);
+    } else if(strstr(line, "\"op\":\"read\"")) {
         char id[80];
         if(hunter_extract_string(line, "event_id", id, sizeof(id))) {
-            // Individual metadata delivery is implemented by scanning the compact JSONL
-            // index. Raw timing data is already embedded in each event record. Hex parts
-            // avoid needing a JSON/base64 library in the FAP and stay below the BLE MTU.
-            File* file = storage_file_alloc(hunter->storage);
-            if(storage_file_open(file, HUNTER_EVENTS_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
-                char record[640];
-                size_t length = 0;
-                char ch = 0;
-                while(storage_file_read(file, &ch, 1) == 1) {
-                    if(ch == '\n') {
-                        record[length] = 0;
-                        if(strstr(record, "\"event_id\":\"") && strstr(record, id)) {
-                            hunter_send_event_parts(hunter, id, record);
-                            break;
-                        }
-                        length = 0;
-                    } else if(length + 1 < sizeof(record)) {
-                        record[length++] = ch;
-                    }
-                }
-                storage_file_close(file);
+            char record[640]; size_t length = 0;
+            if(rf_store_read(hunter->store, id, record, sizeof(record), &length)) {
+                hunter_send_json_chunk(hunter, rid, id, record, length, hunter_json_number(line, "offset"));
             }
-            storage_file_free(file);
-            hunter_ble_send(hunter, "{\"v\":1,\"op\":\"event_end\"}\n");
         }
-    } else if(strstr(line, "\"op\":\"event_ack\"")) {
-        // The current event record is compact metadata; ACK is retained for future raw
-        // capture reclamation and is intentionally idempotent.
-        hunter_ble_send(hunter, "{\"v\":1,\"op\":\"ack\"}\n");
+    } else if(strstr(line, "\"op\":\"ack\"")) {
+        char id[80] = {0}; char reply[180];
+        if(hunter_extract_string(line, "event_id", id, sizeof(id))) rf_store_ack(hunter->store, id);
+        snprintf(reply, sizeof(reply), "{\"v\":1,\"rid\":%lu,\"op\":\"acked\",\"event_id\":\"%s\"}\n", (unsigned long)rid, id);
+        hunter_ble_send(hunter, reply);
     }
 }
 
@@ -384,6 +387,7 @@ int32_t rf_signal_hunter_app(void* context) {
     hunter.bt = furi_record_open(RECORD_BT);
     hunter.ble_rx = furi_stream_buffer_alloc(4096, 1);
     hunter.storage = furi_record_open(RECORD_STORAGE);
+    hunter.store = rf_store_alloc(hunter.storage);
     storage_common_mkdir(hunter.storage, HUNTER_EVENTS_DIR);
     hunter_load_identity(&hunter);
     snprintf(hunter.session_id, sizeof(hunter.session_id), "s");
@@ -451,6 +455,7 @@ int32_t rf_signal_hunter_app(void* context) {
         storage_file_close(hunter.events_file);
         storage_file_free(hunter.events_file);
     }
+    if(hunter.store) rf_store_free(hunter.store);
     if(hunter.storage) furi_record_close(RECORD_STORAGE);
     if(hunter.ble_rx) furi_stream_buffer_free(hunter.ble_rx);
     if(hunter.bt) furi_record_close(RECORD_BT);
