@@ -310,7 +310,7 @@ def compare_events(left: Any, right: Any,
         "repeat_count": {"left": lf["repeat_count"], "right": rf["repeat_count"]},
         "payload_bits": {"left": lf["payload"]["bit_length"], "right": rf["payload"]["bit_length"]},
     }
-    if left_id and left_id == right_id:
+    if left is right or (left_id and left_id == right_id):
         return {
             "score": 1.0, "percent": 100, "confidence": 1.0,
             "relationship": "exact_event", "relationship_text": "exact event",
@@ -525,6 +525,8 @@ class StructuralGrouper:
         self.families = {}
         self._members = {}
         self._events = {}
+        if isinstance(events, Mapping):
+            events = events.values()
         ordered = sorted(list(events), key=lambda event: (fingerprint(event), _identity(event)))
         for event in ordered:
             self.assign(event)
