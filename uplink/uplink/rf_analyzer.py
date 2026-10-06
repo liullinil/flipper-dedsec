@@ -19,7 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
-from .rf_hunter import EventStore, RfEvent, fingerprint
+from .rf_fingerprint import StructuralGrouper, compare_events
+from .rf_hunter import EventStore, RfEvent
 
 
 def parse_time(value: str) -> datetime:
@@ -51,6 +52,7 @@ class AnalyzerProject:
     def __init__(self):
         self.sources: dict[str, EventStore] = {}
         self.events: dict[str, RfEvent] = {}
+        self.grouper = StructuralGrouper()
         self.notes: dict[str, dict] = {}
         self.settings: dict = {"selected_family": "", "timezone": "UTC"}
 
@@ -59,11 +61,13 @@ class AnalyzerProject:
         store = EventStore(root)
         self.sources[root] = store
         self.events.update(store.events)
+        self.rebuild_families()
         return len(store.events)
 
     def add_store(self, store: EventStore) -> int:
         self.sources[store.root] = store
         self.events.update(store.events)
+        self.rebuild_families()
         return len(store.events)
 
     def capture_bytes(self, event: RfEvent) -> bytes:
@@ -83,6 +87,11 @@ class AnalyzerProject:
     def clear(self):
         self.sources.clear()
         self.events.clear()
+        self.grouper = StructuralGrouper()
+
+    def rebuild_families(self):
+        """Recompute authoritative structural families deterministically."""
+        return self.grouper.rebuild(self.events.values())
 
     def add_note(self, key, text, location=""):
         self.notes[str(key)] = {"text": str(text), "location": str(location)}
@@ -164,6 +173,7 @@ class AnalyzerProject:
         return event.family_id or event.fingerprint_id or "unassigned"
 
     def family_summary(self, events: Optional[Iterable[RfEvent]] = None) -> list[dict]:
+        self.rebuild_families()
         groups = {}
         for event in events or self.events.values():
             key = self.family_key(event)
@@ -188,6 +198,8 @@ class AnalyzerProject:
                 "modulation": ", ".join(sorted(group["modulations"])),
                 "rssi_avg_dbm": statistics.mean(group["rssis"]) if group["rssis"] else 0.0,
                 "event_ids": [event.event_id for event in group["events"]],
+                "confidence": self.grouper.families.get(group["family_id"], {}).get("confidence", 0.0),
+                "provisional": self.grouper.families.get(group["family_id"], {}).get("provisional", True),
             })
         return sorted(result, key=lambda row: (-row["observation_count"], row["family_id"]))
 
@@ -230,31 +242,12 @@ class AnalyzerProject:
 
     @staticmethod
     def similarity(left: RfEvent, right: RfEvent) -> dict:
-        reasons = []
-        score = 0.0
-        if left.modulation == right.modulation:
-            score += 0.30
-            reasons.append("same modulation")
-        if left.frequency_hz and right.frequency_hz:
-            drift = abs(left.frequency_hz - right.frequency_hz)
-            if drift <= 150_000:
-                score += 0.30
-                reasons.append("same carrier frequency")
-        if left.pulse_timings_us and right.pulse_timings_us:
-            count = min(len(left.pulse_timings_us), len(right.pulse_timings_us), 64)
-            matches = sum(abs(left.pulse_timings_us[i] - right.pulse_timings_us[i]) <= 75
-                          for i in range(count))
-            timing_score = matches / max(1, count)
-            score += 0.30 * timing_score
-            if timing_score >= 0.75:
-                reasons.append("same pulse timing")
-        if left.repeat_count == right.repeat_count:
-            score += 0.10
-            reasons.append("same repetition pattern")
-        if left.event_id != right.event_id:
-            reasons.append("payload/observation remains separate")
-        return {"score": round(min(1.0, score), 3), "percent": round(min(100.0, score * 100)),
-                "reasons": reasons}
+        result = dict(compare_events(left, right))
+        reasons = list(result.get("reasons", ()))
+        if left.event_id != right.event_id and "distinct observation IDs preserved" not in reasons:
+            reasons.append("distinct observation IDs preserved")
+        result["reasons"] = reasons
+        return result
 
     def export_json(self, path, events: Optional[Iterable[RfEvent]] = None):
         rows = [event.to_dict() for event in (events if events is not None else self.events.values())]

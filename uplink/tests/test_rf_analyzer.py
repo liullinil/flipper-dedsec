@@ -23,7 +23,9 @@ def test_project_merges_multiple_flippers_and_deduplicates():
         events = {second.event_id: second}
     project.add_store(Other())
     assert len(project.events) == 2
-    assert len(project.family_summary()) == 2
+    summary = project.family_summary()
+    assert len(summary) == 1
+    assert summary[0]["observation_count"] == 2
 
 
 def test_filters_and_views_produce_timeline_spectrum_waterfall():
@@ -49,7 +51,7 @@ def test_similarity_explains_structural_match_and_keeps_observations_separate():
     result = AnalyzerProject.similarity(left, right)
     assert result["percent"] >= 90
     assert "same modulation" in result["reasons"]
-    assert "payload/observation remains separate" in result["reasons"]
+    assert "distinct observation IDs preserved" in result["reasons"]
 
 
 def test_raw_capture_is_available_to_detail_view(tmp_path):
@@ -58,3 +60,20 @@ def test_raw_capture_is_available_to_detail_view(tmp_path):
     store.add(event, b"raw pulse capture")
     project = AnalyzerProject(); project.add_store(store)
     assert project.capture_bytes(event) == b"raw pulse capture"
+
+
+def test_authoritative_grouping_merges_structure_and_splits_distinct_shape():
+    first = _event(10, "2026-10-06T08:00:00Z")
+    second = _event(11, "2026-10-06T08:01:00Z")
+    distinct = _event(12, "2026-10-06T08:02:00Z")
+    distinct.pulse_timings_us = (100, 1500, 100)
+    project = AnalyzerProject()
+    project.events = {event.event_id: event for event in (first, second, distinct)}
+    project.rebuild_families()
+    family_map = {event.event_id: event.family_id for event in project.events.values()}
+    assert family_map[first.event_id] == family_map[second.event_id]
+    assert family_map[first.event_id] != family_map[distinct.event_id]
+    reverse = AnalyzerProject()
+    reverse.events = {event.event_id: event for event in (distinct, second, first)}
+    reverse.rebuild_families()
+    assert {key: event.family_id for key, event in reverse.events.items()} == family_map
