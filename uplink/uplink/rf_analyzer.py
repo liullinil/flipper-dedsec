@@ -319,6 +319,8 @@ class RfHunterApp:
         ttk.Entry(filters, textvariable=self.frequency, width=14).pack(side="left", padx=4)
         self.rssi = tk.StringVar(); ttk.Label(filters, text="RSSI≥").pack(side="left", padx=(8, 0))
         ttk.Entry(filters, textvariable=self.rssi, width=7).pack(side="left", padx=4)
+        self.max_rssi = tk.StringVar(); ttk.Label(filters, text="≤").pack(side="left")
+        ttk.Entry(filters, textvariable=self.max_rssi, width=7).pack(side="left", padx=4)
         self.start_time = tk.StringVar(); ttk.Label(filters, text="From UTC").pack(side="left", padx=(8, 0))
         ttk.Entry(filters, textvariable=self.start_time, width=19).pack(side="left", padx=4)
         self.end_time = tk.StringVar(); ttk.Label(filters, text="To").pack(side="left")
@@ -367,13 +369,17 @@ class RfHunterApp:
         except ValueError:
             min_rssi = None
         try:
+            max_rssi = float(self.max_rssi.get().strip()) if self.max_rssi.get().strip() else None
+        except ValueError:
+            max_rssi = None
+        try:
             start = parse_time(self.start_time.get().strip()) if self.start_time.get().strip() else None
             end = parse_time(self.end_time.get().strip()) if self.end_time.get().strip() else None
         except ValueError:
             start = end = None
         return EventFilter(source_type=self.source.get().strip(), family_id=self._selected_family,
                            text=self.search.get().strip(), start=start, end=end,
-                           min_rssi=min_rssi, min_frequency_hz=freq,
+                           min_rssi=min_rssi, max_rssi=max_rssi, min_frequency_hz=freq,
                            max_frequency_hz=freq)
 
     def open_store(self):
