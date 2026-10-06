@@ -18,6 +18,7 @@
 #include <bt/bt_service/bt.h>
 #include "rf_hunter_ble.h"
 #include "rf_store.h"
+#include "rf_capture.h"
 
 #define HUNTER_EVENTS_DIR APP_DATA_PATH("rf_signal_hunter")
 #define HUNTER_EVENTS_PATH HUNTER_EVENTS_DIR "/events.jsonl"
@@ -47,9 +48,9 @@ typedef struct {
     uint32_t notified_bursts;
     uint32_t sequence;
     uint32_t follow_duration;
-    volatile uint32_t pulse_ring[HUNTER_PULSE_RING_SIZE];
-    volatile uint8_t pulse_ring_count;
-    volatile uint8_t pulse_ring_head;
+    RfCaptureEngine capture;
+    RfCaptureTiming* event_timings;
+    uint16_t event_timing_count;
     char session_id[16];
     char device_id[17];
     HunterMode mode;
@@ -150,11 +151,9 @@ static void hunter_record(Hunter* hunter) {
         (unsigned long)hunter->pulses,
         (unsigned long)hunter->last_duration);
     size_t used = strlen(line);
-    uint8_t count = hunter->pulse_ring_count;
-    if(count > HUNTER_PULSE_RING_SIZE) count = HUNTER_PULSE_RING_SIZE;
-    for(uint8_t i = 0; i < count && used + 24 < sizeof(line); i++) {
-        uint8_t index = (hunter->pulse_ring_head + HUNTER_PULSE_RING_SIZE - count + i) % HUNTER_PULSE_RING_SIZE;
-        used += snprintf(line + used, sizeof(line) - used, "%s%lu", i ? "," : "", (unsigned long)hunter->pulse_ring[index]);
+    uint16_t count = hunter->event_timing_count;
+    for(uint16_t i = 0; i < count && used + 24 < sizeof(line); i++) {
+        used += snprintf(line + used, sizeof(line) - used, "%s%lu", i ? "," : "", (unsigned long)hunter->event_timings[i].duration_us);
     }
     snprintf(line + used, sizeof(line) - used, "],\"upload_state\":\"pending\"}\n");
     storage_file_write(hunter->events_file, line, strlen(line));
@@ -166,13 +165,33 @@ static void hunter_record(Hunter* hunter) {
 
 static void hunter_capture(bool level, uint32_t duration, void* context) {
     Hunter* hunter = context;
-    UNUSED(level);
-    hunter->pulses++;
-    hunter->last_duration = duration;
-    hunter->pulse_ring[hunter->pulse_ring_head] = duration;
-    hunter->pulse_ring_head = (hunter->pulse_ring_head + 1) % HUNTER_PULSE_RING_SIZE;
-    if(hunter->pulse_ring_count < HUNTER_PULSE_RING_SIZE) hunter->pulse_ring_count++;
-    if(duration > 8000) hunter->bursts++;
+    rf_capture_isr(&hunter->capture, level, duration);
+}
+
+static void hunter_process_capture(Hunter* hunter) {
+    RfCaptureTiming timing;
+    while(rf_capture_pop(&hunter->capture, &timing)) {
+        hunter->pulses++;
+        hunter->last_duration = timing.duration_us;
+        if(hunter->event_timing_count < RF_CAPTURE_MAX_TIMINGS) {
+            hunter->event_timings[hunter->event_timing_count++] = timing;
+        }
+        if(timing.duration_us > 8000 && hunter->event_timing_count > 1) {
+            hunter->bursts++;
+            if(hunter_event_selected(hunter)) {
+                notification_message(hunter->notifications, &sequence_audiovisual_alert);
+                notification_message(hunter->notifications, &sequence_set_only_green_255);
+                hunter_record(hunter);
+                hunter->families_seen++;
+                if(hunter->mode == HunterModeFollow && hunter->follow_duration == 0) {
+                    hunter->follow_duration = hunter->last_duration;
+                }
+            }
+            hunter->event_timing_count = 0;
+            hunter->rssi_min = hunter->rssi_max = hunter->rssi_sum = 0.0f;
+            hunter->rssi_samples = 0;
+        }
+    }
 }
 
 static void hunter_ble_rx(const uint8_t* data, uint16_t size, void* context) {
@@ -388,6 +407,8 @@ int32_t rf_signal_hunter_app(void* context) {
     hunter.ble_rx = furi_stream_buffer_alloc(4096, 1);
     hunter.storage = furi_record_open(RECORD_STORAGE);
     hunter.store = rf_store_alloc(hunter.storage);
+    hunter.event_timings = malloc(sizeof(RfCaptureTiming) * RF_CAPTURE_MAX_TIMINGS);
+    rf_capture_init(&hunter.capture);
     storage_common_mkdir(hunter.storage, HUNTER_EVENTS_DIR);
     hunter_load_identity(&hunter);
     snprintf(hunter.session_id, sizeof(hunter.session_id), "s");
@@ -414,6 +435,7 @@ int32_t rf_signal_hunter_app(void* context) {
 
     while(hunter.running) {
         furi_delay_ms(250);
+        hunter_process_capture(&hunter);
         hunter_ble_drain(&hunter);
         if(hunter.receiver_active) {
             float rssi = furi_hal_subghz_get_rssi();
@@ -424,18 +446,6 @@ int32_t rf_signal_hunter_app(void* context) {
             if(hunter.mode == HunterModeScout) {
                 hunter.frequency_index = (hunter.frequency_index + 1) % (sizeof(hunter_frequencies) / sizeof(hunter_frequencies[0]));
                 furi_hal_subghz_set_frequency(hunter_frequencies[hunter.frequency_index]);
-            }
-        }
-        if(hunter.bursts != hunter.notified_bursts) {
-            hunter.notified_bursts = hunter.bursts;
-            if(hunter_event_selected(&hunter)) {
-                notification_message(hunter.notifications, &sequence_audiovisual_alert);
-                notification_message(hunter.notifications, &sequence_set_only_green_255);
-                hunter_record(&hunter);
-                hunter.families_seen++;
-                if(hunter.mode == HunterModeFollow && hunter.follow_duration == 0) {
-                    hunter.follow_duration = hunter.last_duration;
-                }
             }
         }
         view_port_update(hunter.viewport);
@@ -456,6 +466,7 @@ int32_t rf_signal_hunter_app(void* context) {
         storage_file_free(hunter.events_file);
     }
     if(hunter.store) rf_store_free(hunter.store);
+    free(hunter.event_timings);
     if(hunter.storage) furi_record_close(RECORD_STORAGE);
     if(hunter.ble_rx) furi_stream_buffer_free(hunter.ble_rx);
     if(hunter.bt) furi_record_close(RECORD_BT);
