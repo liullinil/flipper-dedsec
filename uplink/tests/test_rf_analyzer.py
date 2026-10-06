@@ -116,3 +116,22 @@ def test_timeline_is_sorted_by_utc_investigation_time():
     project.events = {late.event_id: late, early.event_id: early}
     rows = project.timeline()
     assert [row["event_id"] for row in rows] == [early.event_id, late.event_id]
+
+
+def test_family_detail_and_similarity_reasons_are_investigation_ready():
+    first = _event(70, "2026-10-06T08:00:00Z", rssi=-42)
+    second = _event(71, "2026-10-06T18:00:00Z", rssi=-66)
+    second.fingerprint_id = "variant-b"
+    second.upload_state = "imported"
+    project = AnalyzerProject()
+    project.events = {first.event_id: first, second.event_id: second}
+    project.rebuild_families()
+    family = first.family_id
+    detail = project.family_detail(family)
+    assert detail["observation_count"] == 2
+    assert detail["waveform_variants"]
+    assert detail["time_of_day_hours"] == [8, 18]
+    assert detail["imported_count"] == 1
+    similar = project.similar_events(first)
+    assert similar and similar[0]["event"].event_id == second.event_id
+    assert "distinct observation IDs preserved" in similar[0]["comparison"]["reasons"]

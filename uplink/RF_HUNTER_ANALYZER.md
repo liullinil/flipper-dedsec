@@ -25,10 +25,12 @@ release is prepared.
 The UI provides:
 
 - event and family filters by source, family ID, and text;
+- live BLE import with background progress and durable ACK handling;
 - sampled RSSI waterfall, frequency spectrum, and exact UTC timeline views;
-- family observation counts, frequency/modulation summaries, and selected-event details;
+- family observation counts, frequency/modulation summaries, time-of-day/RSSI
+  evidence, source hypotheses, and selected-event details;
 - structural similarity explanations based on carrier, modulation, pulse timing,
-  and repetition pattern;
+  and repetition pattern, including a nearest-observation reasons panel;
 - JSON and CSV export of the active filtered view;
 - multiple Flipper roots with transport deduplication by `event_id`.
 

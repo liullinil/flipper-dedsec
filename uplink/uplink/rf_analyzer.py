@@ -272,6 +272,72 @@ class AnalyzerProject:
             })
         return sorted(result, key=lambda row: (-row["observation_count"], row["family_id"]))
 
+    def family_detail(self, family_id: str, events: Optional[Iterable[RfEvent]] = None) -> dict:
+        """Return the evidence used to explain one signal family.
+
+        The detail payload intentionally keeps observations separate while
+        exposing the aggregate values the investigation UI needs: waveform
+        variants, RSSI/time-of-day distributions, source hypothesis,
+        similarity confidence, Follow state and raw/import status.
+        """
+        family_id = str(family_id or "")
+        rows = [event for event in (events if events is not None else self.events.values())
+                if self.family_key(event) == family_id]
+        if not rows:
+            return {"family_id": family_id, "observation_count": 0, "event_ids": []}
+        frequencies = [event.frequency_hz for event in rows if event.frequency_hz]
+        rssis = [float(event.rssi_avg_dbm) for event in rows]
+        variants = sorted({event.fingerprint_id or "unknown" for event in rows})
+        classifications = {}
+        for event in rows:
+            label = event.classification or "unknown"
+            classifications[label] = classifications.get(label, 0) + 1
+        source_types = sorted({event.source_type or "unknown" for event in rows})
+        hours = [parse_time(event.captured_at_utc).hour for event in rows]
+        raw_count = sum(bool(self.capture_bytes(event)) for event in rows)
+        uploaded = sum(event.upload_state in {"uploaded", "imported"} for event in rows)
+        family = self.grouper.families.get(family_id, {})
+        return {
+            "family_id": family_id,
+            "observation_count": len(rows),
+            "event_ids": [event.event_id for event in rows],
+            "first_seen": min(event.captured_at_utc for event in rows),
+            "last_seen": max(event.captured_at_utc for event in rows),
+            "frequency_min_hz": min(frequencies, default=0),
+            "frequency_max_hz": max(frequencies, default=0),
+            "modulations": sorted({event.modulation or "unknown" for event in rows}),
+            "waveform_variants": variants,
+            "rssi_min_dbm": min(rssis, default=0.0),
+            "rssi_max_dbm": max(rssis, default=0.0),
+            "rssi_avg_dbm": statistics.mean(rssis) if rssis else 0.0,
+            "time_of_day_hours": sorted(set(hours)),
+            "source_types": source_types,
+            "source_hypothesis": max(classifications, key=classifications.get) if classifications else "unknown",
+            "classification_counts": classifications,
+            "classification_confidence": statistics.mean(
+                [float(event.classification_confidence) for event in rows]) if rows else 0.0,
+            "similarity_confidence": family.get("confidence", 0.0),
+            "provisional": family.get("provisional", True),
+            "follow_selected": any(bool(event.follow_profile_id) for event in rows),
+            "raw_capture_count": raw_count,
+            "imported_count": uploaded,
+            "pending_count": len(rows) - uploaded,
+        }
+
+    def similar_events(self, selected: RfEvent, limit: int = 8,
+                       candidates: Optional[Iterable[RfEvent]] = None) -> list[dict]:
+        """Return nearest observations and the plain-language match reasons."""
+        pool = candidates if candidates is not None else self.events.values()
+        rows = []
+        for event in pool:
+            if event.event_id == selected.event_id:
+                continue
+            comparison = self.similarity(selected, event)
+            rows.append({"event": event, "comparison": comparison})
+        rows.sort(key=lambda row: (-float(row["comparison"].get("score", 0.0)),
+                                  parse_time(row["event"].captured_at_utc), row["event"].event_id))
+        return rows[:max(0, int(limit))]
+
     def timeline(self, events: Optional[Iterable[RfEvent]] = None) -> list[dict]:
         rows = [{"event_id": event.event_id, "when": parse_time(event.captured_at_utc),
                  "family_id": self.family_key(event), "frequency_hz": event.frequency_hz,
@@ -322,7 +388,8 @@ class AnalyzerProject:
     def export_json(self, path, events: Optional[Iterable[RfEvent]] = None):
         rows = [event.to_dict() for event in (events if events is not None else self.events.values())]
         with open(path, "w", encoding="utf-8") as fh:
-            json.dump(rows, fh, ensure_ascii=False, indent=2)
+            json.dump({"schema_version": 1, "exported_at_utc": datetime.now(timezone.utc).isoformat(),
+                       "events": rows}, fh, ensure_ascii=False, indent=2)
 
     def export_csv(self, path, events: Optional[Iterable[RfEvent]] = None):
         rows = list(events if events is not None else self.events.values())
@@ -354,6 +421,8 @@ class RfHunterApp:
         self.root.configure(bg="#071018")
         self._selected_family = ""
         self._selected_event = ""
+        self._sync_thread = None
+        self._sync_target = None
         self._build()
 
     def _build(self):
@@ -369,6 +438,7 @@ class RfHunterApp:
         header = ttk.Frame(self.root); header.pack(fill="x", padx=10, pady=8)
         ttk.Label(header, text="RF SIGNAL HUNTER", font=("Segoe UI", 16, "bold")).pack(side="left")
         ttk.Button(header, text="Open Flipper store", command=self.open_store).pack(side="left", padx=16)
+        ttk.Button(header, text="Sync BLE", command=self.sync_ble).pack(side="left", padx=5)
         ttk.Button(header, text="Export JSON", command=lambda: self.export("json")).pack(side="left")
         ttk.Button(header, text="Export CSV", command=lambda: self.export("csv")).pack(side="left", padx=5)
         ttk.Button(header, text="Project", command=self.save_project).pack(side="left", padx=5)
@@ -406,7 +476,11 @@ class RfHunterApp:
                                     showvalue=False, command=self.scrub_changed, bg="#071018", fg="#b6d7de",
                                     highlightthickness=0)
         self.scrub_scale.pack(side="left", fill="x", expand=True)
-        ttk.Label(right, text="SELECTED OBSERVATION").pack(anchor="w")
+        ttk.Label(right, text="SIGNAL FAMILY DETAIL").pack(anchor="w")
+        self.family_details = tk.Text(right, bg="#081923", fg="#b6d7de", insertbackground="#d9f8ff",
+                                      relief="flat", wrap="word", height=9)
+        self.family_details.pack(fill="x", pady=(2, 6)); self.family_details.configure(state="disabled")
+        ttk.Label(right, text="SELECTED OBSERVATION / SIMILARITY").pack(anchor="w")
         self.details = tk.Text(right, bg="#0a1b25", fg="#d9f8ff", insertbackground="#d9f8ff", relief="flat", wrap="word")
         self.details.pack(fill="both", expand=True, pady=5); self.details.configure(state="disabled")
         ttk.Label(right, text="NOTE / LOCATION").pack(anchor="w")
@@ -420,6 +494,33 @@ class RfHunterApp:
         self.timeline_canvas.bind("<Button-1>", self.timeline_event)
         self.playing = False
         self.play_after = None
+
+    def _set_family_details(self, family_id):
+        detail = self.project.family_detail(family_id)
+        if not detail.get("observation_count"):
+            text = "No family selected"
+        else:
+            frequencies = "—"
+            if detail["frequency_min_hz"]:
+                frequencies = f"{detail['frequency_min_hz'] / 1e6:.3f}"
+                if detail["frequency_max_hz"] != detail["frequency_min_hz"]:
+                    frequencies += f"–{detail['frequency_max_hz'] / 1e6:.3f}"
+                frequencies += " MHz"
+            hours = ", ".join(f"{hour:02d}:00" for hour in detail["time_of_day_hours"]) or "—"
+            text = (f"{detail['family_id']}\n"
+                    f"{detail['observation_count']} observations · {frequencies}\n"
+                    f"Seen {detail['first_seen']}\nLast {detail['last_seen']}\n"
+                    f"Modulation: {', '.join(detail['modulations']) or 'unknown'}\n"
+                    f"Waveform variants: {len(detail['waveform_variants'])}\n"
+                    f"RSSI: {detail['rssi_min_dbm']:.1f}…{detail['rssi_max_dbm']:.1f} dBm\n"
+                    f"Active hours: {hours}\n"
+                    f"Hypothesis: {detail['source_hypothesis']} · confidence {detail['similarity_confidence']:.0%}\n"
+                    f"Raw captures: {detail['raw_capture_count']} · imported: {detail['imported_count']} · pending: {detail['pending_count']}\n"
+                    f"Follow: {'selected' if detail['follow_selected'] else 'not selected'}")
+        self.family_details.configure(state="normal")
+        self.family_details.delete("1.0", "end")
+        self.family_details.insert("end", text)
+        self.family_details.configure(state="disabled")
 
     def _spec(self):
         frequency = self.frequency.get().strip().replace(",", ".")
@@ -451,9 +552,61 @@ class RfHunterApp:
         if path:
             self.project.add_root(path); self.refresh()
 
+    def sync_ble(self):
+        """Start a live Flipper pull without freezing the investigation UI."""
+        import threading
+        if self._sync_thread is not None and self._sync_thread.is_alive():
+            return
+        target = next(iter(self.project.sources.values()), None)
+        if target is None:
+            path = self.filedialog.askdirectory(title="Select local RF project directory")
+            if not path:
+                return
+            target = EventStore(path)
+            self._sync_target = target
+        else:
+            self._sync_target = target
+        self.status.configure(text="BLE: discovering RF Hunter…")
+        self._sync_thread = threading.Thread(target=self._sync_ble_worker, daemon=True)
+        self._sync_thread.start()
+
+    def _sync_ble_worker(self):
+        async def run():
+            from .rf_ble import BleakRfAdapter
+            adapter = BleakRfAdapter(timeout=10)
+            try:
+                progress = lambda stats: self.root.after(
+                    0, self._sync_progress, stats)
+                return await adapter.sync_to(self._sync_target, progress=progress)
+            finally:
+                await adapter.close()
+        try:
+            result = asyncio.run(run())
+        except Exception as exc:  # report on Tk's thread, keep the app usable
+            self.root.after(0, self._sync_finished, None, exc)
+        else:
+            self.root.after(0, self._sync_finished, result, None)
+
+    def _sync_progress(self, stats):
+        self.status.configure(
+            text=(f"BLE: {stats.get('imported', 0)} imported · "
+                  f"{stats.get('skipped', 0)} already present · "
+                  f"{stats.get('seen', 0)} seen"))
+
+    def _sync_finished(self, result, error):
+        if error is not None:
+            self.status.configure(text=f"BLE error: {error}")
+            return
+        if self._sync_target is not None:
+            self.project.add_store(self._sync_target)
+        self.refresh()
+        self.status.configure(text=(f"BLE complete · {result.get('imported', 0)} imported · "
+                                    f"{result.get('skipped', 0)} already present"))
+
     def family_selected(self, _event=None):
         selected = self.families.curselection()
         self._selected_family = self.families.get(selected[0]).split("  ", 1)[0] if selected else ""
+        self._set_family_details(self._selected_family)
         self.refresh()
 
     def refresh(self):
@@ -463,6 +616,7 @@ class RfHunterApp:
         for summary in summaries:
             self.families.insert("end", f"{summary['family_id']}  {summary['observation_count']} obs")
         self.status.configure(text=f"{len(events)} observations · {len(self.project.sources)} Flipper(s)")
+        self._set_family_details(self._selected_family)
         self.scrub_scale.configure(to=max(0, len(events) - 1))
         self.scrub.set(min(self.scrub.get(), max(0, len(events) - 1)))
         self.draw(events)
@@ -561,6 +715,7 @@ class RfHunterApp:
 
     def show_event(self, event):
         self._selected_event = event.event_id
+        self._set_family_details(self.project.family_key(event))
         nfc_details = ""
         if event.source_type == "nfc":
             nfc_details = (f"NFC {event.nfc_technology or 'unknown'} / "
@@ -575,6 +730,17 @@ class RfHunterApp:
                 f"Raw capture {len(self.project.capture_bytes(event))} bytes\n"
                 f"Classification {event.classification} "
                 f"({event.classification_confidence:.0%})")
+        similar = self.project.similar_events(event, limit=5)
+        if similar:
+            data += "\n\nSIMILAR OBSERVATIONS\n"
+            for row in similar:
+                comparison = row["comparison"]
+                reasons = "; ".join(comparison.get("reasons", ())) or "no stable feature match"
+                data += (f"{comparison.get('percent', 0)}% · {row['event'].event_id[:16]} · "
+                         f"{comparison.get('relationship_text', 'unknown')}\n"
+                         f"  {reasons}\n")
+        else:
+            data += "\n\nSIMILAR OBSERVATIONS\nNo other observations"
         self.details.configure(state="normal"); self.details.delete("1.0", "end"); self.details.insert("end", data); self.details.configure(state="disabled")
         note = self.project.note(event.event_id)
         self.note_entry.delete(0, "end"); self.note_entry.insert(0, note.get("text", ""))
