@@ -23,7 +23,6 @@
 #include "rf_settings.h"
 
 #define HUNTER_EVENTS_DIR APP_DATA_PATH("rf_signal_hunter")
-#define HUNTER_EVENTS_PATH HUNTER_EVENTS_DIR "/events.jsonl"
 #define HUNTER_DEVICE_ID_PATH HUNTER_EVENTS_DIR "/device_id"
 #define HUNTER_FREQUENCY_HZ 433920000U
 #define HUNTER_PULSE_RING_SIZE 16U
@@ -43,7 +42,6 @@ typedef struct {
     ViewPort* viewport;
     NotificationApp* notifications;
     Storage* storage;
-    File* events_file;
     RfStore* store;
     RfHunterSettings settings;
     volatile uint32_t pulses;
@@ -62,6 +60,7 @@ typedef struct {
     bool running;
     bool receiver_active;
     bool nfc_detect_active;
+    volatile bool nfc_requested;
     bool nfc_hal_acquired;
     bool nfc_field_present;
     uint32_t nfc_field_started_tick;
@@ -218,10 +217,6 @@ static void hunter_record_nfc(
         notification_message(hunter->notifications, &sequence_set_only_red_255);
         return;
     }
-    if(hunter->events_file && storage_file_is_open(hunter->events_file)) {
-        storage_file_write(hunter->events_file, line, (size_t)written);
-        storage_file_sync(hunter->events_file);
-    }
     hunter->bursts++;
     hunter->families_seen++;
     notification_message(hunter->notifications, &sequence_audiovisual_alert);
@@ -272,9 +267,8 @@ static void hunter_process_nfc(Hunter* hunter) {
 }
 
 static void hunter_record(Hunter* hunter) {
-    /* The per-event store is the durable BLE source of truth.  The legacy
-     * JSONL stream is only a convenience export; a failure to open it must
-     * never suppress an otherwise valid pending event. */
+    /* The per-event store is the durable BLE source of truth.  Avoid a raw
+     * JSONL mirror: it would grow forever after individual events are ACKed. */
     if(!hunter->store) return;
     DateTime local;
     furi_hal_rtc_get_datetime(&local);
@@ -352,10 +346,6 @@ static void hunter_record(Hunter* hunter) {
             hunter->receiver_active = false;
         }
         return;
-    }
-    if(hunter->events_file && storage_file_is_open(hunter->events_file)) {
-        storage_file_write(hunter->events_file, line, used);
-        storage_file_sync(hunter->events_file);
     }
 }
 
@@ -636,6 +626,7 @@ static void hunter_input(InputEvent* event, void* context) {
         return;
     }
     if(event->key == InputKeyBack) {
+        hunter->nfc_requested = false;
         hunter->running = false;
         view_port_enabled_set(hunter->viewport, false);
     } else if(event->key == InputKeyLeft || event->key == InputKeyRight) {
@@ -652,16 +643,15 @@ static void hunter_input(InputEvent* event, void* context) {
                 furi_hal_subghz_idle();
                 hunter->receiver_active = false;
             }
-            if(!hunter_nfc_start(hunter)) hunter->mode = previous_mode;
+            hunter->nfc_requested = true;
         } else if(previous_mode == HunterModeNfc) {
-            hunter_nfc_stop(hunter);
+            hunter->nfc_requested = false;
         }
         view_port_update(hunter->viewport);
     } else if(event->key == InputKeyOk) {
         if(hunter->mode == HunterModeScout) hunter->events_reviewed = hunter->bursts;
         if(hunter->mode == HunterModeNfc) {
-            if(hunter->nfc_detect_active) hunter_nfc_stop(hunter);
-            else hunter_nfc_start(hunter);
+            hunter->nfc_requested = !hunter->nfc_requested;
             view_port_update(hunter->viewport);
             return;
         }
@@ -699,11 +689,6 @@ int32_t rf_signal_hunter_app(void* context) {
     hunter_load_identity(&hunter);
     snprintf(hunter.session_id, sizeof(hunter.session_id), "s");
     hunter_hex_random(hunter.session_id + 1, sizeof(hunter.session_id) - 2);
-    hunter.events_file = storage_file_alloc(hunter.storage);
-    if(!storage_file_open(hunter.events_file, HUNTER_EVENTS_PATH, FSAM_WRITE, FSOM_OPEN_APPEND)) {
-        storage_file_free(hunter.events_file);
-        hunter.events_file = NULL;
-    }
     hunter.viewport = view_port_alloc();
     view_port_draw_callback_set(hunter.viewport, hunter_draw, &hunter);
     view_port_input_callback_set(hunter.viewport, hunter_input, &hunter);
@@ -721,6 +706,14 @@ int32_t rf_signal_hunter_app(void* context) {
 
     while(hunter.running) {
         furi_delay_ms(hunter.settings.dwell_ms);
+        /* HAL ownership is thread-affine. Input callbacks only update the
+         * request flag; start/stop and release happen on this app thread so
+         * the cleanup path can always release the NFC mutex legally. */
+        if(hunter.mode == HunterModeNfc && hunter.nfc_requested && !hunter.nfc_detect_active) {
+            hunter_nfc_start(&hunter);
+        } else if((hunter.mode != HunterModeNfc || !hunter.nfc_requested) && hunter.nfc_detect_active) {
+            hunter_nfc_stop(&hunter);
+        }
         hunter_process_capture(&hunter);
         hunter_process_nfc(&hunter);
         hunter_ble_drain(&hunter);
@@ -750,10 +743,6 @@ int32_t rf_signal_hunter_app(void* context) {
     bt_keys_storage_set_default_path(hunter.bt);
     if(!bt_profile_restore_default(hunter.bt)) FURI_LOG_E("RfHunter", "restore default BLE failed");
     notification_message(hunter.notifications, &sequence_reset_rgb);
-    if(hunter.events_file) {
-        storage_file_close(hunter.events_file);
-        storage_file_free(hunter.events_file);
-    }
     if(hunter.store) rf_store_free(hunter.store);
     free(hunter.event_timings);
     if(hunter.storage) furi_record_close(RECORD_STORAGE);
