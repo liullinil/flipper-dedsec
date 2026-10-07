@@ -18,10 +18,12 @@ from .claude import ClaudeWatcher
 from .codex import CodexWatcher
 from .common import ascii_text
 from .link import Link
+from .rf_sync import RfSync
 from .shell import Shell
 from .session_views import SessionViews
 from .settings_window import SettingsWindow
 from .sysmon import SysMon
+from .ui import UiThread
 from .updater import Updater
 
 APP_DIR = config.APP_DIR
@@ -29,6 +31,9 @@ LOG_PATH = os.path.join(APP_DIR, "uplink.log")
 MAX_ROWS = 10
 SESSION_PERIOD = 2.0
 OUTBOX_PER_FRAME = 24   # command-output lines flushed to the Flipper per send cycle
+CLOCK_EVERY = 600       # seconds between Z| clock lines (the Flipper stamps RF events with it)
+RF_STORE = os.path.join(APP_DIR, "rf_hunter")
+RF_TAGS = ("R", "RI", "RE", "RD", "RK", "RX")
 
 log = logging.getLogger("uplink")
 
@@ -52,6 +57,8 @@ class Feed:
         self.shell = None
         self.updater = Updater()
         self.updater.check_async(force=True)
+        self.rf_sync = RfSync(RF_STORE, send_clock=False)   # frame() sends Z| itself
+        self.next_clock = 0.0
         self.worker = threading.Thread(target=self._command_worker, name="cmd-worker", daemon=True)
         self.worker.start()
 
@@ -90,13 +97,22 @@ class Feed:
                                  f"{r.age(now)}|{r.attn}|{r.name}|{r.detail}")
         self.updater.check_async()
         lines += self.updater.advert()
+        if now >= self.next_clock:
+            # PC clock for RF timestamps: the Flipper's RTC keeps local time
+            offset = -(time.altzone if time.localtime(now).tm_isdst > 0 else time.timezone) // 60
+            lines.append(f"Z|{int(now)}|{offset}")
+            self.next_clock = now + CLOCK_EVERY
         if self.shell:
             self.shell.poll_timeout()
         return lines
 
     def urgent(self):
-        """Lines that go out immediately: update chunks first, then command output."""
+        """Lines that go out immediately: update chunks, RF import requests, command output."""
         lines = self.updater.urgent()
+        try:
+            lines += self.rf_sync.urgent_lines()
+        except Exception:
+            log.exception("RF import failed")
         with self.outbox_lock:
             for _ in range(min(OUTBOX_PER_FRAME, len(self.outbox))):
                 lines.append(self.outbox.popleft())
@@ -105,6 +121,13 @@ class Feed:
     def counts(self):
         with self.lock:
             return {k: len(v) for k, v in self.rows.items()}
+
+    def on_link(self, status):
+        """Link status from the BLE thread."""
+        up = status == "connected"
+        if up:
+            self.next_clock = 0.0   # send the clock with the first frame
+        self.rf_sync.on_link(up)
 
     # ------------------------------------------------------------------ remote cmd
     def _emit(self, line):
@@ -120,10 +143,33 @@ class Feed:
                 on_cwd=lambda cwd: self._emit(f"W|{cwd}"))
         return self.shell
 
+    def _purge_output(self, seq):
+        """Drop queued output of a cancelled command, so its exit line is not stuck behind it."""
+        prefix = f"O|{seq}|"
+        with self.outbox_lock:
+            kept = [line for line in self.outbox if not line.startswith(prefix)]
+            self.outbox.clear()
+            self.outbox.extend(kept)
+
+    def reset_shell(self):
+        """Restart the shell (another kind was chosen, or commands were disabled)."""
+        shell, self.shell = self.shell, None
+        if shell:
+            try:
+                shell.stop()
+            except Exception:
+                log.exception("cannot stop the shell")
+
     def handle_rx(self, line):
         """Flipper -> PC line (command requests). Runs on the BLE thread; keep it light."""
         parts = line.split("|")
         tag = parts[0]
+        if tag in RF_TAGS:
+            try:
+                self.rf_sync.handle_line(parts)
+            except Exception:
+                log.exception("bad RF line %r", line[:80])
+            return
         if tag == "C" and len(parts) >= 3:
             seq = parts[1]
             command = "|".join(parts[2:])
@@ -137,8 +183,10 @@ class Feed:
             seq = parts[1]
             text = "|".join(parts[2:])
             self._get_shell().write_input(seq, text)
-        elif tag == "K" and len(parts) >= 2 and self.shell:
-            self.shell.cancel(parts[1])
+        elif tag == "K" and len(parts) >= 2:
+            self._purge_output(parts[1])
+            # even without a running shell this answers X|seq|-1, so the Flipper leaves RUN
+            self._get_shell().cancel(parts[1])
         elif tag == "V" and len(parts) >= 2:
             self.updater.set_flipper_version(parts[1])
         elif tag == "U" and len(parts) >= 2:
@@ -184,6 +232,10 @@ def single_instance():
 
 
 def dump(feed):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # Cyrillic names
+    except Exception:
+        pass
     feed.poll_sessions()
     time.sleep(1.0)
     for line in feed.frame():
@@ -191,8 +243,11 @@ def dump(feed):
 
 
 def run_console(feed):
-    link = Link(feed.frame, on_status=lambda st, name: print(f"[link] {st} {name}"),
-                on_rx=feed.handle_rx, urgent_source=feed.urgent)
+    def on_status(status, name):
+        feed.on_link(status)
+        print(f"[link] {status} {name}")
+
+    link = Link(feed.frame, on_status=on_status, on_rx=feed.handle_rx, urgent_source=feed.urgent)
     link.start()
     try:
         while True:
@@ -229,6 +284,7 @@ def run_tray(feed, cfg):
         return "INSTALL FLIPPER APP UPDATE"
 
     def on_status(status, name):
+        feed.on_link(status)
         state.update(status=status, name=name)
         icon.icon = make_icon(colors.get(status, "#e03030"))
         icon.title = f"DEDSEC // UPLINK  ·  {status_text()}"
@@ -249,32 +305,46 @@ def run_tray(feed, cfg):
             log.warning("companion self-update is only available in the packaged EXE")
             return
         target = sys.executable
-        # A separate PowerShell helper waits for this process to exit, replaces the locked
-        # executable, and starts the new version. The old tray process then quits normally.
+        # A one-file exe runs as two processes (bootloader parent + Python child) and the parent
+        # keeps the exe open, so the helper waits for both, then retries the swap until the file
+        # is free, starts the new version and removes itself. UTF-8 with BOM: Windows
+        # PowerShell 5.1 reads BOM-less scripts as ANSI, which breaks non-ASCII paths.
         def quote(value):
             return "'" + str(value).replace("'", "''") + "'"
+        log_path = os.path.join(APP_DIR, "update.log")
         script = os.path.join(tempfile.gettempdir(), "DedSecUplink-apply-update.ps1")
-        body = (
-            "$p = Get-Process -Id %d -ErrorAction SilentlyContinue; "
-            "if ($p) { $p.WaitForExit() }; "
-            "Move-Item -LiteralPath %s -Destination %s -Force; "
-            "Start-Process -FilePath %s -WindowStyle Hidden; "
-            "Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force"
-        ) % (os.getpid(), quote(temp_path), quote(target), quote(target))
+        body = "\r\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            "foreach ($id in @(%d, %d)) {" % (os.getpid(), os.getppid()),
+            "  $p = Get-Process -Id $id -ErrorAction SilentlyContinue",
+            "  if ($p -and $p.ProcessName -like 'DedSecUplink*') { $p.WaitForExit(30000) | Out-Null }",
+            "}",
+            "$ok = $false",
+            "for ($i = 0; $i -lt 40 -and -not $ok; $i++) {",
+            "  try { Move-Item -LiteralPath %s -Destination %s -Force; $ok = $true }" % (
+                quote(temp_path), quote(target)),
+            "  catch { Start-Sleep -Milliseconds 500 }",
+            "}",
+            "if (-not $ok) { Add-Content -LiteralPath %s -Value 'update: could not replace the exe' }"
+            % quote(log_path),
+            "Start-Process -FilePath %s" % quote(target),
+            "Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force",
+        ])
         try:
-            with open(script, "w", encoding="utf-8") as fh:
+            with open(script, "w", encoding="utf-8-sig") as fh:
                 fh.write(body)
             subprocess.Popen(
                 ["powershell.exe", "-NoLogo", "-NoProfile", "-WindowStyle", "Hidden",
                  "-ExecutionPolicy", "Bypass", "-File", script],
                 creationflags=0x08000000,
             )
-            icon.stop()
+            log.info("companion update downloaded, restarting")
+            quit_app(None, None)
         except Exception:
             log.exception("cannot start companion updater")
 
     def install_companion_update(_icon, _item):
-        if not feed.updater.companion_update_available():
+        if not getattr(sys, "frozen", False) or not feed.updater.companion_update_available():
             return
         feed.updater.install_companion_async(sys.executable, launch_companion_update)
 
@@ -289,26 +359,40 @@ def run_tray(feed, cfg):
     def quit_app(_icon, _item):
         link.stop()
         feed.shutdown()
-        if settings_window:
-            settings_window.close()
+        ui.stop()          # closes the windows on their own thread
         icon.stop()
 
-    # Long-lived settings live in a normal window; the tray menu remains useful
-    # for status and launching that window without burying every preference in
-    # a nested menu.  Callbacks deliberately have no pystray arguments so the
-    # same actions can be used by Tk buttons.
-    settings_window = None
+    # Windows (settings, RF analyzer) share one Tk thread; the tray menu only opens them.
+    ui = UiThread()
+    analyzer = {"window": None}
 
     def open_settings(_icon=None, _item=None):
-        if settings_window:
-            settings_window.show()
+        settings_window.show()
+
+    def open_analyzer(_icon=None, _item=None):
+        def show():
+            from .rf_analyzer import AnalyzerWindow
+            window = analyzer["window"]
+            if window is not None and window.alive:
+                window.show()
+                return
+            analyzer["window"] = AnalyzerWindow(ui.root, RF_STORE, sync=feed.rf_sync)
+        ui.call(show)
+
+    def close_analyzer():
+        window, analyzer["window"] = analyzer["window"], None
+        if window is not None:
+            window.close()
+
+    ui.on_close(close_analyzer)
 
     icon = pystray.Icon(
         "dedsec_uplink", make_icon("#f0b400"), "DEDSEC // UPLINK",
         menu=pystray.Menu(
             pystray.MenuItem(status_text, None, enabled=False),
             pystray.MenuItem(version_text, None, enabled=False),
-            pystray.MenuItem("OPEN SETTINGS…", open_settings),
+            pystray.MenuItem("OPEN SETTINGS…", open_settings, default=True),
+            pystray.MenuItem("RF HUNTER ANALYZER…", open_analyzer),
             pystray.MenuItem("CHECK FOR UPDATES", check_updates),
             pystray.MenuItem(update_label, install_companion_update,
                              enabled=lambda _i: feed.updater.companion_update_available()),
@@ -319,9 +403,11 @@ def run_tray(feed, cfg):
         ))
 
     settings_window = SettingsWindow(
+        ui,
         feed,
         cfg,
         actions={
+            "open_analyzer": lambda: open_analyzer(None, None),
             "check_updates": lambda: check_updates(None, None),
             "install_companion": lambda: install_companion_update(None, None),
             "install_flipper": lambda: install_flipper_update(None, None),
@@ -382,3 +468,7 @@ def main():
     else:
         run_tray(feed, cfg)
     log.info("DedSec Uplink stopped")
+    # Leave without interpreter teardown: daemon threads (BLE, shell, Tk) may still hold
+    # objects whose finalizers must not run on this thread (Tcl aborts the process).
+    logging.shutdown()
+    os._exit(0)

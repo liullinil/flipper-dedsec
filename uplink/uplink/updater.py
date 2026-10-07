@@ -22,7 +22,7 @@ import zlib
 REPO = "liullinil/flipper-dedsec"
 ASSET = "dedsec_uplink.fap"
 COMPANION_ASSET = "DedSecUplink.exe"
-COMPANION_VERSION = "1.1.0"
+COMPANION_VERSION = "1.2.0"
 CHECK_EVERY = 30 * 60      # seconds between release checks
 CHUNK = 192                # raw bytes per chunk (256 base64 chars, fits the Flipper's line buffer)
 WINDOW = 4                 # chunks in flight
@@ -47,7 +47,6 @@ class Updater:
         self.last_check = 0.0
         self.checking = False
         self.on_change = None
-        self.pending_flipper_request = ""
         self._reset()
 
     def _reset(self):
@@ -134,7 +133,6 @@ class Updater:
             version = self.flipper_version
             if not latest or not version or parse_version(latest["tag"]) <= parse_version(version):
                 return False
-            self.pending_flipper_request = latest["tag"]
         threading.Thread(target=self.request, args=(latest["tag"],), daemon=True).start()
         return True
 
@@ -211,9 +209,6 @@ class Updater:
         """Lines to send right now (called every ~20-50 ms by the link)."""
         out = []
         with self.lock:
-            if self.pending_flipper_request:
-                out.append(f"U|{self.pending_flipper_request}")
-                self.pending_flipper_request = ""
             if not self.active:
                 return out
             now = time.time()
