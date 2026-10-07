@@ -10,6 +10,7 @@ import os
 import tempfile
 
 from .common import APPROVAL, ERROR, Session, WORKING, YOUR_TURN
+from .files import replace as replace_file
 
 
 _ACTIVE = frozenset((WORKING, APPROVAL, ERROR))
@@ -93,7 +94,7 @@ class SessionViews:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
                     fh.write("\n")
-                os.replace(tmp, self.persistence_path)
+                replace_file(tmp, self.persistence_path)
             finally:
                 try:
                     os.unlink(tmp)

@@ -16,10 +16,11 @@ import math
 import os
 import re
 import tempfile
-import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
+
+from .files import replace as replace_file
 
 log = logging.getLogger("uplink.rf_hunter")
 
@@ -322,59 +323,6 @@ class FamilyGrouper:
 
 
 # --------------------------------------------------------------------------- durability
-def _fsync_dir(path: str) -> None:
-    """Persist directory entries (a rename or a new file) on POSIX.
-
-    Windows offers no directory handle that ``os.fsync`` accepts; there
-    :func:`_replace` requests a write-through rename (``MOVEFILE_WRITE_THROUGH``)
-    and NTFS journals the metadata change.
-    """
-    if os.name == "nt":
-        return
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
-
-
-if os.name == "nt":  # pragma: no cover - exercised on Windows only
-    import ctypes
-    from ctypes import wintypes
-
-    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    _MoveFileExW = _kernel32.MoveFileExW
-    _MoveFileExW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
-    _MoveFileExW.restype = wintypes.BOOL
-    _MOVEFILE_REPLACE_EXISTING = 0x1
-    _MOVEFILE_WRITE_THROUGH = 0x8
-
-    def _replace(src: str, dst: str) -> None:
-        """Atomic rename that returns only after the change reached the disk.
-
-        A reader (for example the analyzer reloading the folder) can hold the
-        target open for a moment; Windows reports that as a sharing violation,
-        so retry briefly before giving up.
-        """
-        flags = _MOVEFILE_REPLACE_EXISTING | _MOVEFILE_WRITE_THROUGH
-        for attempt in range(10):
-            if _MoveFileExW(os.fspath(src), os.fspath(dst), flags):
-                return
-            error = ctypes.get_last_error()
-            if error not in (5, 32, 33) or attempt == 9:  # access denied / sharing / lock violation
-                raise ctypes.WinError(error)
-            time.sleep(0.05)
-else:
-    def _replace(src: str, dst: str) -> None:
-        os.replace(src, dst)
-        _fsync_dir(os.path.dirname(os.path.abspath(dst)))
-
-
 def _write_durable(path: str, data: bytes) -> None:
     """Write ``data`` to ``path`` atomically: temp file, fsync, durable rename."""
     directory = os.path.dirname(os.path.abspath(path))
@@ -385,7 +333,7 @@ def _write_durable(path: str, data: bytes) -> None:
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
-        _replace(tmp, path)
+        replace_file(tmp, path)
     finally:
         try:
             os.unlink(tmp)

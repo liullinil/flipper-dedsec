@@ -15,7 +15,7 @@
  *                   UA|written            ack: bytes written so far (also used to resync)
  */
 
-#define UPLINK_VERSION "1.3.0"
+#define UPLINK_VERSION "1.3.1"
 
 typedef enum {
     OtaIdle,
