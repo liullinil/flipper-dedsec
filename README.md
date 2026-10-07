@@ -2,16 +2,15 @@
 
 A Flipper Zero project in a Watch Dogs / DedSec style for **Unleashed firmware** (`unlshd-093c`, API 88.9):
 
-1. **DedSec Uplink** — a Flipper app + Windows tray companion talking over Bluetooth LE:
-   a live PC monitor, a status board for your **Codex** and **Claude Code** sessions, and a
-   pocket **cmd.exe**.
+1. **DedSec Uplink** — one Flipper app + one Windows tray companion talking over Bluetooth LE:
+   a live PC monitor, a status board for your **Codex** and **Claude Code** sessions, a pocket
+   **cmd.exe**, and **RF Hunter** — a passive Sub-GHz / NFC-field logger whose records the companion
+   imports into an investigation window on the PC.
 2. **Desktop animations** — nine original 1-bit Watch Dogs style idle animations for the dolphin desktop.
-3. **RF Signal Hunter** — a passive Sub-GHz/NFC logger plus a desktop investigation console for
-   stable event IDs, structural fingerprints, family grouping and idempotent upload acknowledgements.
 
 ![DedSec Uplink screens](docs/uplink_screens.png)
 
-*SYS with autoscaled network/disk bars · CMD running a command on the PC · persistent settings*
+*SYS · Codex sessions · session details · CMD · approval alert · update offer*
 
 ![Desktop animations](docs/animations.gif)
 
@@ -20,15 +19,21 @@ A Flipper Zero project in a Watch Dogs / DedSec style for **Unleashed firmware**
 | Tab | What it shows |
 |---|---|
 | **SYS** | CPU, RAM, network and disk load (bars with autoscale, or text) and a CPU history graph |
-| **CDX** | Codex sessions (`codex --profile …` and the desktop app): working / needs you / your turn / idle, sub-agents, what each is doing |
+| **CDX** | Codex sessions (`codex --profile …` and the desktop app): working / needs you / your turn, sub-agents, what each is doing |
 | **CLD** | Claude Code sessions (CLI and the Code tab of Claude Desktop), progress from the todo list |
-| **CMD** | A real remote shell: type on the Flipper, it runs in a persistent `cmd.exe` on the PC, output and exit code come back |
+| **CMD** | A remote shell: type on the Flipper, it runs in a persistent shell on the PC, output and exit code come back |
+| **RF** | RF Hunter: passive Sub-GHz scan / capture / follow and NFC-field detection, journal on the SD card |
 
 - **Vibrates** when a session needs you (question / approval, or the agent finished its turn) and when the console replies.
-- **Cyrillic** session names, details and console output (embedded UTF-8 font).
+- **Cyrillic** in session names, details and console output, in all four font sizes.
+- **Vertical mode** for holding the Flipper upright.
 - **Over-the-air updates**: the companion checks GitHub releases, the Flipper offers the update and installs it over BLE, then restarts itself.
-- **Settings** on the Flipper: vibration, LED, screen wake, indicators (bars/text), four font sizes, orientation, tab order, auto-update.
-- Companion: tray icon, Windows autostart, optional Claude Code hooks for precise state.
+- **Settings** on the Flipper: vibration, LED, screen wake, indicators, font size, orientation, tab order, RF options, auto-update.
+- Companion: tray icon and settings window, Windows autostart, optional Claude Code hooks, the RF analyzer, self-update.
+
+![RF Hunter tab](docs/uplink_rf.png)
+
+![Vertical mode](docs/uplink_vertical.png)
 
 Full documentation: **[uplink/README.md](uplink/README.md)**.
 
@@ -50,11 +55,11 @@ Details, previews and how they rotate: **[assets/README.md](assets/README.md)**.
 
 | Path | Contents |
 |---|---|
-| [`apps/dedsec_uplink`](apps/dedsec_uplink) | The Flipper app (C, built with `ufbt`) |
-| [`uplink`](uplink) | The Windows companion (Python; also built as a single `.exe`) |
+| [`apps/dedsec_uplink`](apps/dedsec_uplink) | The Flipper app (C, built with `ufbt`), including the RF Hunter engine |
+| [`uplink`](uplink) | The Windows companion (Python; also built as a single `.exe`), including the RF analyzer |
 | [`assets`](assets) | Animation sources, built `.bm` frames, previews |
-| [`apps/rf_signal_hunter`](apps/rf_signal_hunter) | Passive Sub-GHz Scout FAP (RX only) |
-| [`tools`](tools) | Build scripts and Flipper USB helpers |
+| [`tools`](tools) | Build scripts, Flipper USB helpers, the [screen renderer](tools/uplink_render) |
+| [`docs`](docs) | Images, the RF Hunter specification and protocol |
 
 ## Build from source
 

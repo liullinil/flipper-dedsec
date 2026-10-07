@@ -22,3 +22,12 @@ uplink/dist_exe/
 uplink/dist/
 uplink/DedSecUplink.spec
 uplink/DedSecUplinkConsole.spec
+
+# screen renderer (tools/uplink_render): downloaded u8g2 sources and build output
+tools/uplink_render/u8g2/
+tools/uplink_render/obj/
+tools/uplink_render/out/
+tools/uplink_render/render.exe
+
+# local agent worktrees
+.claude/
