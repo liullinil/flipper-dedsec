@@ -34,6 +34,7 @@ from typing import Callable, Iterable, Optional, Sequence
 from .rf_fingerprint import FeatureCache, StructuralGrouper, compare_events
 from .rf_hunter import (EventStore, RfEvent, app_data_dir, default_store_root, folder_signature,
                         resolve_store_root)
+from . import dedsec_ui as ui
 
 log = logging.getLogger("uplink.rf_analyzer")
 
@@ -568,6 +569,18 @@ def _format_local_time(epoch) -> str:
         return "?"
 
 
+def _format_kb(kb) -> str:
+    try:
+        kb = float(kb)
+    except (TypeError, ValueError):
+        return "?"
+    if kb >= 1024 * 1024:
+        return f"{kb / 1024 / 1024:.1f} GB"
+    if kb >= 1024:
+        return f"{kb / 1024:.0f} MB"
+    return f"{kb:.0f} KB"
+
+
 def sync_status_text(status: Optional[dict]) -> tuple:
     """``(summary, error)`` lines for an :meth:`RfSync.status` snapshot."""
     if status is None:
@@ -579,7 +592,7 @@ def sync_status_text(status: Optional[dict]) -> tuple:
         pending = status.get("pending")
         parts.append(f"Flipper: {pending if pending is not None else '?'} pending")
         if status.get("free_kb") is not None:
-            parts.append(f"{status['free_kb']} KB free")
+            parts.append(f"{_format_kb(status['free_kb'])} free")
         state = STATE_TEXT.get(status.get("state"))
         if state:
             parts.append(state)
@@ -633,7 +646,7 @@ class AnalyzerWindow:
         self.window.title("DEDSEC // RF HUNTER")
         self.window.geometry("1280x820")
         self.window.minsize(900, 600)
-        self.window.configure(bg=BG)
+        self.window.configure(bg=ui.BG)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         self._build()
         if self.store_root:
@@ -713,131 +726,140 @@ class AnalyzerWindow:
     def _build(self):
         tk, ttk = self.tk, self.ttk
         window = self.window
-        # Custom style names only: the settings window shares this Tk
-        # interpreter and must keep its own look.
-        style = ttk.Style(window)
-        style.configure("RF.TFrame", background=BG)
-        style.configure("RF.TLabel", background=BG, foreground="#b6d7de")
-        style.configure("RF.Title.TLabel", background=BG, foreground=ACCENT, font=("Segoe UI", 16, "bold"))
-        style.configure("RF.Muted.TLabel", background=BG, foreground=MUTED)
-        style.configure("RF.Warn.TLabel", background=BG, foreground=WARN)
-        style.configure("RF.Error.TLabel", background=BG, foreground=ERROR)
-        style.configure("RF.TButton", background="#11303a", foreground=TEXT)
-        style.map("RF.TButton", background=[("active", "#1d4050"), ("disabled", "#0d1c26")],
-                  foreground=[("disabled", MUTED)])
+        ui.style_scrollbars(window)
+        self._images = []
+        try:
+            from PIL import ImageTk
 
-        header = ttk.Frame(window, style="RF.TFrame")
-        header.pack(fill="x", padx=10, pady=(8, 2))
-        ttk.Label(header, text="DEDSEC // RF HUNTER", style="RF.Title.TLabel").pack(side="left")
-        self.sync_button = ttk.Button(header, text="Sync now", style="RF.TButton", command=self.sync_now)
-        self.sync_button.pack(side="left", padx=(16, 5))
+            from .icon import make_icon
+            hood = ImageTk.PhotoImage(make_icon(ui.MAGENTA).resize((46, 46)), master=window)
+            small = ImageTk.PhotoImage(make_icon(ui.MAGENTA).resize((32, 32)), master=window)
+            self._images += [hood, small]
+            window.iconphoto(False, small)
+        except Exception:
+            hood = None
+
+        top = tk.Frame(window, bg=ui.BG)
+        top.pack(fill="x", padx=10, pady=(8, 0))
+        ui.glitch_header(top, "RF HUNTER", "DEDSEC  //  SIGNAL INVESTIGATION", image=hood).pack(
+            side="left", fill="x", expand=True)
+        self.status = tk.Label(top, text="No observations loaded", fg=ui.DIM, bg=ui.BG,
+                               font=(ui.MONO, 9), anchor="e")
+        self.status.pack(side="right", anchor="n", pady=(6, 0))
+
+        toolbar = tk.Frame(window, bg=ui.BG)
+        toolbar.pack(fill="x", padx=12, pady=(4, 2))
+        self.sync_button = ui.NeonButton(toolbar, "SYNC NOW", self.sync_now, style="primary").pack(
+            side="left", padx=(0, 8))
         if self.sync is None:
             self.sync_button.state(["disabled"])
-        ttk.Button(header, text="Open folder…", style="RF.TButton",
-                   command=self.open_folder).pack(side="left", padx=5)
-        ttk.Button(header, text="Export JSON", style="RF.TButton",
-                   command=lambda: self.export("json")).pack(side="left")
-        ttk.Button(header, text="Export CSV", style="RF.TButton",
-                   command=lambda: self.export("csv")).pack(side="left", padx=5)
-        ttk.Button(header, text="Save project", style="RF.TButton",
-                   command=self.save_project).pack(side="left", padx=5)
-        ttk.Button(header, text="Load project", style="RF.TButton",
-                   command=self.load_project).pack(side="left")
-        self.status = ttk.Label(header, text="No observations loaded", style="RF.TLabel")
-        self.status.pack(side="right")
+        for label, command in (("OPEN FOLDER", self.open_folder),
+                               ("EXPORT JSON", lambda: self.export("json")),
+                               ("EXPORT CSV", lambda: self.export("csv")),
+                               ("SAVE PROJECT", self.save_project),
+                               ("LOAD PROJECT", self.load_project)):
+            ui.NeonButton(toolbar, label, command).pack(side="left", padx=(0, 6))
 
-        info = ttk.Frame(window, style="RF.TFrame")
-        info.pack(fill="x", padx=10, pady=(0, 4))
-        self.sync_label = ttk.Label(info, text="", style="RF.TLabel")
-        self.sync_label.pack(anchor="w")
-        self.sync_error = ttk.Label(info, text="", style="RF.Error.TLabel")
-        self.sync_error.pack(anchor="w")
-        self.store_label = ttk.Label(info, text="", style="RF.Muted.TLabel")
-        self.store_label.pack(anchor="w")
+        info = tk.Frame(window, bg=ui.BG)
+        info.pack(fill="x", padx=12, pady=(6, 2))
+        line = tk.Frame(info, bg=ui.BG)
+        line.pack(fill="x")
+        self.sync_dot = tk.Label(line, text="●", fg=ui.MUTED, bg=ui.BG, font=(ui.MONO, 10))
+        self.sync_dot.pack(side="left")
+        self.sync_label = tk.Label(line, text="", fg=ui.TEXT, bg=ui.BG, font=(ui.MONO, 9, "bold"),
+                                   anchor="w")
+        self.sync_label.pack(side="left", padx=(4, 0))
+        self.sync_error = tk.Label(info, text="", fg=ui.RED, bg=ui.BG, font=(ui.MONO, 9), anchor="w")
+        self.sync_error.pack(fill="x")
+        self.store_label = tk.Label(info, text="", fg=ui.MUTED, bg=ui.BG, font=(ui.MONO, 8), anchor="w")
+        self.store_label.pack(fill="x")
 
-        filters = ttk.Frame(window, style="RF.TFrame")
-        filters.pack(fill="x", padx=10, pady=(2, 0))
-        entry = dict(bg=PANEL, fg=TEXT, insertbackground=TEXT, relief="flat")
+        filters = tk.Frame(window, bg=ui.BG)
+        filters.pack(fill="x", padx=12, pady=(6, 0))
 
-        def field(label, width, padx=(8, 0)):
-            ttk.Label(filters, text=label, style="RF.TLabel").pack(side="left", padx=padx)
+        def field(label, width, padx=(10, 0)):
+            tk.Label(filters, text=label, fg=ui.DIM, bg=ui.BG, font=(ui.MONO, 8, "bold")).pack(
+                side="left", padx=padx)
             variable = tk.StringVar(master=window)
-            widget = tk.Entry(filters, textvariable=variable, width=width, **entry)
-            widget.pack(side="left", padx=4)
+            widget = ui.entry(filters, variable, width)
+            widget.pack(side="left", padx=4, ipady=2)
             widget.bind("<Return>", lambda _event: self.refresh())
             return variable
 
-        self.search = field("Search", 26, padx=(0, 0))
-        self.source = field("Source", 8)
-        self.frequency = field("MHz", 14)
+        self.search = field("SEARCH", 24, padx=(0, 0))
+        self.source = field("SOURCE", 8)
+        self.frequency = field("MHZ", 13)
         self.rssi = field("RSSI ≥", 6)
         self.max_rssi = field("≤", 6, padx=(2, 0))
-        self.start_time = field("From UTC", 17)
-        self.end_time = field("To", 17, padx=(2, 0))
-        ttk.Button(filters, text="Apply filters", style="RF.TButton",
-                   command=self.refresh).pack(side="left", padx=5)
-        self.filter_error = ttk.Label(window, text="", style="RF.Warn.TLabel")
-        self.filter_error.pack(fill="x", padx=10)
+        self.start_time = field("FROM UTC", 16)
+        self.end_time = field("TO", 16, padx=(2, 0))
+        ui.NeonButton(filters, "APPLY", self.refresh, style="accent").pack(side="left", padx=(10, 0))
+        self.filter_error = tk.Label(window, text="", fg=ui.YELLOW, bg=ui.BG, font=(ui.MONO, 9), anchor="w")
+        self.filter_error.pack(fill="x", padx=12)
 
-        body = ttk.Panedwindow(window, orient="horizontal")
-        body.pack(fill="both", expand=True, padx=10, pady=5)
-        left = ttk.Frame(body, width=250, style="RF.TFrame")
-        center = ttk.Frame(body, style="RF.TFrame")
-        right = ttk.Frame(body, width=300, style="RF.TFrame")
-        body.add(left, weight=1)
-        body.add(center, weight=4)
-        body.add(right, weight=1)
+        body = tk.PanedWindow(window, orient="horizontal", bg=ui.LINE, sashwidth=3, borderwidth=0,
+                              sashrelief="flat", opaqueresize=True)
+        body.pack(fill="both", expand=True, padx=12, pady=(4, 10))
+        left = tk.Frame(body, bg=ui.BG)
+        center = tk.Frame(body, bg=ui.BG)
+        right = tk.Frame(body, bg=ui.BG)
+        body.add(left, minsize=200, width=240, stretch="never")
+        body.add(center, minsize=360, stretch="always")
+        body.add(right, minsize=300, width=380, stretch="never")
 
-        ttk.Label(left, text="SIGNAL FAMILIES", style="RF.TLabel").pack(anchor="w")
-        self.families = tk.Listbox(left, bg=PANEL, fg="#c9f5ff", selectbackground="#14515b",
-                                   relief="flat", exportselection=False)
-        self.families.pack(fill="both", expand=True, pady=5)
+        ui.section(left, "SIGNAL_FAMILIES", ui.MAGENTA).pack(fill="x", padx=(0, 8))
+        box = tk.Frame(left, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.LINE)
+        box.pack(fill="both", expand=True, pady=6, padx=(0, 8))
+        self.families = tk.Listbox(box, bg=ui.PANEL, fg=ui.TEXT, selectbackground=ui.MAGENTA,
+                                   selectforeground=ui.BG, relief="flat", exportselection=False,
+                                   font=(ui.MONO, 9), activestyle="none", highlightthickness=0,
+                                   borderwidth=0)
+        family_scroll = ttk.Scrollbar(box, orient="vertical", command=self.families.yview,
+                                      style="DedSec.Vertical.TScrollbar")
+        self.families.configure(yscrollcommand=family_scroll.set)
+        self.families.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=4)
+        family_scroll.pack(side="right", fill="y")
         self.families.bind("<<ListboxSelect>>", self.family_selected)
-        ttk.Button(left, text="Show all families", style="RF.TButton",
-                   command=self.clear_family).pack(anchor="e", pady=(0, 4))
+        ui.NeonButton(left, "SHOW ALL", self.clear_family).pack(anchor="e", padx=(0, 8), pady=(0, 2))
 
-        self.waterfall_canvas = tk.Canvas(center, bg="#041017", highlightthickness=0, height=330)
-        self.waterfall_canvas.pack(fill="both", expand=True)
-        self.timeline_canvas = tk.Canvas(center, bg="#08151d", highlightthickness=0, height=140)
-        self.timeline_canvas.pack(fill="both", expand=True, pady=5)
-        self.spectrum_canvas = tk.Canvas(center, bg="#07141c", highlightthickness=0, height=150)
-        self.spectrum_canvas.pack(fill="both", expand=True)
-        scrub = ttk.Frame(center, style="RF.TFrame")
-        scrub.pack(fill="x")
-        self.play_button = ttk.Button(scrub, text="Play", style="RF.TButton", command=self.toggle_play)
-        self.play_button.pack(side="left")
+        scrub = tk.Frame(center, bg=ui.BG)
+        scrub.pack(side="bottom", fill="x", padx=8, pady=(0, 2))
+        ui.section(center, "WATERFALL").pack(fill="x", padx=8)
+        self.waterfall_canvas = tk.Canvas(center, bg="#020507", highlightthickness=1,
+                                          highlightbackground=ui.LINE, height=220)
+        self.waterfall_canvas.pack(fill="both", expand=True, padx=8, pady=(4, 6))  # takes the spare height
+        ui.section(center, "TIMELINE").pack(fill="x", padx=8)
+        self.timeline_canvas = tk.Canvas(center, bg="#020507", highlightthickness=1,
+                                         highlightbackground=ui.LINE, height=86)
+        self.timeline_canvas.pack(fill="x", padx=8, pady=(4, 6))
+        ui.section(center, "RSSI_SPECTRUM").pack(fill="x", padx=8)
+        self.spectrum_canvas = tk.Canvas(center, bg="#020507", highlightthickness=1,
+                                         highlightbackground=ui.LINE, height=96)
+        self.spectrum_canvas.pack(fill="x", padx=8, pady=(4, 6))
+        self.play_button = ui.NeonButton(scrub, "PLAY", self.toggle_play, style="accent").pack(side="left")
         self.scrub = tk.IntVar(master=window, value=0)
         self.scrub_scale = tk.Scale(scrub, variable=self.scrub, from_=0, to=0, orient="horizontal",
-                                    showvalue=False, command=self.scrub_changed, bg=BG, fg="#b6d7de",
-                                    highlightthickness=0, troughcolor=PANEL)
-        self.scrub_scale.pack(side="left", fill="x", expand=True)
+                                    showvalue=False, command=self.scrub_changed, bg=ui.CYAN,
+                                    activebackground=ui.MAGENTA, troughcolor=ui.PANEL,
+                                    highlightthickness=0, borderwidth=0, sliderrelief="flat",
+                                    sliderlength=22, width=10)
+        self.scrub_scale.pack(side="left", fill="x", expand=True, padx=(10, 0))
 
-        ttk.Label(right, text="SIGNAL FAMILY DETAIL", style="RF.TLabel").pack(anchor="w")
-        family_box = ttk.Frame(right, style="RF.TFrame")
-        family_box.pack(fill="x", pady=(2, 6))
-        self.family_details = tk.Text(family_box, bg="#081923", fg="#b6d7de", insertbackground=TEXT,
-                                      relief="flat", wrap="word", height=10)
-        family_scroll = tk.Scrollbar(family_box, orient="vertical", command=self.family_details.yview)
-        self.family_details.configure(yscrollcommand=family_scroll.set, state="disabled")
-        self.family_details.pack(side="left", fill="both", expand=True)
-        family_scroll.pack(side="right", fill="y")
-        ttk.Label(right, text="SELECTED OBSERVATION / SIMILARITY", style="RF.TLabel").pack(anchor="w")
-        details_box = ttk.Frame(right, style="RF.TFrame")
-        details_box.pack(fill="both", expand=True, pady=5)
-        self.details = tk.Text(details_box, bg=PANEL, fg=TEXT, insertbackground=TEXT,
-                               relief="flat", wrap="word")
-        details_scroll = tk.Scrollbar(details_box, orient="vertical", command=self.details.yview)
-        self.details.configure(yscrollcommand=details_scroll.set, state="disabled")
-        self.details.pack(side="left", fill="both", expand=True)
-        details_scroll.pack(side="right", fill="y")
-        ttk.Label(right, text="NOTE / LOCATION", style="RF.TLabel").pack(anchor="w")
-        self.note_entry = tk.Entry(right, **entry)
-        self.note_entry.pack(fill="x", pady=2)
-        self.location_entry = tk.Entry(right, **entry)
-        self.location_entry.pack(fill="x", pady=2)
-        ttk.Button(right, text="Save note", style="RF.TButton", command=self.save_note).pack(anchor="e")
-        ttk.Button(right, text="Export Follow profile", style="RF.TButton",
-                   command=self.export_follow).pack(anchor="e", pady=4)
+        ui.section(right, "FAMILY_DETAIL", ui.MAGENTA).pack(fill="x", padx=(8, 0))
+        family_box, self.family_details = ui.text_box(right, height=11)
+        family_box.pack(fill="x", padx=(8, 0), pady=(4, 8))
+        ui.section(right, "OBSERVATION // SIMILARITY", ui.MAGENTA).pack(fill="x", padx=(8, 0))
+        details_box, self.details = ui.text_box(right)
+        details_box.pack(fill="both", expand=True, padx=(8, 0), pady=(4, 8))
+        ui.section(right, "NOTE // LOCATION", ui.MAGENTA).pack(fill="x", padx=(8, 0))
+        self.note_entry = ui.entry(right)
+        self.note_entry.pack(fill="x", padx=(8, 0), pady=(4, 2), ipady=2)
+        self.location_entry = ui.entry(right)
+        self.location_entry.pack(fill="x", padx=(8, 0), pady=2, ipady=2)
+        buttons = tk.Frame(right, bg=ui.BG)
+        buttons.pack(fill="x", padx=(8, 0), pady=(4, 0))
+        ui.NeonButton(buttons, "EXPORT FOLLOW PROFILE", self.export_follow).pack(side="right")
+        ui.NeonButton(buttons, "SAVE NOTE", self.save_note, style="accent").pack(side="right", padx=6)
 
         self.waterfall_canvas.bind("<Button-1>", self.canvas_event)
         self.timeline_canvas.bind("<Button-1>", self.timeline_event)
@@ -892,7 +914,7 @@ class AnalyzerWindow:
             text += f" · {skipped} malformed record(s) skipped"
             if messages:
                 text += f" (first: {messages[0][-120:]})"
-        self.store_label.configure(text=text, style="RF.Warn.TLabel" if skipped else "RF.Muted.TLabel")
+        self.store_label.configure(text=text, fg=ui.YELLOW if skipped else ui.MUTED)
 
     # ------------------------------------------------------------------ sync status
     def sync_now(self):
@@ -915,6 +937,15 @@ class AnalyzerWindow:
         summary, error = sync_status_text(status)
         self.sync_label.configure(text=summary)
         self.sync_error.configure(text=error)
+        if status is None:
+            color = ui.MUTED
+        elif status.get("syncing"):
+            color = ui.MAGENTA
+        elif status.get("link_up"):
+            color = ui.GREEN
+        else:
+            color = ui.YELLOW
+        self.sync_dot.configure(fg=color)
         return status
 
     def _tick_status(self):
@@ -976,13 +1007,14 @@ class AnalyzerWindow:
         self._family_rows = [summary["family_id"] for summary in summaries]
         self.families.delete(0, "end")
         for summary in summaries:
-            self.families.insert("end", f"{summary['family_id']}  {summary['observation_count']} obs")
+            short = str(summary["family_id"]).replace("family-", "")[:12].upper()
+            self.families.insert("end", f"▮ {short:<12} {summary['observation_count']:>4}")
         if self._selected_family in self._family_rows:
             index = self._family_rows.index(self._selected_family)
             self.families.selection_set(index)
             self.families.see(index)
-        self.status.configure(text=f"{len(events)} shown · {len(self.project.events)} observations · "
-                                   f"{len(self.project.grouper.families)} families")
+        self.status.configure(text=f"{len(events)} SHOWN  ·  {len(self.project.events)} OBSERVATIONS  ·  "
+                                   f"{len(self.project.grouper.families)} FAMILIES")
         self._set_family_details(self._selected_family)
         self._events = events
         self.scrub_scale.configure(to=max(0, len(events) - 1))
@@ -1005,33 +1037,50 @@ class AnalyzerWindow:
         self.families.selection_clear(0, "end")
         self.refresh()
 
+    @staticmethod
+    def _write(widget, segments):
+        """Replace a read-only text box with (text, tag) segments."""
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        for text, tag in segments:
+            widget.insert("end", text, tag) if tag else widget.insert("end", text)
+        widget.configure(state="disabled")
+
+    @staticmethod
+    def _pairs(rows):
+        segments = []
+        for key, value in rows:
+            segments += [(f"{key:<13}", "muted"), (f"{value}\n", None)]
+        return segments
+
     def _set_family_details(self, family_id):
         detail = self.project.family_detail(family_id) if family_id else {}
         if not detail.get("observation_count"):
-            text = "No family selected"
-        else:
-            frequencies = "—"
-            if detail["frequency_min_hz"]:
-                frequencies = f"{detail['frequency_min_hz'] / 1e6:.3f}"
-                if detail["frequency_max_hz"] != detail["frequency_min_hz"]:
-                    frequencies += f"–{detail['frequency_max_hz'] / 1e6:.3f}"
-                frequencies += " MHz"
-            hours = ", ".join(f"{hour:02d}:00" for hour in detail["time_of_day_hours"]) or "—"
-            text = (f"{detail['family_id']}\n"
-                    f"{detail['observation_count']} observations · {frequencies}\n"
-                    f"Seen {detail['first_seen']}\nLast {detail['last_seen']}\n"
-                    f"Modulation: {', '.join(detail['modulations']) or 'unknown'}\n"
-                    f"Waveform variants: {len(detail['waveform_variants'])}\n"
-                    f"RSSI: {detail['rssi_min_dbm']:.1f}…{detail['rssi_max_dbm']:.1f} dBm\n"
-                    f"Active hours (UTC): {hours}\n"
-                    f"Hypothesis: {detail['source_hypothesis']} · confidence {detail['similarity_confidence']:.0%}\n"
-                    f"Raw captures: {detail['raw_capture_count']} · imported: {detail['imported_count']} · "
-                    f"pending: {detail['pending_count']}\n"
-                    f"Follow: {'selected' if detail['follow_selected'] else 'not selected'}")
-        self.family_details.configure(state="normal")
-        self.family_details.delete("1.0", "end")
-        self.family_details.insert("end", text)
-        self.family_details.configure(state="disabled")
+            self._write(self.family_details, [("NO FAMILY SELECTED\n", "title"),
+                                              ("pick one on the left, or click the waterfall", "muted")])
+            return
+        frequencies = "—"
+        if detail["frequency_min_hz"]:
+            frequencies = f"{detail['frequency_min_hz'] / 1e6:.3f}"
+            if detail["frequency_max_hz"] != detail["frequency_min_hz"]:
+                frequencies += f" – {detail['frequency_max_hz'] / 1e6:.3f}"
+            frequencies += " MHz"
+        hours = ", ".join(f"{hour:02d}" for hour in detail["time_of_day_hours"]) or "—"
+        segments = [(f"{str(detail['family_id']).upper()}\n", "title")]
+        segments += self._pairs([
+            ("OBSERVED", f"{detail['observation_count']}×  ·  {frequencies}"),
+            ("FIRST SEEN", detail["first_seen"]),
+            ("LAST SEEN", detail["last_seen"]),
+            ("MODULATION", ", ".join(detail["modulations"]) or "unknown"),
+            ("VARIANTS", len(detail["waveform_variants"])),
+            ("RSSI", f"{detail['rssi_min_dbm']:.1f} … {detail['rssi_max_dbm']:.1f} dBm"),
+            ("ACTIVE (UTC)", hours),
+            ("HYPOTHESIS", f"{detail['source_hypothesis']}  ·  {detail['similarity_confidence']:.0%}"),
+            ("CAPTURES", f"{detail['raw_capture_count']} raw · {detail['imported_count']} imported · "
+                         f"{detail['pending_count']} pending"),
+            ("FOLLOW", "selected" if detail["follow_selected"] else "not selected"),
+        ])
+        self._write(self.family_details, segments)
 
     # ------------------------------------------------------------------ drawing
     def draw(self, events):
@@ -1041,60 +1090,104 @@ class AnalyzerWindow:
         if events:
             self.show_event(events[min(self.scrub.get(), len(events) - 1)])
 
+    @staticmethod
+    def _grid(canvas, width, height, step_x=64, step_y=24):
+        for x in range(step_x, width, step_x):
+            canvas.create_line(x, 0, x, height, fill="#08161d")
+        for y in range(step_y, height, step_y):
+            canvas.create_line(0, y, width, y, fill="#08161d")
+
+    @staticmethod
+    def _neon(rssi):
+        """Weak signals deep cyan, strong ones magenta, the strongest yellow."""
+        t = max(0.0, min(1.0, ((rssi if rssi is not None else -110) + 100) / 60.0))
+        if t < 0.6:
+            k = t / 0.6
+            r, g, b = 0x10 + (0x27 - 0x10) * k, 0x50 + (0xe0 - 0x50) * k, 0x60 + (0xe8 - 0x60) * k
+        elif t < 0.9:
+            k = (t - 0.6) / 0.3
+            r, g, b = 0x27 + (0xff - 0x27) * k, 0xe0 + (0x2b - 0xe0) * k, 0xe8 + (0xd6 - 0xe8) * k
+        else:
+            k = (t - 0.9) / 0.1
+            r, g, b = 0xff, 0x2b + (0xe1 - 0x2b) * k, 0xd6 + (0x4d - 0xd6) * k
+        return "#%02x%02x%02x" % (int(r), int(g), int(b))
+
     def draw_waterfall(self, events):
         canvas = self.waterfall_canvas
         canvas.delete("all")
         width = max(1, canvas.winfo_width())
         height = max(1, canvas.winfo_height())
+        self._grid(canvas, width, height)
         rows = self.project.waterfall(events)[-waterfall_capacity(height):]
         self._waterfall_rows = rows
         self._waterfall_height = height
         frequencies = [row["frequency_hz"] for row in rows if row["frequency_hz"]]
         if not rows or not frequencies:
-            canvas.create_text(width // 2, height // 2, text="Sampled RF waterfall — no events", fill="#6297a3")
+            cx, cy = width // 2, height // 2
+            for dx, color in ((2, ui.MAGENTA), (-2, ui.CYAN), (0, "#f4fbff")):
+                canvas.create_text(cx + dx, cy - 18, text="NO SIGNALS YET", fill=color,
+                                   font=("Segoe UI Black", 18))
+            canvas.create_text(cx, cy + 12, text="start RF on the Flipper:  RF tab  >  OK", fill=ui.DIM,
+                               font=(ui.MONO, 9))
+            canvas.create_text(cx, cy + 30, text="records arrive here while the Flipper is connected",
+                               fill=ui.MUTED, font=(ui.MONO, 8))
             return
         low, high = min(frequencies), max(frequencies)
         span = max(1, high - low)
         row_h = waterfall_row_height(height, len(rows))
         for index, row in enumerate(rows):
-            x = 12 + (row["frequency_hz"] - low) * (width - 24) / span
-            intensity = max(0, min(255, int((row["rssi_dbm"] + 110) * 4)))
-            color = f"#{20:02x}{min(255, 60 + intensity):02x}{min(255, 100 + intensity):02x}"
+            x = 14 + (row["frequency_hz"] - low) * (width - 28) / span
             y = height - (index + 1) * row_h  # newest row at the top
-            canvas.create_rectangle(max(3, x - 3), y, min(width - 3, x + 3), y + row_h - 1, fill=color, outline="")
+            color = self._neon(row["rssi_dbm"])
+            canvas.create_rectangle(max(3, x - 4), y, min(width - 3, x + 4), y + max(1, row_h - 1),
+                                    fill=color, outline="")
             if row["family_id"] == self._selected_family:
-                canvas.create_oval(x - 6, y, x + 6, y + row_h, outline=WARN, width=2)
+                canvas.create_rectangle(x - 7, y - 1, x + 7, y + row_h, outline=ui.MAGENTA, width=1)
             if row["event_id"] == self._selected_event:
-                canvas.create_rectangle(x - 8, y, x + 8, y + row_h - 1, outline="#ffffff")
-        canvas.create_text(10, 8, anchor="w", text=f"{low/1e6:.3f}–{high/1e6:.3f} MHz · sampled RSSI · newest on top",
-                           fill="#8dd9e6")
+                canvas.create_rectangle(x - 9, y - 2, x + 9, y + row_h + 1, outline=ui.YELLOW, width=2)
+        canvas.create_text(10, 10, anchor="w", fill=ui.CYAN, font=(ui.MONO, 9, "bold"),
+                           text=f"{low / 1e6:.3f} – {high / 1e6:.3f} MHz")
+        canvas.create_text(width - 10, 10, anchor="e", fill=ui.MUTED, font=(ui.MONO, 8),
+                           text="sampled RSSI · newest on top")
 
     def draw_timeline(self, events):
         canvas = self.timeline_canvas
         canvas.delete("all")
         width = max(1, canvas.winfo_width())
         height = max(1, canvas.winfo_height())
+        self._grid(canvas, width, height, step_x=48, step_y=1000)
         rows = self.project.timeline(events)
+        y = height // 2 + 6
+        canvas.create_line(12, y, width - 12, y, fill=ui.LINE, width=2)
         if not rows:
             return
         times = [row["when"].timestamp() for row in rows]
         lo, hi = min(times), max(times)
         span = max(1, hi - lo)
-        y = height // 2
-        canvas.create_line(12, y, width - 12, y, fill="#2d6574")
         for row, timestamp in zip(rows, times):
             x = 12 + (timestamp - lo) * (width - 24) / span
-            color = WARN if row["family_id"] == self._selected_family else "#55d6be"
-            canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=color, outline="")
-        start = (EPOCH + timedelta(seconds=lo)).isoformat(timespec="seconds").replace("+00:00", "Z")
-        canvas.create_text(12, 8, anchor="w", text=start, fill="#79aeb8")
+            selected = row["family_id"] == self._selected_family
+            canvas.create_line(x, y - (10 if selected else 6), x, y + (10 if selected else 6),
+                               fill=ui.MAGENTA if selected else ui.CYAN, width=2 if selected else 1)
+        if self._selected_event:
+            for row, timestamp in zip(rows, times):
+                if row.get("event_id") == self._selected_event:
+                    x = 12 + (timestamp - lo) * (width - 24) / span
+                    canvas.create_polygon(x - 5, y - 16, x + 5, y - 16, x, y - 9, fill=ui.YELLOW, outline="")
+        start = (EPOCH + timedelta(seconds=lo)).strftime("%Y-%m-%d %H:%M:%S")
+        end = (EPOCH + timedelta(seconds=hi)).strftime("%Y-%m-%d %H:%M:%S")
+        canvas.create_text(12, 12, anchor="w", text=start + " UTC", fill=ui.DIM, font=(ui.MONO, 8))
+        canvas.create_text(width - 12, 12, anchor="e", text=end + " UTC", fill=ui.DIM, font=(ui.MONO, 8))
 
     def draw_spectrum(self, events):
         canvas = self.spectrum_canvas
         canvas.delete("all")
         width = max(1, canvas.winfo_width())
         height = max(1, canvas.winfo_height())
+        self._grid(canvas, width, height, step_x=48, step_y=20)
         rows = self.project.spectrum(events)
+        canvas.create_text(10, 10, anchor="w", text="peak RSSI by frequency", fill=ui.MUTED,
+                           font=(ui.MONO, 8))
         if not rows:
             return
         points = []
@@ -1102,11 +1195,11 @@ class AnalyzerWindow:
             if row["rssi_dbm"] is None:
                 continue
             x = 10 + index * (width - 20) / max(1, len(rows) - 1)
-            y = height - 10 - max(0, min(1, (row["rssi_dbm"] + 110) / 80)) * (height - 25)
+            y = height - 10 - max(0, min(1, (row["rssi_dbm"] + 110) / 80)) * (height - 28)
             points.extend((x, y))
         if len(points) >= 4:
-            canvas.create_line(*points, fill="#ff72c6", width=2, smooth=True)
-        canvas.create_text(10, 8, anchor="w", text="RSSI spectrum", fill="#d49bd0")
+            canvas.create_line(*points, fill="#5a1050", width=6, smooth=True)    # glow
+            canvas.create_line(*points, fill=ui.MAGENTA, width=2, smooth=True)
 
     # ------------------------------------------------------------------ selection
     def _select_index(self, index: int):
@@ -1141,7 +1234,7 @@ class AnalyzerWindow:
 
     def toggle_play(self):
         self.playing = not self.playing
-        self.play_button.configure(text="Pause" if self.playing else "Play")
+        self.play_button.configure(text="PAUSE" if self.playing else "PLAY")
         if self.playing:
             self._play_step()
 
@@ -1150,7 +1243,7 @@ class AnalyzerWindow:
             return
         if not self._events:
             self.playing = False
-            self.play_button.configure(text="Play")
+            self.play_button.configure(text="PLAY")
             return
         self.scrub.set((self.scrub.get() + 1) % len(self._events))
         self.draw(self._events)
@@ -1168,31 +1261,33 @@ class AnalyzerWindow:
                            f"{event.nfc_protocol or 'unknown'}\n"
                            f"Field interval {event.nfc_field_duration_ms} ms · "
                            f"observations {event.nfc_field_count}\n")
-        data = (f"Event {event.event_id}\nDevice {event.device_uuid}\nSession {event.session_id}\n"
-                f"{event.captured_at_utc}\n{event.frequency_hz / 1e6:.3f} MHz · {event.modulation}\n"
-                f"{nfc_details}"
-                f"RSSI {event.rssi_avg_dbm:.1f} dBm · duration {event.duration_us} us\n"
-                f"Family {family}\n"
-                f"Fingerprint {project.fingerprint_key(event)}"
-                f"{' (Flipper hint ' + hint + ')' if hint.startswith('local-') else ''}\n"
-                f"Pulse timings {len(event.pulse_timings_us)} samples\n"
-                f"Raw capture {len(project.capture_bytes(event))} bytes · {event.upload_state}\n"
-                f"Classification {event.classification} ({event.classification_confidence:.0%})")
+        segments = [(f"{event.event_id}\n", "title")]
+        segments += self._pairs([
+            ("CAPTURED", event.captured_at_utc),
+            ("FREQUENCY", f"{event.frequency_hz / 1e6:.3f} MHz · {event.modulation}"),
+            ("RSSI", f"{event.rssi_avg_dbm:.1f} dBm · {event.duration_us} us"),
+            ("FAMILY", family),
+            ("FINGERPRINT", project.fingerprint_key(event)
+             + (f"  (Flipper {hint})" if hint.startswith("local-") else "")),
+            ("PULSES", f"{len(event.pulse_timings_us)} timings"),
+            ("RAW", f"{len(project.capture_bytes(event))} bytes · {event.upload_state}"),
+            ("CLASS", f"{event.classification} ({event.classification_confidence:.0%})"),
+            ("DEVICE", f"{event.device_uuid} / {event.session_id}"),
+        ])
+        if nfc_details:
+            segments.append((nfc_details, None))
         similar = project.similar_events(event, limit=5)
+        segments.append(("\nSIMILAR OBSERVATIONS\n", "head"))
         if similar:
-            data += "\n\nSIMILAR OBSERVATIONS\n"
             for row in similar:
                 comparison = row["comparison"]
                 reasons = "; ".join(comparison.get("reasons", ())) or "no stable feature match"
-                data += (f"{comparison.get('percent', 0)}% · {row['event'].event_id[:16]} · "
-                         f"{comparison.get('relationship_text', 'unknown')}\n"
-                         f"  {reasons}\n")
+                segments += [(f"{comparison.get('percent', 0):>3}%  ", "good"),
+                             (f"{row['event'].event_id[:18]}  {comparison.get('relationship_text', 'unknown')}\n", None),
+                             (f"      {reasons}\n", "muted")]
         else:
-            data += "\n\nSIMILAR OBSERVATIONS\nNo other observations"
-        self.details.configure(state="normal")
-        self.details.delete("1.0", "end")
-        self.details.insert("end", data)
-        self.details.configure(state="disabled")
+            segments.append(("no other observations\n", "muted"))
+        self._write(self.details, segments)
         note = project.note(event.event_id)
         self.note_entry.delete(0, "end")
         self.note_entry.insert(0, note.get("text", ""))

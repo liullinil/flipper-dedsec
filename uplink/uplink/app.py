@@ -483,7 +483,7 @@ def main():
     if not single_instance():
         log.info("another copy is already running")
         return
-    log.info("DedSec Uplink starting on %s (shell=%s cmd_enabled=%s autostart=%s)",
+    log.info("DedSec Uplink %s starting on %s (shell=%s cmd_enabled=%s autostart=%s)", COMPANION_VERSION,
              feed.host, cfg.get("shell"), cfg.get("cmd_enabled"), config.autostart_enabled())
     if args.console:
         run_console(feed)

@@ -22,7 +22,7 @@ import zlib
 REPO = "liullinil/flipper-dedsec"
 ASSET = "dedsec_uplink.fap"
 COMPANION_ASSET = "DedSecUplink.exe"
-COMPANION_VERSION = "1.2.1"
+COMPANION_VERSION = "1.2.2"
 CHECK_EVERY = 30 * 60      # seconds between release checks
 CHUNK = 192                # raw bytes per chunk (256 base64 chars, fits the Flipper's line buffer)
 WINDOW = 4                 # chunks in flight for apps from 1.2.0 on
