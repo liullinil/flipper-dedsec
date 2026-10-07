@@ -591,6 +591,8 @@ def sync_status_text(status: Optional[dict]) -> tuple:
     else:
         pending = status.get("pending")
         parts.append(f"Flipper: {pending if pending is not None else '?'} pending")
+        if status.get("carry"):
+            parts.append(f"carrying {status['carry']} for other PCs")
         if status.get("free_kb") is not None:
             parts.append(f"{_format_kb(status['free_kb'])} free")
         state = STATE_TEXT.get(status.get("state"))
@@ -601,11 +603,20 @@ def sync_status_text(status: Optional[dict]) -> tuple:
     if status.get("syncing"):
         progress = status.get("current_progress") or ""
         parts.append(f"syncing {progress} B" if progress else "syncing…")
+    if status.get("pushing"):
+        parts.append(f"to the Flipper {status.get('push_done', 0)}/{status.get('push_total', 0)}")
     parts.append(f"imported {status.get('imported', 0)} · failed {status.get('failed', 0)}")
+    if status.get("last_push") and not status.get("pushing"):
+        parts.append(f"last transfer {status.get('push_sent', 0)} sent, "
+                     f"{status.get('push_present', 0)} already there")
     if status.get("last_sync"):
         parts.append(f"last sync {_format_local_time(status['last_sync'])}")
-    error = status.get("last_error") or ""
-    return " · ".join(parts), (f"Last error: {error}" if error else "")
+    errors = []
+    if status.get("last_error"):
+        errors.append(f"Last error: {status['last_error']}")
+    if status.get("push_error"):
+        errors.append(f"Transfer to the Flipper: {status['push_error']}")
+    return " · ".join(parts), "   ".join(errors)
 
 
 class AnalyzerWindow:
@@ -749,16 +760,16 @@ class AnalyzerWindow:
 
         toolbar = tk.Frame(window, bg=ui.BG)
         toolbar.pack(fill="x", padx=12, pady=(4, 2))
-        self.sync_button = ui.NeonButton(toolbar, "SYNC NOW", self.sync_now, style="primary").pack(
-            side="left", padx=(0, 8))
+        self.sync_button = ui.NeonButton(toolbar, "FLIPPER → PC", self.sync_now,
+                                         style="primary").pack(side="left", padx=(0, 8))
+        self.push_button = ui.NeonButton(toolbar, "FLIPPER ← PC", self.push_now,
+                                         style="accent").pack(side="left")
         if self.sync is None:
             self.sync_button.state(["disabled"])
-        for label, command in (("OPEN FOLDER", self.open_folder),
-                               ("EXPORT JSON", lambda: self.export("json")),
-                               ("EXPORT CSV", lambda: self.export("csv")),
-                               ("SAVE PROJECT", self.save_project),
-                               ("LOAD PROJECT", self.load_project)):
-            ui.NeonButton(toolbar, label, command).pack(side="left", padx=(0, 6))
+            self.push_button.state(["disabled"])
+        tk.Label(toolbar, text="import the Flipper's records  ·  put this PC's records on the Flipper "
+                               "for another PC", fg=ui.MUTED, bg=ui.BG, font=(ui.MONO, 8)).pack(
+            side="left", padx=(12, 0))
 
         info = tk.Frame(window, bg=ui.BG)
         info.pack(fill="x", padx=12, pady=(6, 2))
@@ -880,12 +891,6 @@ class AnalyzerWindow:
                 log.warning("cannot open RF store %s: %s", path, exc)
             return False
 
-    def open_folder(self):
-        """Open another folder read-only (for example a copied SD-card journal)."""
-        path = self.filedialog.askdirectory(parent=self.window, title="Open RF journal folder (read-only)")
-        if path and self._open_root(path):
-            self.refresh()
-
     def _poll_folders(self):
         """Reload any folder whose journal changed on disk (stat calls only)."""
         try:
@@ -926,6 +931,15 @@ class AnalyzerWindow:
             self._report_error("RF sync failed", exc)
         self._show_sync_status()
 
+    def push_now(self):
+        if self.sync is None:
+            return
+        try:
+            self.sync.push_now()
+        except Exception as exc:
+            self._report_error("Transfer to the Flipper failed", exc)
+        self._show_sync_status()
+
     def _show_sync_status(self):
         status = None
         if self.sync is not None:
@@ -939,7 +953,7 @@ class AnalyzerWindow:
         self.sync_error.configure(text=error)
         if status is None:
             color = ui.MUTED
-        elif status.get("syncing"):
+        elif status.get("syncing") or status.get("pushing"):
             color = ui.MAGENTA
         elif status.get("link_up"):
             color = ui.GREEN
@@ -1299,30 +1313,6 @@ class AnalyzerWindow:
         if self._selected_event:
             self.project.add_note(self._selected_event, self.note_entry.get(), self.location_entry.get())
 
-    def save_project(self):
-        path = self.filedialog.asksaveasfilename(parent=self.window, defaultextension=".rfproject.json",
-                                                 filetypes=[("RF projects", "*.rfproject.json")])
-        if not path:
-            return
-        try:
-            self.project.save_project(path)
-        except Exception as exc:
-            self._report_error("Cannot save project", exc)
-
-    def load_project(self):
-        path = self.filedialog.askopenfilename(parent=self.window,
-                                               filetypes=[("RF projects", "*.rfproject.json"), ("JSON", "*.json")])
-        if not path:
-            return
-        try:
-            self.project.load_project(path)
-        except Exception as exc:
-            self._report_error("Cannot load project", exc)
-        if self.store_root and self.store_root not in self.project.sources:
-            self._open_root(self.store_root, report=False)
-        self._folder_signatures = {root: folder_signature(root) for root in self.project.sources}
-        self.refresh()
-
     def export_follow(self):
         if not self._selected_family:
             self.messagebox.showinfo("Export Follow profile", "Select a signal family first.", parent=self.window)
@@ -1335,18 +1325,6 @@ class AnalyzerWindow:
         except Exception as exc:
             self._report_error("Cannot export Follow profile", exc)
 
-    def export(self, kind):
-        path = self.filedialog.asksaveasfilename(parent=self.window, defaultextension="." + kind,
-                                                 filetypes=[(kind.upper(), "*." + kind)])
-        if not path:
-            return
-        events = self.project.filtered(self._spec())
-        try:
-            (self.project.export_json if kind == "json" else self.project.export_csv)(path, events)
-        except Exception as exc:
-            self._report_error(f"Cannot export {kind.upper()}", exc)
-            return
-        self.status.configure(text=f"Exported {len(events)} observations to {os.path.basename(path)}")
 
 
 # =========================================================================== standalone / CLI

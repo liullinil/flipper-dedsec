@@ -37,6 +37,8 @@ typedef struct {
     uint32_t families; // distinct local fingerprints since start
     uint32_t unseen; // events since the last rf_engine_mark_seen()
     uint32_t pending; // records waiting for upload (files in events/)
+    uint32_t carry; // records a PC put here for another PC (carry/)
+    uint32_t listed; // what the PC on the link can import (pending + others' carried)
     uint32_t errors; // failed journal writes since start
     uint32_t free_kb; // SD free space
     bool storage_full;

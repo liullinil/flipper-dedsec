@@ -3,7 +3,8 @@
 RF Signal Hunter is an **RF tab of the DedSec Uplink Flipper app** and an **RF analyzer window of the
 DedSec Uplink companion**. There is no separate RF Hunter BLE device and the analyzer never opens a
 BLE connection: journal records travel over the companion's existing Uplink link. The binding
-protocol is `docs/rf_integration_contract.md` (v1). Everything is passive; nothing here transmits.
+protocol is [docs/rf_hunter_design.md](../docs/rf_hunter_design.md). Everything is passive; nothing
+here transmits a radio signal.
 
 | Piece | Module | Thread |
 |---|---|---|
@@ -18,11 +19,12 @@ protocol is `docs/rf_integration_contract.md` (v1). Everything is passive; nothi
   (`default_store_root()`), holding `events.jsonl` (one record per line) and
   `captures/<event_id>.bin`, the exact bytes received from the Flipper.
 * **Flipper journal** (SD card): `/ext/apps_data/dedsec_uplink/rf/` with `events/<event_id>.json`
-  (pending upload) and `uploaded/<event_id>.json` (kept after an ACK when "keep uploaded" is on).
+  (pending upload), `uploaded/<event_id>.json` (kept after an ACK when "keep uploaded" is on) and
+  `carry/<pc_id>/<event_id>.json` (records a PC put there for another PC, see below).
   The engine uses this absolute path because `/data` resolves per calling thread.
 * To inspect a card without the link, copy `apps_data/dedsec_uplink/rf` (or the whole card) to the PC
-  and use **Open folder…**. The analyzer accepts the `rf` folder, its `events/` or `uploaded/`
-  sub-folder, `apps_data/dedsec_uplink`, and the card root. Opened folders are read-only.
+  and open it from the command line (below). The analyzer accepts the `rf` folder, its `events/` or
+  `uploaded/` sub-folder, `apps_data/dedsec_uplink`, and the card root. Opened folders are read-only.
 * Journals of the former standalone app are still readable: its `APP_DATA_PATH("rf_signal_hunter")`
   resolved to `/ext/apps_data/rf_signal_hunter/rf_signal_hunter/` (`events/` and `receipts/*.ack`);
   opening `apps_data/rf_signal_hunter` finds it.
@@ -36,19 +38,23 @@ sync = RfSync(default_store_root())   # creates the folder if needed
 # link thread:  for every Flipper line -> sync.handle_line(line.split("|"))  (True = RF line)
 #               every 20-50 ms         -> send each line of sync.urgent_lines()
 # link status:  sync.on_link(True / False)
-# UI thread:    sync.status(), sync.sync_now()
+# UI thread:    sync.status(), sync.sync_now(), sync.push_now()
 ```
 
-`RfSync(store_root, *, clock=time.monotonic, wall_clock=time.time, send_clock=True)` is thread-safe:
-`handle_line` may run on the BLE thread, `urgent_lines` on the link loop and `status`/`sync_now` on
-the UI thread. Store I/O (the fsync before an ACK) runs inside `urgent_lines` without holding the
+`RfSync(store_root, *, clock=time.monotonic, wall_clock=time.time, send_clock=True, pc_id=None)` is
+thread-safe: `handle_line` may run on the BLE thread, `urgent_lines` on the link loop and
+`status`/`sync_now`/`push_now` on the UI thread. `pc_id` (16 hex digits) defaults to a hash of the
+Windows MachineGuid, so it stays the same for the PC and differs between PCs. Store I/O (the fsync before an ACK) runs inside `urgent_lines` without holding the
 lock, so the BLE callback and the UI never wait for the disk. `sync.store` is the `EventStore` it
 writes; readers should open their own read-only `EventStore` on `sync.store_root` (the analyzer does).
 
-Protocol (PC → Flipper `RL|cursor`, `RR|event_id|offset`, `RA|event_id|size|crc32`, `Z|utc|offset`;
-Flipper → PC `R|…`, `RI|…`, `RE`, `RD|…`, `RK|…`, `RX|code|text`):
+Protocol (PC → Flipper `RO|pc_id`, `RL|cursor`, `RR|event_id|offset`, `RA|event_id|size|crc32`,
+`RP|…`, `RW|…`, `Z|utc|offset`; Flipper → PC `R|…`, `RO|…`, `RI|…`, `RE`, `RD|…`, `RK|…`, `RG|…`,
+`RH|…`, `RX|code|text`):
 
-* A round starts when `R|pending` is above 0 or on `sync_now()`. One `RL` is outstanding at a time.
+* A round starts when `R|listed` is above 0 or on `sync_now()`, with `RO|pc_id` so the Flipper also
+  lists what other PCs carried to it (an app before 1.3.0 answers `RX|bad`; the round goes on). One
+  `RL` is outstanding at a time.
 * A record is read with up to four `RR` in flight, matched by offset. A short reply leaves a gap that
   is requested at once; a missing reply is requested again after 3 s; the record is given up after
   20 s. Records of any size (also above 768 bytes) are read completely by offset.
@@ -59,7 +65,7 @@ Flipper → PC `R|…`, `RI|…`, `RE`, `RD|…`, `RK|…`, `RX|code|text`):
 * A record that cannot be imported (malformed JSON, invalid fields, identity mismatch, conflict,
   timeout, rejected ACK) is skipped with `cursor = next`, counted in `failed`, reported in
   `last_error` and stays on the Flipper. Unchanged rejected records are not downloaded again by
-  automatic rounds; **Sync now** retries them.
+  automatic rounds; **FLIPPER → PC** (`sync_now()`) retries them.
 * Already imported: if the stored capture matches size and CRC the record is acknowledged without a
   download; if the stored event has no capture (for example a store built from a copied journal)
   the record is downloaded, attached durably and then acknowledged; a different payload for the
@@ -72,11 +78,32 @@ Flipper → PC `R|…`, `RI|…`, `RE`, `RD|…`, `RK|…`, `RX|code|text`):
 * `Z|utc_unix|tz_offset_min` (the PC clock and local UTC offset) is sent first on every link and
   hourly while connected; pass `send_clock=False` if the companion sends it itself.
 
-`status()` returns `pending`, `stored`, `free_kb`, `state` (0 off, 1 Sub-GHz RX, 2 NFC) and
-`errors` from the last `R|` line (`None` until one arrived), the session totals `imported`, `failed`,
-`skipped` (already imported, acknowledged again) and `conflicts`, plus `last_error` (kept until a
-round finishes without failures), `syncing`, `last_sync` (epoch seconds), `link_up`,
-`current_event`, `current_progress` and `store_root`.
+`status()` returns `pending` (what this PC can import), `stored`, `free_kb`, `state` (0 off,
+1 Sub-GHz RX, 2 NFC), `errors` and `carry` from the last `R|` line (`None` until one arrived), the
+session totals `imported`, `failed`, `skipped` (already imported, acknowledged again) and
+`conflicts`, plus `last_error` (kept until a round finishes without failures), `syncing`,
+`last_sync` (epoch seconds), `link_up`, `current_event`, `current_progress`, `store_root` and the
+push state below.
+
+## Carrying records to another PC (`push_now`)
+
+`push_now()` puts every record of the store on the Flipper so that another PC can import it there:
+the Flipper is the carrier. After `RO|pc_id` each record goes out as `RP|event_id|size|crc32`; the
+Flipper answers `RH` when it already holds the record (pending or carried), otherwise `RG|id|0`, and
+the PC streams `RW|event_id|offset|base64` chunks of 150 bytes, at most four in flight. Every chunk
+is answered with `RG|id|received`; no progress means a lost chunk and the PC sends again from
+`received`, three seconds without progress do the same, and `received == size` means the Flipper
+checked the CRC-32 and committed the record. The bytes are the record exactly as a Flipper wrote it
+(`captures/<event_id>.bin`), so every PC ends up with identical copies; records without a capture go
+as their JSON. A push waits for an import round in progress; `RX|io` (SD card full) or a link drop
+stops it, a refused record is counted and skipped.
+
+On the Flipper the records live in `carry/<pc_id>/`: they are listed, read and acknowledged like its
+own records, but only to a PC that sent `RO`, and never to the PC that brought them. Another PC
+imports them in its normal round; the ACK deletes them (or keeps a copy in `uploaded/`).
+
+Push status: `pushing`, `push_total`, `push_done`, `push_sent`, `push_present` (already on the
+Flipper), `push_failed`, `push_error` and `last_push` (epoch seconds).
 
 ## Event store guarantees (`EventStore`)
 
@@ -104,15 +131,18 @@ window.alive      # False after close
 
 `AnalyzerWindow(parent, store_root, sync=None, *, extra_roots=(), on_close=None, project=None)` builds
 a `tk.Toplevel` on an existing Tk root; all calls must come from that root's thread (the companion's
-single UI thread, shared with the tray panel). It uses its own `RF.*` ttk style names and does
-not change the theme of the shared interpreter.
+single UI thread, shared with the tray panel). It is drawn in the DedSec style with plain Tk
+widgets (`uplink/uplink/dedsec_ui.py`) and only adds `DedSec.*` scrollbar styles to the shared
+interpreter.
 
 * Reloads a folder when its journal changes (stat-only check every 3 s, immediately after `RfSync`
   reports a new import).
-* Shows the `RfSync` status (pending on the Flipper, free space, receiver state, imported/failed,
-  progress, last sync time, last error) and a **Sync now** button. With `sync=None` it is a viewer.
-* **Open folder…** adds a copied journal read-only. Export JSON/CSV writes the filtered view;
-  failures of user actions are shown in a dialog and logged.
+* Shows the `RfSync` status (pending on the Flipper, records carried for other PCs, free space,
+  receiver state, imported/failed, progress of an import or a transfer, last sync time, errors) and
+  two buttons: **FLIPPER → PC** (`sync_now()`) and **FLIPPER ← PC** (`push_now()`). With
+  `sync=None` it is a viewer and both are disabled.
+* Exports and extra read-only folders are on the command line (below); failures of user actions
+  are shown in a dialog and logged.
 * Filters: text, source, **MHz** (`433.92` matches ±0.2 MHz, `433.92+-0.05` sets the tolerance,
   `433-434` is a range), RSSI bounds and **From/To UTC** (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM[:SS]`;
   a date as the end means the whole day). An unreadable filter is reported and ignored.

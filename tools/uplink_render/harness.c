@@ -223,7 +223,6 @@ static void render_all(App* base, int orientation, int font) {
     memcpy(app, base, sizeof(App));
     app->settings.orientation = orientation;
     app->settings.font = font;
-    bool fonts_only = font != FontNormal;
 
     // tabs: SYS CDX CLD CMD = indices 0..3
     app->tab_index = 1;
@@ -237,7 +236,7 @@ static void render_all(App* base, int orientation, int font) {
     app->detail = false;
     app->tab_index = 3;
     render(app, "cmd");
-    if(!fonts_only) {
+    {
         app->tab_index = 0;
         render(app, "sys_bars");
         app->settings.indicators = IndicatorsText;
@@ -258,7 +257,7 @@ static void render_all(App* base, int orientation, int font) {
         app->alert_state = 'I';
         render(app, "alert_turn");
         app->alert_update = true;
-        strlcpy(app->ota.tag, "v1.3.0", sizeof(app->ota.tag));
+        strlcpy(app->ota.tag, "v1.4.0", sizeof(app->ota.tag));
         render(app, "alert_update");
         app->alert = false;
         app->alert_update = false;

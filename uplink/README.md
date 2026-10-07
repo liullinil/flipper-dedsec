@@ -60,8 +60,11 @@ output wrap to the narrow screen. The on-screen keyboard and the settings list s
 
 ![Vertical screens](../docs/uplink_vertical.png)
 
-Four font sizes, all with Cyrillic: **Micro** (4×6, 7 sessions per screen), **Small** (5×7, 6),
-**Normal** (6×12, 5) and **Large** (7×13, 4).
+*Settings → Font size* sets the text of every tab, smallest to largest: **Micro** (4×6, 7 sessions per
+screen), **Small** (5×7, 6), **Normal** (6×12, 5) and **Large** (7×13, 4), all with Cyrillic. SYS
+meters, session lists and details, the console, the RF tab and the alerts follow it and rearrange
+themselves: Large puts the SYS meters in two columns, shortens labels (`FAM`, `PEND`) and drops the key
+hints when the screen runs out. Only the tab bar keeps its size.
 
 ![Font sizes](../docs/uplink_fonts.png)
 
@@ -76,7 +79,7 @@ Saved to `SD/apps_data/dedsec_uplink/.uplink.settings`.
 | LED alerts | on / off |
 | Wake screen on alert | on / off |
 | Indicators | Bars / Text |
-| Font | Normal / Large / Small / Micro |
+| Font size | Micro / Small / Normal / Large — for everything below the tab bar |
 | Orientation | Horizontal / Vertical (main screens) |
 | Tab 1…5 | SYS / CDX / CLD / CMD / RF / Off — order and visibility of the tabs |
 | RF band | All / 433 / 315 / 868 MHz |
@@ -145,8 +148,16 @@ imported twice.
 
 **RF analyzer** (tray panel → *RF Hunter analyzer*): a waterfall of frequency over
 time, a timeline, signal families grouped by structure (carrier, modulation, pulse timing, repetition — not
-by payload or RSSI), similarity explanations, notes and JSON/CSV export. It can also open a copied SD-card
-folder. Details: [RF_HUNTER_ANALYZER.md](RF_HUNTER_ANALYZER.md); the engine:
+by payload or RSSI), similarity explanations and notes. Two buttons:
+
+- **FLIPPER → PC** imports the Flipper's records now (it also happens by itself while connected).
+- **FLIPPER ← PC** puts every record of this PC on the Flipper, to take them to another PC. Connect the
+  Flipper to the other PC's companion and it imports them like the Flipper's own records; then they leave
+  the Flipper (or a copy stays, see *RF after import*). Records the Flipper already holds are skipped, and the
+  PC that brought them never imports them back. The RF tab counts them under PENDING until then.
+
+Exports (JSON/CSV) and copied SD-card folders are on the command line. Details:
+[RF_HUNTER_ANALYZER.md](RF_HUNTER_ANALYZER.md); the engine:
 [RF_ENGINE.md](../apps/dedsec_uplink/RF_ENGINE.md); design and protocol:
 [docs/rf_hunter_design.md](../docs/rf_hunter_design.md).
 

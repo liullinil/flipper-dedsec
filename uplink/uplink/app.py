@@ -18,7 +18,7 @@ from .codex import CodexWatcher
 from .common import ascii_text
 from .frozen import apply_companion_update
 from .link import Link
-from .rf_sync import RfSync
+from .rf_sync import RF_TAGS, RfSync
 from .shell import Shell
 from .session_views import SessionViews
 from .sysmon import SysMon
@@ -35,7 +35,6 @@ CLOCK_EVERY = 600       # seconds between Z| clock lines (the Flipper stamps RF 
 RF_STORE = os.path.join(APP_DIR, "rf_hunter")
 GITHUB_URL = "https://github.com/liullinil/flipper-dedsec"
 UPDATE_TICK = 60       # seconds between automatic update decisions
-RF_TAGS = ("R", "RI", "RE", "RD", "RK", "RX")
 
 log = logging.getLogger("uplink")
 

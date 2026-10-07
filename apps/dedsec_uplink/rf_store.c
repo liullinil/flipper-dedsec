@@ -11,7 +11,9 @@
  *   reset in the middle can be repaired at the next start.
  * - FAT directory lookups are linear and event file names are long, so every
  *   open/stat costs a directory scan.  Reads of the record being synced reuse
- *   one cached handle instead of reopening it for every chunk. */
+ *   one cached handle instead of reopening it for every chunk.
+ * - Carried records are copies a PC put here for another PC (the PC still has
+ *   them), so a broken one is simply deleted instead of quarantined. */
 
 #define RF_STORE_IO_SIZE     512U
 #define RF_STORE_PATH_SIZE   128U
@@ -28,14 +30,36 @@ typedef struct {
     bool used;
 } RfStoreRecent;
 
+typedef enum {
+    RfWhereEvents, /* events/: recorded by this Flipper */
+    RfWhereCarry, /* carry/<pc>/: brought by another PC than the peer */
+    RfWhereOwn, /* carry/<peer>/: brought by the peer itself */
+} RfWhere;
+
 struct RfStore {
     Storage* storage;
-    File* cache; /* read handle of cache_id in events/ */
+    File* cache; /* read handle of cache_id (cache_path) */
     bool cache_open;
     char cache_id[RF_STORE_ID_MAX + 1];
+    char cache_path[RF_STORE_PATH_SIZE];
+    uint8_t cache_where; /* RfWhere */
     uint32_t cache_size;
     uint32_t pending;
     uint32_t uploaded;
+    uint32_t carry; /* files in carry/<any>/ */
+    uint32_t carry_own; /* files in carry/<peer>/ */
+    char peer[RF_STORE_PEER_MAX + 1]; /* the PC on the link, "" = unknown */
+    char origin[RF_STORE_NAME_SIZE]; /* a carry/ folder name while walking them */
+    File* put; /* the record being received from the peer */
+    bool put_open;
+    char put_id[RF_STORE_ID_MAX + 1];
+    char put_path[RF_STORE_PATH_SIZE];
+    uint32_t put_size;
+    uint32_t put_crc;
+    uint32_t put_done;
+    uint32_t put_value; /* CRC-32 so far */
+    uint8_t put_first;
+    uint8_t put_tail[2];
     uint32_t free_kb;
     bool free_known;
     char device_id[17];
@@ -92,8 +116,26 @@ bool rf_store_valid_id(const char* id) {
     return n > 0;
 }
 
+bool rf_store_valid_peer(const char* pc_id) {
+    if(!pc_id) return false;
+    size_t n = 0;
+    for(; pc_id[n]; n++) {
+        if(n >= RF_STORE_PEER_MAX) return false;
+        char c = pc_id[n];
+        if(!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return n >= 8;
+}
+
 static bool rf_store_path(char* out, const char* dir, const char* id, const char* suffix) {
     int n = snprintf(out, RF_STORE_PATH_SIZE, "%s/%s%s", dir, id, suffix);
+    return n > 0 && (size_t)n < RF_STORE_PATH_SIZE;
+}
+
+/* carry/<pc> (id == NULL) or carry/<pc>/<id>.json */
+static bool rf_store_carry_path(char* out, const char* pc_id, const char* id) {
+    int n = id ? snprintf(out, RF_STORE_PATH_SIZE, "%s/%s/%s.json", RF_STORE_CARRY_DIR, pc_id, id) :
+                 snprintf(out, RF_STORE_PATH_SIZE, "%s/%s", RF_STORE_CARRY_DIR, pc_id);
     return n > 0 && (size_t)n < RF_STORE_PATH_SIZE;
 }
 
@@ -119,10 +161,44 @@ static void rf_store_cache_close(RfStore* store) {
     store->cache_size = 0;
 }
 
-static RfStoreResult rf_store_cache_open(RfStore* store, const char* id) {
-    if(store->cache_open && strcmp(store->cache_id, id) == 0) return RfStoreOk;
-    rf_store_cache_close(store);
+/* Where record `id` is: events/ first, then the carry/ folders; the path is left in
+ * store->path. */
+static RfStoreResult rf_store_locate(RfStore* store, const char* id, uint8_t* where) {
     if(!rf_store_path(store->path, RF_STORE_EVENTS_DIR, id, ".json")) return RfStoreErrInvalid;
+    FileInfo info;
+    FS_Error error = storage_common_stat(store->storage, store->path, &info);
+    if(error == FSE_OK) {
+        *where = RfWhereEvents;
+        return RfStoreOk;
+    }
+    if(error != FSE_NOT_EXIST) return RfStoreErrIo;
+    RfStoreResult result = RfStoreErrNotFound;
+    File* dir = storage_file_alloc(store->storage);
+    if(storage_dir_open(dir, RF_STORE_CARRY_DIR)) {
+        while(result == RfStoreErrNotFound &&
+              storage_dir_read(dir, &info, store->origin, sizeof(store->origin))) {
+            if(!(info.flags & FSF_DIRECTORY) || !rf_store_valid_peer(store->origin) ||
+               !rf_store_carry_path(store->path, store->origin, id)) {
+                continue;
+            }
+            FileInfo file_info;
+            error = storage_common_stat(store->storage, store->path, &file_info);
+            if(error == FSE_OK) {
+                result = RfStoreOk;
+                *where = strcmp(store->origin, store->peer) == 0 ? RfWhereOwn : RfWhereCarry;
+            } else if(error != FSE_NOT_EXIST) {
+                result = RfStoreErrIo;
+            }
+        }
+        storage_dir_close(dir);
+    }
+    storage_file_free(dir);
+    return result;
+}
+
+/* Opens store->path as the cached record `id`. */
+static RfStoreResult rf_store_cache_open_path(RfStore* store, const char* id, uint8_t where) {
+    rf_store_cache_close(store);
     if(!storage_file_open(store->cache, store->path, FSAM_READ, FSOM_OPEN_EXISTING)) {
         FS_Error error = storage_file_get_error(store->cache);
         if(storage_file_is_open(store->cache)) storage_file_close(store->cache);
@@ -131,9 +207,20 @@ static RfStoreResult rf_store_cache_open(RfStore* store, const char* id) {
     uint64_t size = storage_file_size(store->cache);
     store->cache_open = true;
     store->cache_size = size > UINT32_MAX ? UINT32_MAX : (uint32_t)size;
+    store->cache_where = where;
     strncpy(store->cache_id, id, RF_STORE_ID_MAX);
     store->cache_id[RF_STORE_ID_MAX] = '\0';
+    memcpy(store->cache_path, store->path, RF_STORE_PATH_SIZE);
     return RfStoreOk;
+}
+
+static RfStoreResult rf_store_cache_open(RfStore* store, const char* id) {
+    if(store->cache_open && strcmp(store->cache_id, id) == 0) return RfStoreOk;
+    rf_store_cache_close(store);
+    uint8_t where = RfWhereEvents;
+    RfStoreResult result = rf_store_locate(store, id, &where);
+    if(result != RfStoreOk) return result;
+    return rf_store_cache_open_path(store, id, where);
 }
 
 /* Stream a whole open file through CRC-32 and check that it looks like one
@@ -291,7 +378,8 @@ static void rf_store_recover(RfStore* store) {
             storage_common_remove(store->storage, store->path);
         }
     } else if(op == 'M') {
-        if(storage_common_exists(store->storage, store->path) &&
+        uint8_t where = RfWhereEvents;
+        if(rf_store_locate(store, id, &where) == RfStoreOk &&
            rf_store_path(store->path2, RF_STORE_UPLOADED_DIR, id, ".json")) {
             storage_common_remove(store->storage, store->path2);
         }
@@ -342,6 +430,66 @@ static bool rf_store_quarantine(RfStore* store, const char* id) {
     if(storage_common_rename(store->storage, store->path, store->path2) != FSE_OK) return false;
     if(store->pending) store->pending--;
     return true;
+}
+
+static void rf_store_carry_removed(RfStore* store, uint8_t where) {
+    if(store->carry) store->carry--;
+    if(where == RfWhereOwn && store->carry_own) store->carry_own--;
+}
+
+/* The cached record is no complete JSON record: pending ones are quarantined, carried copies
+ * (the PC that brought them still has the original) deleted. */
+static bool rf_store_drop_broken(RfStore* store, const char* id) {
+    if(store->cache_where == RfWhereEvents) return rf_store_quarantine(store, id);
+    uint8_t where = store->cache_where;
+    memcpy(store->path, store->cache_path, RF_STORE_PATH_SIZE);
+    rf_store_cache_close(store);
+    FURI_LOG_W("RfStore", "dropping broken carried record %s", id);
+    if(storage_common_remove(store->storage, store->path) != FSE_OK) return false;
+    rf_store_carry_removed(store, where);
+    return true;
+}
+
+/* carried records per origin; carry_own for the peer's folder */
+static void rf_store_count_carry(RfStore* store) {
+    store->carry = 0;
+    store->carry_own = 0;
+    File* dir = storage_file_alloc(store->storage);
+    if(storage_dir_open(dir, RF_STORE_CARRY_DIR)) {
+        FileInfo info;
+        while(storage_dir_read(dir, &info, store->origin, sizeof(store->origin))) {
+            if(!(info.flags & FSF_DIRECTORY) || !rf_store_valid_peer(store->origin) ||
+               !rf_store_carry_path(store->path2, store->origin, NULL)) {
+                continue;
+            }
+            uint32_t count = rf_store_count(store, store->path2);
+            store->carry += count;
+            if(strcmp(store->origin, store->peer) == 0) store->carry_own = count;
+        }
+        storage_dir_close(dir);
+    }
+    storage_file_free(dir);
+}
+
+static void rf_store_put_abort(RfStore* store) {
+    if(!store->put_open) return;
+    storage_file_close(store->put);
+    store->put_open = false;
+    storage_common_remove(store->storage, store->put_path);
+}
+
+/* Size, CRC-32 and shape of a stored file. */
+static RfStoreResult
+    rf_store_check_file(RfStore* store, const char* path, uint32_t* size, uint32_t* crc, bool* complete) {
+    File* file = storage_file_alloc(store->storage);
+    RfStoreResult result = RfStoreErrIo;
+    if(storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        uint64_t length = storage_file_size(file);
+        *size = length > UINT32_MAX ? UINT32_MAX : (uint32_t)length;
+        result = rf_store_digest(store, file, *size, crc, complete);
+    }
+    rf_store_file_done(file);
+    return result;
 }
 
 static RfStoreResult rf_store_copy_to_uploaded(
@@ -412,13 +560,16 @@ RfStore* rf_store_alloc(Storage* storage) {
     memset(store, 0, sizeof(RfStore));
     store->storage = storage;
     store->cache = storage_file_alloc(storage);
+    store->put = storage_file_alloc(storage);
     return store;
 }
 
 void rf_store_free(RfStore* store) {
     if(!store) return;
     rf_store_cache_close(store);
+    rf_store_put_abort(store);
     storage_file_free(store->cache);
+    storage_file_free(store->put);
     free(store);
 }
 
@@ -428,10 +579,12 @@ void rf_store_open(RfStore* store) {
     storage_common_mkdir(store->storage, RF_STORE_ROOT);
     storage_common_mkdir(store->storage, RF_STORE_EVENTS_DIR);
     storage_common_mkdir(store->storage, RF_STORE_UPLOADED_DIR);
+    storage_common_mkdir(store->storage, RF_STORE_CARRY_DIR);
     rf_store_load_device_id(store);
     rf_store_recover(store);
     store->pending = rf_store_count(store, RF_STORE_EVENTS_DIR);
     store->uploaded = rf_store_count(store, RF_STORE_UPLOADED_DIR);
+    rf_store_count_carry(store);
     if(store->uploaded > RF_STORE_UPLOADED_MAX) {
         rf_store_prune_uploaded(store, RF_STORE_UPLOADED_MAX);
     }
@@ -440,6 +593,7 @@ void rf_store_open(RfStore* store) {
 
 void rf_store_idle(RfStore* store) {
     rf_store_cache_close(store);
+    rf_store_put_abort(store); /* the PC went quiet in the middle of a record */
 }
 
 const char* rf_store_device_id(const RfStore* store) {
@@ -451,7 +605,16 @@ uint32_t rf_store_pending(const RfStore* store) {
 }
 
 uint32_t rf_store_stored(const RfStore* store) {
-    return store->pending + store->uploaded;
+    return store->pending + store->uploaded + store->carry;
+}
+
+uint32_t rf_store_carry(const RfStore* store) {
+    return store->carry;
+}
+
+uint32_t rf_store_listed(const RfStore* store) {
+    if(!store->peer[0]) return store->pending;
+    return store->pending + (store->carry > store->carry_own ? store->carry - store->carry_own : 0);
 }
 
 uint32_t rf_store_free_kb(const RfStore* store) {
@@ -504,6 +667,59 @@ RfStoreResult rf_store_save(RfStore* store, const char* id, const char* data, si
     return RfStoreOk;
 }
 
+/* The record at index `cursor` (events/, then the other PCs' carry/ folders); its path is
+ * left in store->path. */
+static RfStoreResult rf_store_find(RfStore* store, uint32_t cursor, char* id, uint8_t* where) {
+    uint32_t index = 0;
+    bool found = false;
+    File* dir = storage_file_alloc(store->storage);
+    bool opened = storage_dir_open(dir, RF_STORE_EVENTS_DIR);
+    if(opened) {
+        FileInfo info;
+        while(!found && storage_dir_read(dir, &info, store->name, sizeof(store->name))) {
+            if(info.flags & FSF_DIRECTORY) continue;
+            if(!rf_store_name_to_id(store->name, id)) continue;
+            found = index++ == cursor;
+        }
+        storage_dir_close(dir);
+    }
+    storage_file_free(dir);
+    if(!opened) return RfStoreErrIo;
+    if(found) {
+        *where = RfWhereEvents;
+        return rf_store_path(store->path, RF_STORE_EVENTS_DIR, id, ".json") ? RfStoreOk :
+                                                                              RfStoreErrInvalid;
+    }
+    if(!store->peer[0]) return RfStoreErrNotFound; /* carried records only for a known PC */
+    dir = storage_file_alloc(store->storage);
+    if(storage_dir_open(dir, RF_STORE_CARRY_DIR)) {
+        FileInfo info;
+        while(!found && storage_dir_read(dir, &info, store->origin, sizeof(store->origin))) {
+            if(!(info.flags & FSF_DIRECTORY) || !rf_store_valid_peer(store->origin) ||
+               strcmp(store->origin, store->peer) == 0 ||
+               !rf_store_carry_path(store->path2, store->origin, NULL)) {
+                continue;
+            }
+            File* inner = storage_file_alloc(store->storage);
+            if(storage_dir_open(inner, store->path2)) {
+                FileInfo entry;
+                while(!found && storage_dir_read(inner, &entry, store->name, sizeof(store->name))) {
+                    if(entry.flags & FSF_DIRECTORY) continue;
+                    if(!rf_store_name_to_id(store->name, id)) continue;
+                    found = index++ == cursor;
+                }
+                storage_dir_close(inner);
+            }
+            storage_file_free(inner);
+        }
+        storage_dir_close(dir);
+    }
+    storage_file_free(dir);
+    if(!found) return RfStoreErrNotFound;
+    *where = RfWhereCarry;
+    return rf_store_carry_path(store->path, store->origin, id) ? RfStoreOk : RfStoreErrInvalid;
+}
+
 RfStoreResult rf_store_list(
     RfStore* store,
     uint32_t cursor,
@@ -514,26 +730,10 @@ RfStoreResult rf_store_list(
     if(!id || id_size < RF_STORE_ID_MAX + 1) return RfStoreErrInvalid;
     for(uint8_t attempt = 0; attempt < 8; attempt++) {
         rf_store_cache_close(store);
-        bool found = false;
-        File* dir = storage_file_alloc(store->storage);
-        bool opened = storage_dir_open(dir, RF_STORE_EVENTS_DIR);
-        if(opened) {
-            FileInfo info;
-            uint32_t index = 0;
-            while(storage_dir_read(dir, &info, store->name, sizeof(store->name))) {
-                if(info.flags & FSF_DIRECTORY) continue;
-                if(!rf_store_name_to_id(store->name, id)) continue;
-                if(index++ == cursor) {
-                    found = true;
-                    break;
-                }
-            }
-            storage_dir_close(dir);
-        }
-        storage_file_free(dir);
-        if(!opened) return RfStoreErrIo;
-        if(!found) return RfStoreErrNotFound;
-        RfStoreResult result = rf_store_cache_open(store, id);
+        uint8_t where = RfWhereEvents;
+        RfStoreResult result = rf_store_find(store, cursor, id, &where);
+        if(result != RfStoreOk) return result;
+        result = rf_store_cache_open_path(store, id, where);
         if(result != RfStoreOk) return result;
         bool complete = false;
         result = rf_store_digest(store, store->cache, store->cache_size, crc32, &complete);
@@ -545,8 +745,8 @@ RfStoreResult rf_store_list(
             *size = store->cache_size;
             return RfStoreOk;
         }
-        if(!rf_store_quarantine(store, id)) return RfStoreErrIo;
-        /* The next record now has this directory index. */
+        if(!rf_store_drop_broken(store, id)) return RfStoreErrIo;
+        /* The next record now has this index. */
     }
     return RfStoreErrIo;
 }
@@ -587,12 +787,13 @@ RfStoreResult
     uint32_t actual_size = store->cache_size, actual_crc = 0;
     bool complete = false;
     result = rf_store_digest(store, store->cache, actual_size, &actual_crc, &complete);
+    uint8_t where = store->cache_where;
+    memcpy(store->path, store->cache_path, RF_STORE_PATH_SIZE);
     rf_store_cache_close(store); /* a file cannot be removed while open */
     if(result != RfStoreOk) return result;
     if(actual_size != size || actual_crc != crc32 || actual_size > RF_STORE_RECORD_MAX) {
         return RfStoreErrMismatch;
     }
-    if(!rf_store_path(store->path, RF_STORE_EVENTS_DIR, id, ".json")) return RfStoreErrInvalid;
     bool fresh = false;
     if(keep) {
         if(!rf_store_mark(store, 'M', id)) return RfStoreErrIo;
@@ -604,10 +805,120 @@ RfStoreResult
         /* Still pending; a kept copy is replaced by the next ACK attempt. */
         return RfStoreErrIo;
     }
-    if(store->pending) store->pending--;
+    if(where == RfWhereEvents) {
+        if(store->pending) store->pending--;
+    } else {
+        rf_store_carry_removed(store, where);
+    }
     rf_store_remember(store, id, size, crc32);
     if(store->uploaded > RF_STORE_UPLOADED_MAX) {
         rf_store_prune_uploaded(store, RF_STORE_UPLOADED_MAX);
     }
+    return RfStoreOk;
+}
+
+/* ------------------------------------------------------------------ carrying for a PC */
+
+bool rf_store_set_peer(RfStore* store, const char* pc_id) {
+    if(!pc_id) pc_id = "";
+    if(pc_id[0] && !rf_store_valid_peer(pc_id)) return false;
+    if(strcmp(store->peer, pc_id) != 0) {
+        rf_store_put_abort(store); /* it belongs to the previous PC */
+        strncpy(store->peer, pc_id, RF_STORE_PEER_MAX);
+        store->peer[RF_STORE_PEER_MAX] = '\0';
+        rf_store_count_carry(store);
+    }
+    return true;
+}
+
+RfStoreResult rf_store_put_begin(RfStore* store, const char* id, uint32_t size, uint32_t crc32) {
+    rf_store_put_abort(store);
+    if(!store->peer[0]) return RfStoreErrNoPeer;
+    if(!rf_store_valid_id(id) || size < 2 || size > RF_STORE_RECORD_MAX) return RfStoreErrInvalid;
+    rf_store_cache_close(store);
+    uint8_t where = RfWhereEvents;
+    RfStoreResult result = rf_store_locate(store, id, &where);
+    if(result == RfStoreOk) {
+        /* already here, pending or carried: nothing to send */
+        uint32_t have_size = 0, have_crc = 0;
+        bool complete = false;
+        result = rf_store_check_file(store, store->path, &have_size, &have_crc, &complete);
+        if(result != RfStoreOk) return result;
+        if(complete && have_size == size && have_crc == crc32) return RfStoreErrExists;
+        /* An event id never changes its record; only an unfinished copy of this PC's own
+         * earlier transfer is replaced. */
+        if(complete || where != RfWhereOwn) return RfStoreErrMismatch;
+        rf_store_carry_removed(store, where);
+    } else if(result != RfStoreErrNotFound) {
+        return result;
+    }
+    if(!rf_store_space_ok(store, size)) return RfStoreErrLowSpace;
+    if(!rf_store_carry_path(store->put_path, store->peer, NULL)) return RfStoreErrInvalid;
+    storage_common_mkdir(store->storage, RF_STORE_CARRY_DIR);
+    storage_common_mkdir(store->storage, store->put_path);
+    if(!rf_store_carry_path(store->put_path, store->peer, id)) return RfStoreErrInvalid;
+    if(!storage_file_open(store->put, store->put_path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        if(storage_file_is_open(store->put)) storage_file_close(store->put);
+        return RfStoreErrIo;
+    }
+    store->put_open = true;
+    strncpy(store->put_id, id, RF_STORE_ID_MAX);
+    store->put_id[RF_STORE_ID_MAX] = '\0';
+    store->put_size = size;
+    store->put_crc = crc32;
+    store->put_done = 0;
+    store->put_value = 0;
+    store->put_first = 0;
+    store->put_tail[0] = store->put_tail[1] = 0;
+    return RfStoreOk;
+}
+
+RfStoreResult rf_store_put_write(
+    RfStore* store,
+    const char* id,
+    uint32_t offset,
+    const uint8_t* data,
+    size_t length,
+    uint32_t* received) {
+    *received = 0;
+    if(!store->put_open || strcmp(store->put_id, id) != 0) return RfStoreErrNotFound;
+    *received = store->put_done;
+    if(offset != store->put_done) return RfStoreOk; /* a repeat or a gap: resend from here */
+    if(!data || !length || length > store->put_size - store->put_done) {
+        rf_store_put_abort(store);
+        *received = 0;
+        return RfStoreErrInvalid;
+    }
+    if(storage_file_write(store->put, data, length) != length) {
+        rf_store_put_abort(store);
+        *received = 0;
+        return RfStoreErrIo;
+    }
+    if(!store->put_done) store->put_first = data[0];
+    if(length >= 2) {
+        store->put_tail[0] = data[length - 2];
+        store->put_tail[1] = data[length - 1];
+    } else {
+        store->put_tail[0] = store->put_tail[1];
+        store->put_tail[1] = data[0];
+    }
+    store->put_value = rf_store_crc32(store->put_value, data, length);
+    store->put_done += (uint32_t)length;
+    *received = store->put_done;
+    if(store->put_done < store->put_size) return RfStoreOk;
+    bool ok = store->put_value == store->put_crc && store->put_first == '{' &&
+              store->put_tail[0] == '}' && store->put_tail[1] == '\n' &&
+              storage_file_sync(store->put);
+    storage_file_close(store->put);
+    store->put_open = false;
+    if(!ok) {
+        storage_common_remove(store->storage, store->put_path);
+        *received = 0;
+        return RfStoreErrMismatch;
+    }
+    store->carry++;
+    store->carry_own++;
+    uint32_t used_kb = (store->put_size + 1023U) / 1024U;
+    store->free_kb = store->free_kb > used_kb ? store->free_kb - used_kb : 0;
     return RfStoreOk;
 }

@@ -254,6 +254,18 @@ def test_sync_status_text_summarizes_rfsync_status():
     assert "Viewer only" in sync_status_text(None)[0]
 
 
+def test_sync_status_text_shows_carried_records_and_the_transfer():
+    summary, error = sync_status_text({"link_up": True, "pending": 0, "carry": 7, "free_kb": 2048,
+                                       "state": 1, "errors": 0, "imported": 1, "failed": 0,
+                                       "pushing": True, "push_done": 3, "push_total": 9,
+                                       "push_error": "the Flipper refused x"})
+    assert "carrying 7 for other PCs" in summary and "to the Flipper 3/9" in summary
+    assert error == "Transfer to the Flipper: the Flipper refused x"
+    summary, error = sync_status_text({"link_up": True, "pending": 0, "pushing": False, "last_push": 1.0,
+                                       "push_sent": 5, "push_present": 2})
+    assert "last transfer 5 sent, 2 already there" in summary and error == ""
+
+
 def test_main_exports_and_survives_windowed_python(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "appdata"))
     store = EventStore(tmp_path / "store")
@@ -286,6 +298,9 @@ class FakeSync:
     def sync_now(self):
         self.calls += 1
 
+    def push_now(self):
+        self.pushes = getattr(self, "pushes", 0) + 1
+
 
 def test_analyzer_window_smoke(tmp_path):
     tk = pytest.importorskip("tkinter")
@@ -315,6 +330,8 @@ def test_analyzer_window_smoke(tmp_path):
         assert "read-only" in window.store_label.cget("text")
         window.sync_now()
         assert sync.calls == 1
+        window.push_now()
+        assert sync.pushes == 1
 
         # A record committed by the companion shows up after the folder poll.
         writer.add(RfEvent.from_dict(_flipper_record(9)), b"raw")

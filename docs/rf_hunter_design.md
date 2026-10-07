@@ -67,8 +67,10 @@ void rf_engine_status_line(RfEngine* engine, char* out, size_t size); // formats
 ```
 
 Callbacks run on the engine thread; `uplink.c` queues reply lines and sends them from its own thread.
-Journal folder: `EXT_PATH("apps_data/dedsec_uplink/rf")` with `events/`, `uploaded/` (absolute paths,
-never `/data`, because `/data` resolves per calling thread).
+Journal folder: `EXT_PATH("apps_data/dedsec_uplink/rf")` with `events/`, `uploaded/` and
+`carry/<pc_id>/` (absolute paths, never `/data`, because `/data` resolves per calling thread).
+`RfStatus` also has `carry` (records a PC left here for another PC) and `listed` (what the PC on the
+link can import: pending plus the records other PCs carried here).
 
 ## 2. Protocol over the Uplink link
 
@@ -77,29 +79,49 @@ Text lines, `|`-separated. Flipper → PC lines are BLE notifications of at most
 PC → Flipper:
 
 ```
-RL|cursor                   list: the pending record at directory index `cursor` (0 = first)
+RO|pc_id                    who the PC is (8-16 hex digits); sent before every round and every push
+RL|cursor                   list: the record at index `cursor` (0 = first) of the pending records,
+                            then of the records other PCs carried here
 RR|event_id|offset          read up to 120 bytes of a record from `offset` (the PC may pipeline up to 4)
 RA|event_id|size|crc32      acknowledge a durably imported record (size and crc32 must match)
+RP|event_id|size|crc32      carry: the PC is about to put one of its records on the Flipper
+RW|event_id|offset|base64   carry: the next bytes of that record, n <= 180, in order (up to 4 in flight)
 Z|utc_unix|tz_offset_min    PC clock: UTC seconds and the PC's local offset (for RF timestamps)
 ```
 
 Flipper → PC:
 
 ```
-R|pending|stored|free_kb|state|errors    RF journal status (link up, when pending changes, every 10 s)
-                                          state: 0 off, 1 Sub-GHz RX, 2 NFC detect
+R|listed|stored|free_kb|state|errors|carry   RF journal status (link up, when it changes, every 10 s)
+                                          listed: what this PC can import; state: 0 off,
+                                          1 Sub-GHz RX, 2 NFC detect; carry: records carried here
+RO|listed|carry                           reply to RO
 RI|next|event_id|size|crc32              reply to RL; `next` is the cursor of the following record
 RE                                        reply to RL: no record at that cursor
 RD|event_id|offset|base64                 reply to RR: bytes [offset, offset + n), n <= 120
 RK|event_id                               reply to RA: record moved to uploaded/ or deleted
+RG|event_id|received                      reply to RP (0) and to every RW: bytes stored so far;
+                                          received == size: verified and committed
+RH|event_id                               reply to RP: the Flipper already holds this record
 RX|code|text                              a request failed: nf (not found), bad (malformed/mismatch),
-                                          io (SD error), off (RF sync disabled on the Flipper)
+                                          io (SD error), off (RF sync disabled on the Flipper);
+                                          the text starts with the event id when there is one
 ```
 
-Sync loop (PC): `cursor = 0`; `RL|cursor` → `RE` ends the round; on `RI` read all bytes with `RR`,
-check size + crc32 (`binascii.crc32`, unsigned decimal), commit the record durably on the PC (fsync),
-then `RA` and wait for `RK` — the record leaves `events/`, so the cursor stays the same. If a record
-cannot be imported, skip it with `cursor = next`. A new round starts whenever `R|pending` > 0.
+Sync loop (PC): `RO|pc_id`, then `cursor = 0`; `RL|cursor` → `RE` ends the round; on `RI` read all
+bytes with `RR`, check size + crc32 (`binascii.crc32`, unsigned decimal), commit the record durably on
+the PC (fsync), then `RA` and wait for `RK` — the record leaves the Flipper, so the cursor stays the
+same. If a record cannot be imported, skip it with `cursor = next`. A new round starts whenever
+`R|listed` > 0. A Flipper app before 1.3.0 answers `RO` with `RX|bad` and the round goes on.
+
+Carrying (PC → Flipper → another PC): the PC sends `RO`, then for each of its records `RP`; on
+`RH` it skips the record, on `RG|id|0` it streams `RW` chunks. The Flipper writes them to
+`carry/<pc_id>/<event_id>.json` strictly in order and answers every chunk with the bytes it holds,
+so a lost chunk shows up as no progress and the PC sends again from there; at the announced size
+it checks the CRC-32 and the JSON shape (`{` … `}\n`) and commits. A record left unfinished (the PC
+went quiet for 3 s, or another `RP` came) is deleted. Carried records are listed, read and
+acknowledged like pending ones, but only to a PC that sent `RO`, and never to the PC that brought
+them; a broken carried copy is deleted instead of quarantined (the PC that brought it still has it).
 
 Records: one UTF-8 JSON object per event, unchanged from the former standalone app
 (`schema_version, event_id, device_uuid, session_id, sequence_number, captured_at_utc,
@@ -117,8 +139,12 @@ class RfSync:
     def urgent_lines(self) -> list: ...               # lines to send now (polled every 20–50 ms by the link)
     def on_link(self, up: bool) -> None: ...           # link up/down (abort the round on down)
     def sync_now(self) -> None: ...                    # start a round even if pending looks 0
+    def push_now(self) -> None: ...                    # carry every record of the store to the Flipper
     def status(self) -> dict: ...                      # {"pending", "stored", "free_kb", "state", "errors",
-                                                       #  "imported", "failed", "last_error", "syncing", "last_sync"}
+                                                       #  "carry", "imported", "failed", "last_error",
+                                                       #  "syncing", "last_sync", "pushing", "push_total",
+                                                       #  "push_done", "push_sent", "push_present",
+                                                       #  "push_failed", "push_error", "last_push"}
     store: EventStore                                  # the analyzer reads from the same folder
 ```
 
@@ -126,6 +152,7 @@ class RfSync:
 
 `AnalyzerWindow(parent, store_root, sync=None)` builds a `tk.Toplevel` on an existing Tk root that the
 companion runs in its single UI thread (the tray panel lives in the same thread). It reloads the
-store when the folder changes (poll every few seconds), shows `sync.status()` and offers "Sync now"
-(`sync.sync_now()`); it never opens its own BLE connection. `main(argv)` keeps the CLI (export,
+store when the folder changes (poll every few seconds), shows `sync.status()` and offers two buttons:
+**FLIPPER → PC** (`sync.sync_now()`) and **FLIPPER ← PC** (`sync.push_now()`); it never opens its own
+BLE connection. `main(argv)` keeps the CLI (export,
 standalone viewer).

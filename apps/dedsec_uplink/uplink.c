@@ -163,7 +163,8 @@ typedef struct {
     char rf_line[256];
     uint16_t rf_line_len;
     uint32_t rf_status_tick; // last R| line sent to the PC
-    uint32_t rf_status_pending; // pending count in that line
+    uint32_t rf_status_listed; // listed count in that line
+    uint32_t rf_status_carry; // carried count in that line
     // At most one EvRf and one EvRfTx wait in the dispatcher queue: posting blocks when the
     // queue is full, and after view_dispatcher_run returns nobody drains it any more.
     volatile bool rf_event_posted;
@@ -335,18 +336,20 @@ static void clean_copy(char* dst, size_t size, const char* src) {
 }
 
 /* ---- text fonts: every size carries Latin + Cyrillic (u8g2 fonts embedded in the .fap).
- * Names, details and console output use them; fixed English labels use FontSecondary. */
+ * The size picked in the settings is used for everything below the tab bar; the tab bar and
+ * the system panels (update, offline) keep the firmware fonts. All four are monospace. */
 typedef struct {
     const uint8_t* font;
-    uint8_t row; // list row height
+    uint8_t cap; // height of capitals and digits: AlignTop puts their top at y
     uint8_t line; // line step for wrapped text and the console
+    uint8_t row; // list row height
 } TextFont;
 
 static const TextFont text_fonts[] = {
-    [FontNormal] = {u8g2_font_uplink_6x12, 10, 9},
-    [FontLarge] = {u8g2_font_uplink_7x13, 13, 11},
-    [FontSmall] = {u8g2_font_uplink_5x7, 8, 8},
-    [FontMicro] = {u8g2_font_uplink_4x6, 7, 7},
+    [FontNormal] = {u8g2_font_uplink_6x12, 7, 9, 10},
+    [FontLarge] = {u8g2_font_uplink_7x13, 9, 11, 13},
+    [FontSmall] = {u8g2_font_uplink_5x7, 6, 8, 8},
+    [FontMicro] = {u8g2_font_uplink_4x6, 5, 7, 7},
 };
 
 static const TextFont* text_font(const App* app) {
@@ -358,9 +361,15 @@ static void font_text(Canvas* c, const App* app) {
     canvas_set_custom_u8g2_font(c, text_font(app)->font);
 }
 
-/* small print for secondary info; FontSecondary has no Cyrillic, so Cyrillic text uses 4x6 */
-static void font_info(Canvas* c) {
-    canvas_set_custom_u8g2_font(c, u8g2_font_uplink_4x6);
+static int text_width(Canvas* c, const char* s) {
+    return canvas_string_width(c, s);
+}
+
+/* the first of the texts that fits into w pixels with the current font, else the last one */
+static const char* first_fit(Canvas* c, int w, const char* const* texts, size_t count) {
+    for(size_t i = 0; i + 1 < count; i++)
+        if(text_width(c, texts[i]) <= w) return texts[i];
+    return texts[count - 1];
 }
 
 /* one UTF-8 character at p: its code point and its length in bytes (always >= 1) */
@@ -453,6 +462,38 @@ static int draw_wrapped(
         p = next;
     }
     return total;
+}
+
+/* Word-wraps text into w pixels and draws it centred on cx from y down (draw = false only
+ * counts the lines). Returns the number of lines. */
+static int draw_centered(Canvas* c, int cx, int y, int w, const char* text, int step, bool draw) {
+    char buf[64];
+    const char* p = text;
+    int lines = 0;
+    while(*p) {
+        const char* next;
+        size_t n = wrap_fit(c, p, w, &next);
+        while(n && p[n - 1] == ' ')
+            n--;
+        if(n >= sizeof(buf)) n = sizeof(buf) - 1;
+        if(draw) {
+            memcpy(buf, p, n);
+            buf[n] = 0;
+            canvas_draw_str_aligned(c, cx, y + lines * step, AlignCenter, AlignTop, buf);
+        }
+        lines++;
+        p = next;
+    }
+    return lines;
+}
+
+/* a short message in the middle of the area under the tab bar */
+static void draw_message(Canvas* c, const App* app, const char* text) {
+    int W = canvas_width(c), H = canvas_height(c);
+    int step = text_font(app)->line + 1;
+    font_text(c, app);
+    int lines = draw_centered(c, W / 2, 0, W - 4, text, step, false);
+    draw_centered(c, W / 2, 11 + (H - 11 - lines * step) / 2, W - 4, text, step, true);
 }
 
 static const char* state_text(char st) {
@@ -884,7 +925,8 @@ static void rf_send_status(App* app) {
     rf_engine_status_line(app->rf, line, sizeof(line));
     uplink_send(app, line);
     app->rf_status_tick = app->tick;
-    app->rf_status_pending = app->rf_status.pending;
+    app->rf_status_listed = app->rf_status.listed;
+    app->rf_status_carry = app->rf_status.carry;
 }
 
 static void rf_refresh_status(App* app) {
@@ -892,7 +934,8 @@ static void rf_refresh_status(App* app) {
     rf_engine_get_status(app->rf, &app->rf_status);
     if(app->rf_status.unseen && app->tabs[app->tab_index] == ScreenRf && !app->alert)
         rf_engine_mark_seen(app->rf); // the user is looking at the RF tab
-    if(app->link && (app->rf_status.pending != app->rf_status_pending ||
+    if(app->link && (app->rf_status.listed != app->rf_status_listed ||
+                     app->rf_status.carry != app->rf_status_carry ||
                      app->tick - app->rf_status_tick > RF_STATUS_TICKS))
         rf_send_status(app);
 }
@@ -1034,13 +1077,13 @@ static void draw_header(Canvas* c, App* app) {
     fg(c);
 }
 
-static void draw_meter(Canvas* c, int x, int y, int w, uint8_t pct) {
-    canvas_draw_frame(c, x, y, w, 9);
+static void draw_meter(Canvas* c, int x, int y, int w, int h, uint8_t pct) {
+    canvas_draw_frame(c, x, y, w, h);
     int fill = (w - 2) * (pct > 100 ? 100 : pct) / 100;
-    if(fill > 0) canvas_draw_box(c, x + 1, y + 1, fill, 7);
+    if(fill > 0) canvas_draw_box(c, x + 1, y + 1, fill, h - 2);
     canvas_set_color(c, ColorXOR);
     for(int t = 1; t < 4; t++)
-        canvas_draw_dot(c, x + t * w / 4, y + 4);
+        canvas_draw_dot(c, x + t * w / 4, y + h / 2);
     fg(c);
 }
 
@@ -1059,14 +1102,15 @@ static void draw_cpu_graph(Canvas* c, const Sys* s, int x, int y, int w, int h, 
 static void draw_sys(Canvas* c, App* app) {
     Sys* s = &app->sys;
     int W = canvas_width(c), H = canvas_height(c);
-    char a[16], b[16], line[48];
-    canvas_set_font(c, FontSecondary);
+    const TextFont* tf = text_font(app);
+    int cap = tf->cap;
     if(!s->valid) {
-        canvas_draw_str_aligned(c, W / 2, H / 2, AlignCenter, AlignTop, "waiting for data...");
+        draw_message(c, app, "waiting for data...");
         return;
     }
+    font_text(c, app);
     uint32_t net = s->up + s->dn, dsk = s->rd + s->wr;
-    const char* labels[4] = {"CPU", "RAM", "NET", "DSK"};
+    static const char* const labels[4] = {"CPU", "RAM", "NET", "DSK"};
     uint8_t pcts[4] = {
         s->cpu, s->ram, (uint8_t)(net * 100 / s->net_max), (uint8_t)(dsk * 100 / s->dsk_max)};
     char vals[4][12];
@@ -1074,57 +1118,99 @@ static void draw_sys(Canvas* c, App* app) {
     snprintf(vals[1], sizeof(vals[1]), "%u%%", s->ram);
     fmt_rate(vals[2], sizeof(vals[2]), net);
     fmt_rate(vals[3], sizeof(vals[3]), dsk);
-    bool bars = app->settings.indicators == IndicatorsBars;
+    int top = 12, graph = top; // graph: where the CPU history starts
 
-    if(narrow(c)) {
-        int y = 12;
-        if(bars) {
-            for(int i = 0; i < 4; i++, y += 18) {
+    if(app->settings.indicators == IndicatorsBars) {
+        if(narrow(c)) {
+            // label and value on one line, the meter under them
+            int mh = cap < 7 ? 5 : 7, pitch = cap + 2 + mh + 3;
+            for(int i = 0; i < 4; i++) {
+                int y = top + i * pitch;
                 canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, labels[i]);
                 canvas_draw_str_aligned(c, W - 1, y, AlignRight, AlignTop, vals[i]);
-                draw_meter(c, 1, y + 8, W - 2, pcts[i]);
+                draw_meter(c, 1, y + cap + 2, W - 2, mh, pcts[i]);
             }
+            graph = top + 4 * pitch;
+        } else if(top + 4 * (cap + 3) + 8 <= H) {
+            // one row per value: label, meter, value
+            int lw = text_width(c, "CPU"), vw = text_width(c, "100%"), mh = cap + 2;
+            for(int i = 0; i < 4; i++) {
+                int y = top + i * (mh + 1);
+                canvas_draw_str_aligned(c, 2, y + 1, AlignLeft, AlignTop, labels[i]);
+                draw_meter(c, lw + 6, y, W - lw - vw - 11, mh, pcts[i]);
+                canvas_draw_str_aligned(c, W - 1, y + 1, AlignRight, AlignTop, vals[i]);
+            }
+            graph = top + 4 * (mh + 1) + 1;
         } else {
-            uint32_t v[4] = {s->up, s->dn, s->rd, s->wr};
-            const char* sub[4] = {"up", "dn", "rd", "wr"};
-            canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, "CPU");
-            canvas_draw_str_aligned(c, W - 1, y, AlignRight, AlignTop, vals[0]);
-            y += 10;
-            canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, "RAM");
-            canvas_draw_str_aligned(c, W - 1, y, AlignRight, AlignTop, vals[1]);
-            y += 10;
-            for(int i = 0; i < 4; i++, y += 10) {
-                if(!(i & 1)) canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, labels[2 + i / 2]);
-                fmt_rate(a, sizeof(a), v[i]);
-                snprintf(line, sizeof(line), "%s %s", sub[i], a);
-                canvas_draw_str_aligned(c, W - 1, y, AlignRight, AlignTop, line);
+            // large text: two columns, a thin meter under each label and value
+            int cw = (W - 10) / 2, pitch = cap + 2 + 5 + 3;
+            for(int i = 0; i < 4; i++) {
+                int x = (i % 2) ? W - 2 - cw : 2, y = top + (i / 2) * pitch;
+                canvas_draw_str_aligned(c, x, y, AlignLeft, AlignTop, labels[i]);
+                canvas_draw_str_aligned(c, x + cw, y, AlignRight, AlignTop, vals[i]);
+                draw_meter(c, x, y + cap + 2, cw, 5, pcts[i]);
             }
-            y += 4;
-        }
-        draw_cpu_graph(c, s, 1, y + 2, W - 2, H - y - 5, 1);
-        return;
-    }
-
-    if(bars) {
-        for(int i = 0; i < 4; i++) {
-            int y = 12 + i * 10;
-            canvas_draw_str_aligned(c, 2, y + 1, AlignLeft, AlignTop, labels[i]);
-            draw_meter(c, 22, y, 78, pcts[i]);
-            canvas_draw_str_aligned(c, W - 1, y + 1, AlignRight, AlignTop, vals[i]);
+            graph = top + 2 * pitch;
         }
     } else {
-        snprintf(line, sizeof(line), "CPU %u%%   RAM %u%%", s->cpu, s->ram);
-        canvas_draw_str_aligned(c, 2, 13, AlignLeft, AlignTop, line);
-        fmt_rate(a, sizeof(a), s->up);
-        fmt_rate(b, sizeof(b), s->dn);
-        snprintf(line, sizeof(line), "NET up %s  dn %s", a, b);
-        canvas_draw_str_aligned(c, 2, 24, AlignLeft, AlignTop, line);
-        fmt_rate(a, sizeof(a), s->rd);
-        fmt_rate(b, sizeof(b), s->wr);
-        snprintf(line, sizeof(line), "DSK rd %s  wr %s", a, b);
-        canvas_draw_str_aligned(c, 2, 35, AlignLeft, AlignTop, line);
+        char up[12], dn[12], rd[12], wr[12];
+        fmt_rate(up, sizeof(up), s->up);
+        fmt_rate(dn, sizeof(dn), s->dn);
+        fmt_rate(rd, sizeof(rd), s->rd);
+        fmt_rate(wr, sizeof(wr), s->wr);
+        if(narrow(c)) {
+            // label left, value right; NET/DSK spelled out while the values fit next to them
+            const char* lab[6] = {"CPU", "RAM", "NET", "", "DSK", ""};
+            char v[6][16];
+            snprintf(v[0], sizeof(v[0]), "%u%%", s->cpu);
+            snprintf(v[1], sizeof(v[1]), "%u%%", s->ram);
+            snprintf(v[2], sizeof(v[2]), "up %s", up);
+            snprintf(v[3], sizeof(v[3]), "dn %s", dn);
+            snprintf(v[4], sizeof(v[4]), "rd %s", rd);
+            snprintf(v[5], sizeof(v[5]), "wr %s", wr);
+            bool fits = true;
+            for(int i = 2; i < 6; i++)
+                if(text_width(c, "NET") + text_width(c, v[i]) + 4 > W - 2) fits = false;
+            if(!fits) {
+                static const char* const brief[4] = {"UP", "DN", "RD", "WR"};
+                const char* rates[4] = {up, dn, rd, wr};
+                for(int i = 0; i < 4; i++) {
+                    lab[2 + i] = brief[i];
+                    snprintf(v[2 + i], sizeof(v[2 + i]), "%s", rates[i]);
+                }
+            }
+            int pitch = tf->line + 1;
+            for(int i = 0; i < 6; i++) {
+                canvas_draw_str_aligned(c, 1, top + i * pitch, AlignLeft, AlignTop, lab[i]);
+                canvas_draw_str_aligned(c, W - 1, top + i * pitch, AlignRight, AlignTop, v[i]);
+            }
+            graph = top + 6 * pitch + 2;
+        } else {
+            char l[3][40];
+            snprintf(l[0], sizeof(l[0]), "CPU %u%%   RAM %u%%", s->cpu, s->ram);
+            snprintf(l[1], sizeof(l[1]), "NET up %s  dn %s", up, dn);
+            snprintf(l[2], sizeof(l[2]), "DSK rd %s  wr %s", rd, wr);
+            bool fits = true;
+            for(int i = 0; i < 3; i++)
+                if(text_width(c, l[i]) > W - 3) fits = false;
+            if(!fits) {
+                snprintf(l[0], sizeof(l[0]), "CPU %u%% RAM %u%%", s->cpu, s->ram);
+                snprintf(l[1], sizeof(l[1]), "UP %s DN %s", up, dn);
+                snprintf(l[2], sizeof(l[2]), "RD %s WR %s", rd, wr);
+            }
+            int pitch = tf->line + 2;
+            for(int i = 0; i < 3; i++)
+                canvas_draw_str_aligned(c, 2, top + 1 + i * pitch, AlignLeft, AlignTop, l[i]);
+            graph = top + 1 + 3 * pitch;
+        }
     }
-    draw_cpu_graph(c, s, 2, 52, 124, 11, 2);
+    int gh = H - 1 - graph;
+    if(gh >= 4) {
+        if(narrow(c))
+            draw_cpu_graph(c, s, 1, graph, W - 2, gh, 1);
+        else
+            draw_cpu_graph(c, s, 2, graph, W - 4, gh, 2);
+    }
 }
 
 /* 7x7 state glyph; `big` allows the 9x9 blinking box of "needs approval" */
@@ -1175,21 +1261,21 @@ static void draw_list(Canvas* c, App* app, Kind k) {
     int W = canvas_width(c), H = canvas_height(c);
     const TextFont* tf = text_font(app);
     bool two_lines = narrow(c); // vertical: name, then age/progress and what it is doing
-    int rh = tf->row + (two_lines ? 7 : 0);
+    int rh = tf->row + (two_lines ? tf->line : 0);
     int rows = (H - 11) / rh;
     uint8_t total = visible_count(app, k);
     if(l->cursor >= total) l->cursor = total ? total - 1 : 0;
-    canvas_set_font(c, FontSecondary);
     if(!total) {
-        canvas_draw_str_aligned(c, W / 2, H / 2 - 8, AlignCenter, AlignTop, "NO ACTIVE");
-        canvas_draw_str_aligned(c, W / 2, H / 2 + 2, AlignCenter, AlignTop, "SESSIONS");
+        draw_message(c, app, "NO ACTIVE SESSIONS");
         return;
     }
+    font_text(c, app);
     if(l->cursor < l->scroll) l->scroll = l->cursor;
     if(l->cursor >= l->scroll + rows) l->scroll = l->cursor - rows + 1;
     if(l->scroll + rows > total) l->scroll = total > rows ? total - rows : 0;
     bool bar = total > rows;
     int right_edge = bar ? W - 5 : W - 2;
+    int ty = (tf->row - tf->cap - 1) / 2; // text inside a row
     for(int r = 0; r < rows && l->scroll + r < total; r++) {
         int i = visible_raw_index(app, k, l->scroll + r);
         if(i < 0) break;
@@ -1197,24 +1283,15 @@ static void draw_list(Canvas* c, App* app, Kind k) {
         int y = 11 + r * rh;
         char info[12];
         item_info(it, info, sizeof(info));
+        int iw = text_width(c, info);
         draw_glyph(c, 2, y + (tf->row - 7) / 2, it->state, app->tick, tf->row >= 10);
         if(two_lines) {
-            font_text(c, app);
-            draw_str_fit(c, 12, y, it->name, right_edge - 12);
-            font_info(c);
-            int iw = canvas_string_width(c, info);
+            draw_str_fit(c, 12, y + ty, it->name, right_edge - 12);
             canvas_draw_str_aligned(c, right_edge, y + tf->row, AlignRight, AlignTop, info);
             draw_str_fit(c, 12, y + tf->row, it->detail, right_edge - iw - 15);
         } else {
-            if(tf->row >= 10)
-                canvas_set_font(c, FontSecondary);
-            else
-                font_text(c, app);
-            int iw = canvas_string_width(c, info);
-            canvas_draw_str_aligned(
-                c, right_edge, y + (tf->row >= 10 ? (tf->row - 8) / 2 : 0), AlignRight, AlignTop, info);
-            font_text(c, app);
-            draw_str_fit(c, 12, y, it->name, right_edge - iw - 15);
+            canvas_draw_str_aligned(c, right_edge, y + ty, AlignRight, AlignTop, info);
+            draw_str_fit(c, 12, y + ty, it->name, right_edge - iw - 15);
         }
         if(l->scroll + r == l->cursor) {
             canvas_set_color(c, ColorXOR);
@@ -1243,33 +1320,37 @@ static void draw_detail(Canvas* c, App* app, Kind k) {
     Item* it = &l->items[raw];
     int y = 11;
     font_text(c, app);
-    draw_str_fit(c, 2, y, it->name, W - 4);
+    draw_str_fit(c, 2, y + 1, it->name, W - 4);
     y += tf->line + 2;
 
-    canvas_set_font(c, FontSecondary);
+    // state in a lit box, the age right of it (under it when there is no room)
     const char* st = state_text(it->state);
-    int sw = canvas_string_width(c, st);
-    canvas_draw_box(c, 2, y, sw + 6, 9);
+    int sw = text_width(c, st), bh = tf->cap + 4;
+    canvas_draw_box(c, 2, y, sw + 6, bh);
     bg(c);
-    canvas_draw_str_aligned(c, 5, y + 1, AlignLeft, AlignTop, st);
+    canvas_draw_str_aligned(c, 5, y + 2, AlignLeft, AlignTop, st);
     fg(c);
     char age[16], buf[24];
     fmt_age(age, sizeof(age), it->age);
     snprintf(buf, sizeof(buf), "%s ago", age);
-    if(sw + 12 + canvas_string_width(c, buf) > W) y += 10; // no room on the same row
-    canvas_draw_str_aligned(c, W - 1, y + 1, AlignRight, AlignTop, buf);
-    y += 11;
+    if(sw + 12 + text_width(c, buf) <= W) {
+        canvas_draw_str_aligned(c, W - 1, y + 2, AlignRight, AlignTop, buf);
+        y += bh + 2;
+    } else {
+        y += bh + 2;
+        canvas_draw_str_aligned(c, W - 1, y, AlignRight, AlignTop, buf);
+        y += tf->line + 1;
+    }
     if(it->total) {
         snprintf(buf, sizeof(buf), "%u/%u", it->done, it->total);
-        int tw = canvas_string_width(c, buf);
-        int bw = W - tw - 7;
-        canvas_draw_frame(c, 2, y, bw, 7);
+        int tw = text_width(c, buf);
+        int bw = W - tw - 7, ph = MAX(5, tf->cap);
+        canvas_draw_frame(c, 2, y, bw, ph);
         int w = (bw - 2) * MIN(it->done, it->total) / it->total;
-        if(w) canvas_draw_box(c, 3, y + 1, w, 5);
-        canvas_draw_str_aligned(c, W - 1, y - 1, AlignRight, AlignTop, buf);
-        y += 9;
+        if(w) canvas_draw_box(c, 3, y + 1, w, ph - 2);
+        canvas_draw_str_aligned(c, W - 1, y + (ph - tf->cap) / 2, AlignRight, AlignTop, buf);
+        y += ph + 3;
     }
-    font_text(c, app);
     int rows = (H - y) / tf->line;
     if(rows <= 0) return;
     int total = draw_wrapped(c, 2, y, W - 6, it->detail, 0, tf->line, 0);
@@ -1347,23 +1428,24 @@ static void draw_cmd(Canvas* c, App* app) {
     Cmd* cmd = &app->cmd;
     int W = canvas_width(c), H = canvas_height(c);
     const TextFont* tf = text_font(app);
+    bool n = narrow(c);
+    font_text(c, app);
     char status[24] = "";
-    if(cmd->running)
-        snprintf(status, sizeof(status), narrow(c) ? "RUN" : "RUN Back=stop");
-    else if(cmd->have_exit)
+    if(cmd->running) {
+        static const char* const run[] = {"RUN Back=stop", "RUN"};
+        snprintf(status, sizeof(status), "%s", n ? "RUN" : first_fit(c, W / 2, run, 2));
+    } else if(cmd->have_exit)
         snprintf(status, sizeof(status), "exit %d", cmd->exit_code);
-    canvas_set_font(c, FontSecondary);
-    int sw = status[0] ? canvas_string_width(c, status) + 4 : 0;
-    canvas_draw_str_aligned(c, W - 1, 12, AlignRight, AlignTop, status);
+    int sw = status[0] ? text_width(c, status) + 4 : 0;
+    canvas_draw_str_aligned(c, W - 1, 11, AlignRight, AlignTop, status);
     // working directory: keep its end, it is the informative part
     char cwd[64];
     clean_copy(cwd, sizeof(cwd), cmd->cwd[0] ? cmd->cwd : "cmd");
-    font_text(c, app);
     const char* shown = cwd;
     char head[72];
     for(;;) {
         snprintf(head, sizeof(head), "%s%s>", shown == cwd ? "" : "~", shown);
-        if(!shown[0] || canvas_string_width(c, head) <= W - 2 - sw) break;
+        if(!shown[0] || text_width(c, head) <= W - 2 - sw) break;
         shown += utf8_len_at(shown);
     }
     canvas_draw_str_aligned(c, 1, 11, AlignLeft, AlignTop, head);
@@ -1371,10 +1453,10 @@ static void draw_cmd(Canvas* c, App* app) {
     canvas_draw_line(c, 0, sep, W, sep);
 
     if(cmd->count == 0) {
-        canvas_set_font(c, FontSecondary);
-        canvas_draw_str_aligned(c, W / 2, sep + 10, AlignCenter, AlignTop, "OK: type a command");
-        canvas_draw_str_aligned(
-            c, W / 2, sep + 22, AlignCenter, AlignTop, narrow(c) ? "on the PC" : "cmd.exe in your pocket");
+        int step = tf->line + 1;
+        int y = sep + 2 + (H - sep - 2) / 4;
+        y += step * draw_centered(c, W / 2, y, W - 4, "OK: type a command", step, true) + 3;
+        draw_centered(c, W / 2, y, W - 4, n ? "on the PC" : "cmd.exe in your pocket", step, true);
         return;
     }
     draw_console(c, app, sep + 2, H, W - 5);
@@ -1397,9 +1479,9 @@ static int draw_panel(Canvas* c, int x, int y, int w, int h, const char* title) 
 static void draw_alert(Canvas* c, App* app) {
     int W = canvas_width(c), H = canvas_height(c);
     bool n = narrow(c);
-    int pw = W - 8, ph = n ? 70 : 42;
-    int px = 4, py = n ? (H - ph) / 2 : 12;
     if(app->alert_update) {
+        int pw = W - 8, ph = n ? 70 : 42;
+        int px = 4, py = n ? (H - ph) / 2 : 12;
         char line[40];
         int y = draw_panel(c, px, py, pw, ph, n ? "UPDATE" : ">> UPDATE AVAILABLE <<");
         snprintf(line, sizeof(line), n ? "%s ->" : "%s -> %s", UPLINK_VERSION, app->ota.tag);
@@ -1413,19 +1495,27 @@ static void draw_alert(Canvas* c, App* app) {
         }
         return;
     }
+    // the panel grows with the text size: title bar, CODEX/CLAUDE, the session name
+    const TextFont* tf = text_font(app);
+    char name[64];
+    clean_copy(name, sizeof(name), app->alert_name);
+    int px = n ? 2 : 4, pw = W - 2 * px; // narrow: every pixel counts for the wrapped name
+    font_text(c, app);
+    int lines = n ? MAX(1, MIN(3, draw_wrapped(c, 0, 0, pw - 4, name, 0, tf->line, 0))) : 1;
+    int ph = 15 + tf->line + 3 + lines * tf->line + 5;
+    int py = n ? (H - ph) / 2 : 12;
     const char* title = app->alert_state == 'A' ? (n ? "APPROVAL" : "!! APPROVAL NEEDED !!") :
                                                   (n ? "YOUR TURN" : ">> YOUR TURN <<");
     int y = draw_panel(c, px, py, pw, ph, title);
+    font_text(c, app);
     canvas_draw_str_aligned(
         c, W / 2, y + 1, AlignCenter, AlignTop, app->alert_kind == KindCodex ? "CODEX" : "CLAUDE");
-    font_text(c, app);
-    char name[64];
-    clean_copy(name, sizeof(name), app->alert_name);
+    y += tf->line + 3;
     if(n) {
-        draw_wrapped(c, px + 3, y + 12, pw - 6, name, 3, text_font(app)->line, 0);
+        draw_wrapped(c, px + 2, y, pw - 4, name, 3, tf->line, 0);
     } else {
-        utf8_fit(c, name, pw - 8);
-        canvas_draw_str_aligned(c, W / 2, y + 12, AlignCenter, AlignTop, name);
+        utf8_fit(c, name, pw - 10);
+        canvas_draw_str_aligned(c, W / 2, y, AlignCenter, AlignTop, name);
     }
 }
 
@@ -1531,113 +1621,172 @@ static void draw_rf(Canvas* c, App* app) {
     int W = canvas_width(c), H = canvas_height(c);
     bool n = narrow(c);
     const RfStatus* s = &app->rf_status;
-    char a[16], b[16], line[72];
-    canvas_set_font(c, FontSecondary);
+    const TextFont* tf = text_font(app);
+    int cap = tf->cap, line = tf->line;
     if(!app->rf) {
-        canvas_draw_str_aligned(c, W / 2, H / 2, AlignCenter, AlignTop, "RF engine unavailable");
+        draw_message(c, app, "RF engine unavailable");
         return;
     }
-    // mode in a lit box; receiver state on the right with a blinking dot while it listens
+    font_text(c, app);
+    // mode in a lit box; the receiver state right of it (under it when narrow) with a
+    // blinking dot while it listens
+    char a[16], state[24];
     const char* mode = rf_mode_names[s->mode < RfModeCount ? s->mode : 0];
-    int mw = canvas_string_width(c, mode) + 6;
-    canvas_draw_box(c, 1, 12, mw, 9);
+    int bh = cap + 3;
+    canvas_draw_box(c, 1, 12, text_width(c, mode) + 6, bh);
     bg(c);
-    canvas_draw_str_aligned(c, 4, 13, AlignLeft, AlignTop, mode);
+    canvas_draw_str_aligned(c, 4, 14, AlignLeft, AlignTop, mode);
     fg(c);
     if(!s->running)
-        snprintf(line, sizeof(line), "OFF");
+        snprintf(state, sizeof(state), "OFF");
     else if(s->mode == RfModeNfc)
-        snprintf(line, sizeof(line), s->nfc_field ? "FIELD!" : "LISTEN");
+        snprintf(state, sizeof(state), s->nfc_field ? "FIELD!" : "LISTEN");
     else {
         fmt_mhz(a, sizeof(a), s->frequency_hz);
-        snprintf(line, sizeof(line), "RX %s", a);
+        snprintf(state, sizeof(state), "RX %s", a);
     }
-    int sy = n ? 23 : 13;
-    canvas_draw_str_aligned(c, W - 1, sy, AlignRight, AlignTop, line);
-    if(s->running && (app->tick & 2)) {
-        int lw = canvas_string_width(c, line);
-        canvas_draw_disc(c, W - lw - 6, sy + 3, 2);
-    }
+    int sy = n ? 12 + bh + 2 : 14;
+    canvas_draw_str_aligned(c, W - 1, sy, AlignRight, AlignTop, state);
+    if(s->running && (app->tick & 2))
+        canvas_draw_disc(c, W - text_width(c, state) - 5, sy + cap / 2, 2);
+    int y = n ? sy + line + 1 : 12 + bh + 2;
 
-    char ev[16], fam[16], pend[16], sd[16];
-    snprintf(ev, sizeof(ev), "%lu", (unsigned long)s->events);
-    snprintf(fam, sizeof(fam), "%lu", (unsigned long)s->families);
-    snprintf(pend, sizeof(pend), "%lu", (unsigned long)s->pending);
-    fmt_kb(sd, sizeof(sd), s->free_kb);
-    char last[64] = "no events yet";
+    // counters: two columns (one when narrow), long labels where they fit next to the value
+    static const char* const full[4] = {"EVENTS", "FAMILIES", "PENDING", "SD FREE"};
+    static const char* const brief[4] = {"EVT", "FAM", "PEND", "SD"};
+    char v[4][16];
+    snprintf(v[0], sizeof(v[0]), "%lu", (unsigned long)s->events);
+    snprintf(v[1], sizeof(v[1]), "%lu", (unsigned long)s->families);
+    snprintf(v[2], sizeof(v[2]), "%lu", (unsigned long)(s->pending + s->carry));
+    fmt_kb(v[3], sizeof(v[3]), s->free_kb);
+    for(int i = 0; i < 4; i++) {
+        int x = n ? 1 : (i % 2 ? W / 2 + 3 : 2);
+        int right = n ? W - 1 : (i % 2 ? W - 1 : W / 2 - 3);
+        int yy = y + (n ? i : i / 2) * line;
+        int room = right - x - text_width(c, v[i]) - 3;
+        canvas_draw_str_aligned(
+            c, x, yy, AlignLeft, AlignTop, text_width(c, full[i]) <= room ? full[i] : brief[i]);
+        canvas_draw_str_aligned(c, right, yy, AlignRight, AlignTop, v[i]);
+    }
+    y += (n ? 4 : 2) * line;
+    canvas_draw_line(c, 0, y, W, y);
+    y += 2;
+
+    // the last event: time, frequency (or NFC), level or Follow match
+    char when[12] = "", hm[8] = "", where[12] = "", tail[12] = "", tail_short[12] = "";
     if(s->last_unix) {
-        fmt_clock(a, sizeof(a), s->last_unix, app->settings.rf_tz);
-        fmt_mhz(b, sizeof(b), s->last_frequency_hz);
-        if(s->mode == RfModeFollow && s->follow_valid)
-            snprintf(last, sizeof(last), "%s %s %u%%", a, b, s->last_similarity);
-        else if(s->last_frequency_hz)
-            snprintf(last, sizeof(last), "%s %s %ddB", a, b, s->last_rssi_dbm);
+        fmt_clock(when, sizeof(when), s->last_unix, app->settings.rf_tz);
+        snprintf(hm, sizeof(hm), "%.5s", when);
+        if(s->last_frequency_hz)
+            fmt_mhz(where, sizeof(where), s->last_frequency_hz);
         else
-            snprintf(last, sizeof(last), "%s NFC", a);
+            snprintf(where, sizeof(where), "NFC");
+        if(s->mode == RfModeFollow && s->follow_valid) {
+            snprintf(tail, sizeof(tail), "%u%%", s->last_similarity);
+            snprintf(tail_short, sizeof(tail_short), "%s", tail);
+        } else if(s->last_frequency_hz) {
+            snprintf(tail, sizeof(tail), "%ddB", s->last_rssi_dbm);
+            snprintf(tail_short, sizeof(tail_short), "%d", s->last_rssi_dbm);
+        }
     }
-    const char* problem = NULL;
-    if(s->storage_full)
-        problem = "SD FULL: IMPORT ON PC";
-    else if(s->errors) {
-        snprintf(b, sizeof(b), "%lu", (unsigned long)s->errors);
-        problem = "WRITE ERRORS";
+    const char* sp = tail[0] ? " " : "";
+    // a problem replaces the key hints
+    char problem[32] = "", problem_short[16] = "";
+    if(s->storage_full) {
+        snprintf(problem, sizeof(problem), "SD FULL: IMPORT ON PC");
+        snprintf(problem_short, sizeof(problem_short), "SD FULL");
+    } else if(s->errors) {
+        snprintf(problem, sizeof(problem), "WRITE ERRORS: %lu", (unsigned long)s->errors);
+        snprintf(problem_short, sizeof(problem_short), "ERRORS %lu", (unsigned long)s->errors);
     }
+    const char* problems[2] = {problem, problem_short};
+    int bar = cap + 4; // the problem bar
+    const char* ok = s->running ? "OK: stop" : "OK: start";
 
-    if(n) {
-        static const char* const labels[4] = {"EVENTS", "FAMILIES", "PENDING", "SD FREE"};
-        const char* values[4] = {ev, fam, pend, sd};
-        int y = 35;
-        for(int i = 0; i < 4; i++, y += 9) {
-            canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, labels[i]);
-            canvas_draw_str_aligned(c, W - 1, y, AlignRight, AlignTop, values[i]);
+    if(!n) {
+        // one line for the event, one for the hints or the problem; the problem wins over the
+        // event, the event over the hints
+        int foot = problem[0] ? bar : line;
+        bool both = y + line + foot <= H;
+        if(both || !problem[0]) {
+            char l1[48], l2[40], l3[32], l4[24];
+            if(s->last_unix) {
+                snprintf(l1, sizeof(l1), "LAST %s %s%s%s", when, where, sp, tail);
+                snprintf(l2, sizeof(l2), "%s %s%s%s", when, where, sp, tail);
+                snprintf(l3, sizeof(l3), "%s %s%s%s", hm, where, sp, tail);
+                snprintf(l4, sizeof(l4), "%s %s", hm, where);
+            } else {
+                snprintf(l1, sizeof(l1), "LAST: no events yet");
+                snprintf(l2, sizeof(l2), "no events yet");
+                snprintf(l3, sizeof(l3), "no events");
+                snprintf(l4, sizeof(l4), "-");
+            }
+            const char* last[4] = {l1, l2, l3, l4};
+            canvas_draw_str_aligned(c, 2, y, AlignLeft, AlignTop, first_fit(c, W - 3, last, 4));
         }
-        canvas_draw_line(c, 0, y + 2, W, y + 2);
-        y += 5;
-        canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, "LAST EVENT");
-        y += 9;
-        if(s->last_unix) {
-            canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, a);
-            canvas_draw_str_aligned(c, 1, y + 9, AlignLeft, AlignTop, last + strlen(a) + 1);
-        } else
-            canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, last);
-        if(problem) {
-            // the problem replaces the mode hint, below the last-event block
-            canvas_draw_box(c, 0, H - 20, W, 10);
-            bg(c);
-            canvas_draw_str_aligned(
-                c, W / 2, H - 19, AlignCenter, AlignTop, s->storage_full ? "SD FULL" : problem);
-            fg(c);
-        } else {
-            canvas_draw_str_aligned(c, 1, H - 18, AlignLeft, AlignTop, "UP/DN: mode");
+        if(both || problem[0]) {
+            if(problem[0]) {
+                canvas_draw_box(c, 0, H - bar, W, bar);
+                bg(c);
+                canvas_draw_str_aligned(
+                    c, W / 2, H - bar + 2, AlignCenter, AlignTop, first_fit(c, W - 4, problems, 2));
+                fg(c);
+            } else {
+                char h1[32], h2[32];
+                snprintf(h1, sizeof(h1), "%s   UP/DN: mode", ok);
+                snprintf(h2, sizeof(h2), "%s UP/DN:mode", ok);
+                const char* hints[3] = {h1, h2, ok};
+                canvas_draw_str_aligned(c, 2, H - line, AlignLeft, AlignTop, first_fit(c, W - 3, hints, 3));
+            }
         }
-        canvas_draw_str_aligned(c, 1, H - 9, AlignLeft, AlignTop, s->running ? "OK: stop" : "OK: start");
         return;
     }
 
-    canvas_draw_str_aligned(c, 2, 24, AlignLeft, AlignTop, "EVENTS");
-    canvas_draw_str_aligned(c, 61, 24, AlignRight, AlignTop, ev);
-    canvas_draw_str_aligned(c, 67, 24, AlignLeft, AlignTop, "FAMILIES");
-    canvas_draw_str_aligned(c, W - 1, 24, AlignRight, AlignTop, fam);
-    canvas_draw_str_aligned(c, 2, 33, AlignLeft, AlignTop, "PENDING");
-    canvas_draw_str_aligned(c, 61, 33, AlignRight, AlignTop, pend);
-    canvas_draw_str_aligned(c, 67, 33, AlignLeft, AlignTop, "SD");
-    canvas_draw_str_aligned(c, W - 1, 33, AlignRight, AlignTop, sd);
-    canvas_draw_line(c, 0, 43, W, 43);
-    snprintf(line, sizeof(line), "LAST %s", last);
-    canvas_draw_str_aligned(
-        c, 2, 45, AlignLeft, AlignTop, canvas_string_width(c, line) <= W - 3 ? line : last);
-    if(problem) {
-        canvas_draw_box(c, 0, 54, W, 10);
-        bg(c);
-        if(s->errors && !s->storage_full)
-            snprintf(line, sizeof(line), "%s: %s", problem, b);
+    // narrow: "LAST EVENT", time, frequency + level, then two hint rows or the problem bar;
+    // when it does not fit, the label goes first, then the hints
+    const char* rows[4];
+    int count = 0;
+    char wt[24], wt2[24];
+    rows[count++] = text_width(c, "LAST EVENT") <= W - 2 ? "LAST EVENT" : "LAST";
+    if(s->last_unix) {
+        rows[count++] = when;
+        snprintf(wt, sizeof(wt), "%s%s%s", where, sp, tail);
+        snprintf(wt2, sizeof(wt2), "%s%s%s", where, sp, tail_short);
+        if(text_width(c, wt) <= W - 2)
+            rows[count++] = wt;
+        else if(text_width(c, wt2) <= W - 2)
+            rows[count++] = wt2;
+        else {
+            rows[count++] = where;
+            if(tail[0]) rows[count++] = tail;
+        }
+    } else {
+        rows[count++] = "none yet";
+    }
+    int first = 0, hints = problem[0] ? 0 : 2;
+    int foot = problem[0] ? bar : hints * line;
+    while(y + (count - first) * line + foot > H) {
+        if(first == 0 && count > 2)
+            first = 1;
+        else if(hints > 0)
+            foot = --hints * line;
         else
-            snprintf(line, sizeof(line), "%s", problem);
-        canvas_draw_str_aligned(c, W / 2, 55, AlignCenter, AlignTop, line);
+            break;
+    }
+    for(int i = first; i < count && y + line <= H - foot; i++, y += line)
+        canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, rows[i]);
+    if(problem[0]) {
+        canvas_draw_box(c, 0, H - bar, W, bar);
+        bg(c);
+        canvas_draw_str_aligned(
+            c, W / 2, H - bar + 2, AlignCenter, AlignTop, first_fit(c, W - 4, problems, 2));
         fg(c);
     } else {
-        canvas_draw_str_aligned(
-            c, 2, 55, AlignLeft, AlignTop, s->running ? "OK: stop   UP/DN: mode" : "OK: start   UP/DN: mode");
+        static const char* const mode_hint[2] = {"UP/DN: mode", "UP/DN"};
+        if(hints == 2)
+            canvas_draw_str_aligned(
+                c, 1, H - 2 * line, AlignLeft, AlignTop, first_fit(c, W - 2, mode_hint, 2));
+        if(hints >= 1) canvas_draw_str_aligned(c, 1, H - line, AlignLeft, AlignTop, ok);
     }
 }
 
@@ -1659,11 +1808,9 @@ static void main_draw(Canvas* c, void* model) {
         else if(screen == ScreenRf)
             draw_rf(c, app);
         else if(screen == ScreenCmd) {
-            if(!app->link) {
-                canvas_set_font(c, FontSecondary);
-                canvas_draw_str_aligned(
-                    c, canvas_width(c) / 2, canvas_height(c) / 2, AlignCenter, AlignTop, "link down");
-            } else
+            if(!app->link)
+                draw_message(c, app, "link down");
+            else
                 draw_cmd(c, app);
         } else if(app->detail)
             draw_detail(c, app, screen_kind(screen));
@@ -1908,7 +2055,8 @@ static bool nav_event(void* context) {
 /* ------------------------------------------------------------------ settings view */
 static const char* const on_off[] = {"OFF", "ON"};
 static const char* const ind_vals[] = {"Bars", "Text"};
-static const char* const font_vals[] = {"Normal", "Large", "Small", "Micro"};
+static const char* const font_vals[] = {"Micro", "Small", "Normal", "Large"};
+static const uint8_t font_sizes[] = {FontMicro, FontSmall, FontNormal, FontLarge};
 static const char* const orientation_vals[] = {"Horizontal", "Vertical"};
 // tab choices in the order the user sees them; stored as ScreenId
 static const char* const tab_vals[] = {"SYS", "CDX", "CLD", "CMD", "RF", "Off"};
@@ -1949,6 +2097,12 @@ static uint8_t tab_choice(uint8_t screen) {
     for(uint8_t i = 0; i < COUNT_OF(tab_screens); i++)
         if(tab_screens[i] == screen) return i;
     return COUNT_OF(tab_screens) - 1; // Off
+}
+
+static uint8_t font_choice(uint8_t font) {
+    for(uint8_t i = 0; i < COUNT_OF(font_sizes); i++)
+        if(font_sizes[i] == font) return i;
+    return 2; // Normal
 }
 
 static uint8_t nearest_index(const uint16_t* vals, uint8_t count, uint16_t v) {
@@ -2028,7 +2182,7 @@ static void setting_changed(VariableItem* item) {
         s->indicators = idx;
         break;
     case SetFont:
-        s->font = idx;
+        s->font = font_sizes[idx];
         break;
     case SetOrientation:
         // only the main view turns: the stock keyboard and this settings list are drawn
@@ -2116,7 +2270,7 @@ static void build_settings(App* app) {
     add_row(app, "LED alerts", SetLed, 2, s->led);
     add_row(app, "Wake screen on alert", SetBacklight, 2, s->backlight);
     add_row(app, "Indicators", SetIndicators, 2, s->indicators);
-    add_row(app, "Font", SetFont, 4, s->font);
+    add_row(app, "Font size", SetFont, COUNT_OF(font_sizes), font_choice(s->font));
     add_row(app, "Orientation", SetOrientation, 2, s->orientation);
     static const char* const tab_names[TAB_SLOTS] = {"Tab 1", "Tab 2", "Tab 3", "Tab 4", "Tab 5"};
     for(uint8_t i = 0; i < TAB_SLOTS; i++)

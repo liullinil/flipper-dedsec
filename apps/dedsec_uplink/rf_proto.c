@@ -48,6 +48,43 @@ static size_t rf_proto_base64(const uint8_t* data, size_t length, char* out) {
     return used;
 }
 
+static int rf_proto_base64_value(char ch) {
+    if(ch >= 'A' && ch <= 'Z') return ch - 'A';
+    if(ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+    if(ch >= '0' && ch <= '9') return ch - '0' + 52;
+    if(ch == '+') return 62;
+    if(ch == '/') return 63;
+    return -1;
+}
+
+/* Strict base64 (padding only at the very end); false when it does not fit `capacity`. */
+static bool rf_proto_unbase64(const char* text, uint8_t* out, size_t capacity, size_t* length) {
+    size_t n = strlen(text), used = 0;
+    if(!n || n % 4U) return false;
+    for(size_t i = 0; i < n; i += 4U) {
+        uint32_t chunk = 0;
+        size_t pad = 0;
+        for(size_t k = 0; k < 4U; k++) {
+            char ch = text[i + k];
+            int value = 0;
+            if(ch == '=' && i + 4U == n && k >= 2U) {
+                pad++;
+            } else {
+                value = rf_proto_base64_value(ch);
+                if(value < 0 || pad) return false;
+            }
+            chunk = (chunk << 6) | (uint32_t)value;
+        }
+        size_t bytes = 3U - pad;
+        if(used + bytes > capacity) return false;
+        out[used++] = (uint8_t)(chunk >> 16);
+        if(bytes > 1U) out[used++] = (uint8_t)(chunk >> 8);
+        if(bytes > 2U) out[used++] = (uint8_t)chunk;
+    }
+    *length = used;
+    return true;
+}
+
 static const char* rf_proto_code(RfStoreResult result) {
     switch(result) {
     case RfStoreErrNotFound:
@@ -171,6 +208,98 @@ static void rf_proto_ack(
     }
 }
 
+/* RO|pc_id: the PC on the link; carried records are listed to every PC but their own. */
+static void rf_proto_origin(
+    RfStore* store,
+    char** fields,
+    size_t count,
+    char* out,
+    RfProtoReply reply,
+    void* context) {
+    if(count != 2 || !rf_store_set_peer(store, fields[1])) {
+        rf_proto_fail(out, "bad", NULL, "RO needs a PC id (8-16 hex digits)", reply, context);
+        return;
+    }
+    snprintf(
+        out,
+        RF_PROTO_LINE_MAX,
+        "RO|%lu|%lu",
+        (unsigned long)rf_store_listed(store),
+        (unsigned long)rf_store_carry(store));
+    reply(out, context);
+}
+
+/* RP|event_id|size|crc32: the PC is about to send one of its records for another PC. */
+static void rf_proto_put(
+    RfStore* store,
+    char** fields,
+    size_t count,
+    char* out,
+    RfProtoReply reply,
+    void* context) {
+    uint32_t size = 0, crc = 0;
+    if(count != 4 || !rf_store_valid_id(fields[1]) || !rf_proto_u32(fields[2], &size) ||
+       !rf_proto_u32(fields[3], &crc)) {
+        rf_proto_fail(out, "bad", NULL, "RP needs event_id, size and crc32", reply, context);
+        return;
+    }
+    const char* id = fields[1];
+    RfStoreResult result = rf_store_put_begin(store, id, size, crc);
+    if(result == RfStoreOk) {
+        snprintf(out, RF_PROTO_LINE_MAX, "RG|%s|0", id);
+        reply(out, context);
+    } else if(result == RfStoreErrExists) {
+        snprintf(out, RF_PROTO_LINE_MAX, "RH|%s", id);
+        reply(out, context);
+    } else if(result == RfStoreErrNoPeer) {
+        rf_proto_fail(out, "bad", id, "send RO first", reply, context);
+    } else if(result == RfStoreErrMismatch) {
+        rf_proto_fail(out, "bad", id, "differs from the record on the Flipper", reply, context);
+    } else if(result == RfStoreErrInvalid) {
+        rf_proto_fail(out, "bad", id, "size out of range", reply, context);
+    } else if(result == RfStoreErrLowSpace) {
+        rf_proto_fail(out, "io", id, "SD card full", reply, context);
+    } else {
+        rf_proto_fail(out, rf_proto_code(result), id, "cannot store", reply, context);
+    }
+}
+
+/* RW|event_id|offset|base64: the next bytes of the record announced with RP. */
+static void rf_proto_write(
+    RfStore* store,
+    char** fields,
+    size_t count,
+    char* out,
+    RfProtoReply reply,
+    void* context) {
+    uint32_t offset = 0;
+    if(count != 4 || !rf_store_valid_id(fields[1]) || !rf_proto_u32(fields[2], &offset)) {
+        rf_proto_fail(out, "bad", NULL, "RW needs event_id, offset and data", reply, context);
+        return;
+    }
+    const char* id = fields[1];
+    uint8_t data[RF_PROTO_PUT_MAX];
+    size_t length = 0;
+    if(!rf_proto_unbase64(fields[3], data, sizeof(data), &length)) {
+        rf_proto_fail(out, "bad", id, "malformed data", reply, context);
+        return;
+    }
+    uint32_t received = 0;
+    RfStoreResult result = rf_store_put_write(store, id, offset, data, length, &received);
+    if(result == RfStoreOk) {
+        snprintf(out, RF_PROTO_LINE_MAX, "RG|%s|%lu", id, (unsigned long)received);
+        reply(out, context);
+    } else if(result == RfStoreErrNotFound) {
+        rf_proto_fail(out, "nf", id, "not being received", reply, context);
+    } else if(result == RfStoreErrMismatch) {
+        rf_proto_fail(out, "bad", id, "size/crc32 mismatch", reply, context);
+    } else if(result == RfStoreErrInvalid) {
+        rf_proto_fail(out, "bad", id, "more data than announced", reply, context);
+    } else {
+        rf_proto_fail(out, rf_proto_code(result), id, "write failed", reply, context);
+    }
+}
+
 void rf_proto_handle(
     RfStore* store,
     char* line,
@@ -192,6 +321,12 @@ void rf_proto_handle(
         rf_proto_read(store, fields, count, scratch, reply, context);
     } else if(strcmp(fields[0], "RA") == 0) {
         rf_proto_ack(store, fields, count, keep_uploaded, scratch, reply, context);
+    } else if(strcmp(fields[0], "RO") == 0) {
+        rf_proto_origin(store, fields, count, scratch, reply, context);
+    } else if(strcmp(fields[0], "RP") == 0) {
+        rf_proto_put(store, fields, count, scratch, reply, context);
+    } else if(strcmp(fields[0], "RW") == 0) {
+        rf_proto_write(store, fields, count, scratch, reply, context);
     } else {
         rf_proto_fail(scratch, "bad", NULL, "unknown request", reply, context);
     }

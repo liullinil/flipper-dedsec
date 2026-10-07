@@ -42,7 +42,7 @@
 
 #define RF_ENGINE_STACK      (4U * 1024U) /* ~1.2 KB measured + printf/storage frames */
 #define RF_QUEUE_DEPTH       8U
-#define RF_REQUEST_MAX       96U
+#define RF_REQUEST_MAX       RF_PROTO_REQUEST_MAX /* an RW line with 180 record bytes */
 #define RF_RECORD_SIZE       4096U /* one record incl. pulse timings */
 #define RF_TIMINGS_MAX       512U /* timings kept per event (4 bytes each) */
 #define RF_PRETRIGGER_MAX    64U
@@ -849,6 +849,8 @@ static void rf_publish(RfEngine* engine, uint32_t now, bool force) {
     status.events = engine->events;
     status.families = engine->family_count;
     status.pending = rf_store_pending(engine->store);
+    status.carry = rf_store_carry(engine->store);
+    status.listed = rf_store_listed(engine->store);
     status.errors = engine->errors;
     status.free_kb = rf_store_free_kb(engine->store);
     status.storage_full = engine->storage_full;
@@ -1115,11 +1117,12 @@ void rf_engine_status_line(RfEngine* engine, char* out, size_t size) {
     snprintf(
         out,
         size,
-        "R|%lu|%lu|%lu|%u|%lu",
-        (unsigned long)engine->status.pending,
+        "R|%lu|%lu|%lu|%u|%lu|%lu",
+        (unsigned long)engine->status.listed,
         (unsigned long)engine->stored,
         (unsigned long)engine->status.free_kb,
         state,
-        (unsigned long)engine->status.errors);
+        (unsigned long)engine->status.errors,
+        (unsigned long)engine->status.carry);
     furi_mutex_release(engine->mutex);
 }

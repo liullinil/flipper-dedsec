@@ -25,11 +25,11 @@ A Flipper Zero project in a Watch Dogs / DedSec style for **Unleashed firmware**
 | **RF** | RF Hunter: passive Sub-GHz scan / capture / follow and NFC-field detection, journal on the SD card |
 
 - **Vibrates** when a session needs you (question / approval, or the agent finished its turn) and when the console replies.
-- **Cyrillic** in session names, details and console output, in all four font sizes.
+- **Four font sizes** (Micro, Small, Normal, Large) for every tab; Cyrillic in session names, details and console output.
 - **Vertical mode** for holding the Flipper upright.
 - **Automatic updates**: the companion follows the GitHub releases, installs new Flipper app versions over BLE and replaces itself.
 - **Settings** on the Flipper: vibration, LED, screen wake, indicators, font size, orientation, tab order, RF options.
-- Companion: a DedSec tray panel, no settings to manage — it starts with Windows, keeps its Claude Code hooks on and updates itself and the Flipper app automatically; the RF analyzer.
+- Companion: a DedSec tray panel, no settings to manage — it starts with Windows, keeps its Claude Code hooks on and updates itself and the Flipper app automatically; the RF analyzer, which can also put a PC's RF records on the Flipper to take them to another PC.
 
 ![RF Hunter tab](docs/uplink_rf.png)
 

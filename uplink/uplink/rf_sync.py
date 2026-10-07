@@ -1,8 +1,8 @@
-"""RF journal import over the DedSec Uplink BLE link.
+"""RF journal import over the DedSec Uplink BLE link, and records carried to another PC.
 
 The RF Hunter is a tab of the DedSec Uplink Flipper app and its journal
 records travel over the companion's existing link (see
-``docs/rf_integration_contract.md``, sections 2 and 3).  :class:`RfSync` is a
+``docs/rf_hunter_design.md``, sections 2 and 3).  :class:`RfSync` is a
 passive protocol engine and never opens a BLE connection itself:
 
 * the link calls :meth:`RfSync.handle_line` with every Flipper line already
@@ -10,7 +10,13 @@ passive protocol engine and never opens a BLE connection itself:
 * the link polls :meth:`RfSync.urgent_lines` every 20-50 ms and sends the
   returned lines (link loop);
 * the companion reports connection changes with :meth:`RfSync.on_link`;
-* the UI calls :meth:`RfSync.status` and :meth:`RfSync.sync_now`.
+* the UI calls :meth:`RfSync.status`, :meth:`RfSync.sync_now` (Flipper -> PC)
+  and :meth:`RfSync.push_now` (PC -> Flipper).
+
+Every round and every push starts with ``RO|pc_id``: the Flipper lists the
+records other PCs carried to it only to a PC that said who it is, and never
+the ones that PC brought itself.  A Flipper app without carrying (before 1.3.0)
+answers ``RX|bad`` and the round simply goes on.
 
 Import rules:
 
@@ -28,16 +34,24 @@ Import rules:
   none, and is reported as a conflict (never acknowledged) when it differs;
 * store I/O runs inside :meth:`urgent_lines` without holding the lock, so the
   BLE thread and the UI never wait for an fsync.
+
+Push rules (``FLIPPER <- PC``): every record of the store goes to the
+Flipper's ``carry/<pc_id>/`` with ``RP`` (the Flipper answers ``RH`` when it
+already has it) and ``RW`` chunks in order, at most four in flight; ``RG``
+reports how many bytes the Flipper stored, a gap rewinds to it, and
+``RG == size`` means the record was verified and committed.
 """
 from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import os
 import threading
 import time
+import uuid
 from collections import deque
 from datetime import datetime
 from typing import Callable, Optional
@@ -46,7 +60,7 @@ from .rf_hunter import EventStore, RfEvent, default_store_root, validate_event_i
 
 log = logging.getLogger("uplink.rf_sync")
 
-RF_TAGS = ("R", "RI", "RE", "RD", "RK", "RX")
+RF_TAGS = ("R", "RI", "RE", "RD", "RK", "RX", "RO", "RG", "RH")
 READ_CHUNK = 120            # the Flipper returns at most this many bytes per RR
 MAX_INFLIGHT_READS = 4
 REQUEST_TIMEOUT = 3.0       # seconds to wait for RI/RE, RD or RK
@@ -56,8 +70,14 @@ MAX_READ_ERRORS = 8         # RX io replies tolerated while reading one record
 MAX_RECORD_BYTES = 1 << 20  # sanity limit for the size announced by RI
 AUTO_RETRY_BACKOFF = 30.0   # pause automatic rounds after a round-level failure
 CLOCK_INTERVAL = 3600.0     # resend Z| while the link stays up
+PUSH_CHUNK = 150            # record bytes per RW line (the Flipper takes up to 180)
+PUSH_WINDOW = 4             # RW lines in flight
+PUSH_RECORD_MAX = 64 * 1024  # the Flipper does not keep larger records
+PUSH_STALLS = 5             # RG-less timeouts tolerated while sending one record
 
-IDLE, LIST, CHECK, READ, COMMIT, ACK = "idle", "list", "check", "read", "commit", "ack"
+IDLE, HELLO, LIST, CHECK, READ, COMMIT, ACK = "idle", "hello", "list", "check", "read", "commit", "ack"
+PUSH_LOAD, PUSH_OFFER, PUSH_SEND = "push-load", "push-offer", "push-send"
+PUSH_PHASES = (PUSH_LOAD, PUSH_OFFER, PUSH_SEND)
 
 
 def _crc32(data: bytes) -> int:
@@ -71,12 +91,42 @@ def _same_observation(stored: RfEvent, incoming: RfEvent) -> bool:
             and stored.captured_at_utc == incoming.captured_at_utc)
 
 
+def local_pc_id() -> str:
+    """16 hex digits, stable for this Windows installation (MachineGuid), else for the host."""
+    seed = ""
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography",
+                                0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
+                seed = str(winreg.QueryValueEx(key, "MachineGuid")[0])
+        except OSError:
+            seed = ""
+    if not seed:
+        seed = f"{uuid.getnode():012x}"
+    return hashlib.sha256(("dedsec-uplink-pc:" + seed).encode("utf-8")).hexdigest()[:16]
+
+
+def push_payload(store: EventStore, event: RfEvent) -> bytes:
+    """The bytes to carry: the record exactly as the Flipper wrote it, else its JSON."""
+    payload = store.read_capture(event)
+    if not payload:
+        payload = json.dumps(event.to_dict(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if not payload.endswith(b"}\n"):
+        payload = payload.rstrip() + b"\n"
+    return payload
+
+
 class RfSync:
-    """Pull the Flipper RF journal into an :class:`EventStore` (thread-safe)."""
+    """Pull the Flipper RF journal into an :class:`EventStore` and carry records to the Flipper
+    (thread-safe)."""
 
     def __init__(self, store_root: str, *, clock: Callable[[], float] = time.monotonic,
-                 wall_clock: Callable[[], float] = time.time, send_clock: bool = True):
+                 wall_clock: Callable[[], float] = time.time, send_clock: bool = True,
+                 pc_id: Optional[str] = None):
         self.store_root = os.fspath(store_root)
+        self.pc_id = pc_id or local_pc_id()
         self._clock = clock
         self._wall_clock = wall_clock
         self._send_clock = bool(send_clock)
@@ -93,11 +143,15 @@ class RfSync:
             log.warning("RF store %s: %d malformed record(s) skipped", self.store_root,
                         self.store.skipped_records)
         self._handlers = {"R": self._on_status, "RI": self._on_item, "RE": self._on_end,
-                          "RD": self._on_data, "RK": self._on_acked, "RX": self._on_error}
+                          "RD": self._on_data, "RK": self._on_acked, "RX": self._on_error,
+                          "RO": self._on_hello, "RG": self._on_got, "RH": self._on_have}
         self._status = {
             "pending": None, "stored": None, "free_kb": None, "state": None, "errors": None,
+            "carry": None,
             "imported": 0, "failed": 0, "skipped": 0, "conflicts": 0,
             "last_error": "", "syncing": False, "last_sync": None, "link_up": False,
+            "pushing": False, "push_total": 0, "push_done": 0, "push_sent": 0, "push_present": 0,
+            "push_failed": 0, "push_error": "", "last_push": None,
         }
         self._link_up = False
         self._link_known = False
@@ -106,8 +160,10 @@ class RfSync:
         self._busy = False
         self._manual = False
         self._want_round = False
+        self._want_push = False
         self._auto_after = 0.0
         self._clock_sent_at: Optional[float] = None
+        self._after_hello = LIST
         self._cursor = 0
         self._item: Optional[dict] = None
         self._sent_at = 0.0
@@ -124,6 +180,9 @@ class RfSync:
         self._vanished: set = set()
         self._rejected: dict = {}
         self._malformed = 0
+        self._push_ids: list = []
+        self._push_index = 0
+        self._push: Optional[dict] = None
         # RX carries no request id.  Replies arrive in request order, so count
         # the RR replies still owed by a record we left; those RD/RX lines are
         # stale and must not be read as the answer to a later RL or RA.
@@ -174,7 +233,7 @@ class RfSync:
         return lines
 
     def on_link(self, up: bool) -> None:
-        """Link up/down; a round in progress is aborted when the link drops."""
+        """Link up/down; a round or push in progress is aborted when the link drops."""
         with self._lock:
             self._link_known = True
             changed = bool(up) != self._link_up
@@ -186,7 +245,7 @@ class RfSync:
                 self._link_up = False
                 self._out.clear()  # requests for the old connection must not leak
                 if self._phase != IDLE:
-                    self._abort_round(self._clock(), "link lost during RF sync")
+                    self._abort_round(self._clock(), "link lost during the transfer")
             if changed:
                 self._stale = 0  # replies of the old connection will never arrive
             self._status["link_up"] = self._link_up
@@ -200,19 +259,36 @@ class RfSync:
                 return
             self._start_round(self._clock(), manual=True)
 
+    def push_now(self) -> None:
+        """Copy every record of the store to the Flipper, for another PC to import."""
+        with self._lock:
+            if not self._link_up:
+                self._status["push_error"] = "Flipper not connected"
+                return
+            if self._phase != IDLE:
+                self._want_push = True  # after the round in progress
+                return
+            self._start_push(self._clock())
+
     def status(self) -> dict:
         """Snapshot for the UI.
 
-        Keys: ``pending``, ``stored``, ``free_kb``, ``state``, ``errors`` (from the
-        last ``R|`` line, ``None`` until one arrived), ``imported``, ``failed``
-        (session totals), ``last_error``, ``syncing``, ``last_sync`` (UTC epoch
-        seconds of the last completed round or ``None``), plus ``skipped``
-        (already imported, acknowledged again), ``conflicts``, ``link_up``,
-        ``current_event``/``current_progress`` and ``store_root``.
+        Keys: ``pending`` (what this PC can import), ``stored``, ``free_kb``,
+        ``state``, ``errors``, ``carry`` (records the Flipper carries for
+        some PC; from the last ``R|`` line, ``None`` until one arrived),
+        ``imported``, ``failed`` (session totals), ``last_error``, ``syncing``,
+        ``last_sync`` (UTC epoch seconds of the last completed round or
+        ``None``), plus ``skipped`` (already imported, acknowledged again),
+        ``conflicts``, ``link_up``, ``current_event``/``current_progress``,
+        ``store_root`` and the push: ``pushing``, ``push_total``,
+        ``push_done``, ``push_sent``, ``push_present`` (already on the
+        Flipper), ``push_failed``, ``push_error``, ``last_push``.
         """
         with self._lock:
             result = dict(self._status)
-            result["syncing"] = self._phase != IDLE
+            pushing = self._phase in PUSH_PHASES or (self._phase == HELLO and self._after_hello == PUSH_LOAD)
+            result["pushing"] = pushing
+            result["syncing"] = self._phase != IDLE and not pushing
             result["store_root"] = self.store_root
             result["current_event"] = ""
             result["current_progress"] = ""
@@ -229,15 +305,28 @@ class RfSync:
         log.debug("ignored malformed RF line %s|%s", tag, "|".join(fields)[:120])
 
     def _on_status(self, fields: list, now: float) -> None:
-        """``R|pending|stored|free_kb|state|errors``"""
+        """``R|pending|stored|free_kb|state|errors[|carry]``"""
         try:
             pending, stored, free_kb, state, errors = (int(value) for value in fields[:5])
+            carry = int(fields[5]) if len(fields) > 5 else None
         except ValueError:
             self._bad_line("R", fields)
             return
-        self._status.update(pending=pending, stored=stored, free_kb=free_kb, state=state, errors=errors)
+        self._status.update(pending=pending, stored=stored, free_kb=free_kb, state=state, errors=errors,
+                            carry=carry)
         if pending > 0 and self._phase == IDLE and self._link_up and now >= self._auto_after:
             self._start_round(now, manual=False)
+
+    def _on_hello(self, fields: list, now: float) -> None:
+        """``RO|listed|carry``: the Flipper knows this PC now (reply to RO)."""
+        try:
+            listed, carry = int(fields[0]), int(fields[1])
+        except (IndexError, ValueError):
+            self._bad_line("RO", fields)
+            return
+        self._status.update(pending=listed, carry=carry)
+        if self._phase == HELLO:
+            self._hello_done(now, carrying=True)
 
     def _on_item(self, fields: list, now: float) -> None:
         """``RI|next|event_id|size|crc32`` (reply to RL)."""
@@ -325,6 +414,39 @@ class RfSync:
             self._stale = 0
             self._record_done(now)
 
+    def _on_have(self, fields: list, now: float) -> None:
+        """``RH|event_id``: the Flipper already holds this record (reply to RP)."""
+        item = self._push
+        if self._phase == PUSH_OFFER and item is not None and fields and fields[0] == item["event_id"]:
+            self._status["push_present"] += 1
+            self._push_record_done(now)
+
+    def _on_got(self, fields: list, now: float) -> None:
+        """``RG|event_id|received``: bytes the Flipper stored (reply to RP and every RW)."""
+        item = self._push
+        if item is None or not fields or fields[0] != item["event_id"]:
+            return  # about a record we already left
+        try:
+            received = int(fields[1])
+        except (IndexError, ValueError):
+            self._bad_line("RG", fields)
+            return
+        if self._phase == PUSH_OFFER:
+            self._phase = PUSH_SEND
+            item.update(acked=received, next=received, rewind=None, progress_at=now, stalls=0)
+        elif self._phase != PUSH_SEND:
+            return
+        if received >= item["size"]:
+            self._status["push_sent"] += 1  # verified and committed on the Flipper
+            self._push_record_done(now)
+            return
+        if received > item["acked"]:
+            item.update(acked=received, progress_at=now)
+        elif received == item["acked"] and received < item["next"] and item["rewind"] != received:
+            # No progress although more was sent: a chunk was lost, send again from there.
+            item.update(next=received, rewind=received)
+        self._send_window(now)
+
     def _on_error(self, fields: list, now: float) -> None:
         """``RX|code|text``: nf, bad, io or off."""
         code = fields[0].lower() if fields else ""
@@ -344,6 +466,10 @@ class RfSync:
                 return
         if code == "off":
             self._abort_round(now, "RF sync is disabled on the Flipper", backoff=True)
+        elif phase == HELLO:
+            self._hello_done(now, carrying=False)  # a Flipper app that cannot carry records
+        elif phase in (PUSH_OFFER, PUSH_SEND):
+            self._on_push_error(code, text, detail, now)
         elif phase == LIST:
             self._retry_list(now, f"Flipper could not list records ({detail})")
         elif phase == READ and item is not None:
@@ -373,9 +499,38 @@ class RfSync:
                 self._fail_item(now, f"Flipper rejected the acknowledgement of {item['event_id']} ({detail})")
             else:
                 self._resend_ack(now, f"acknowledging {item['event_id']} failed ({detail})")
-        # CHECK/COMMIT: no request is outstanding, so the error is stale.
+        # CHECK/COMMIT/PUSH_LOAD: no request is outstanding, so the error is stale.
+
+    def _on_push_error(self, code: str, text: str, detail: str, now: float) -> None:
+        item = self._push
+        if item is None or text.split(" ", 1)[0] != item["event_id"]:
+            return  # about another record (late), or an answer we cannot place
+        if code == "io":
+            self._abort_round(now, f"the Flipper cannot store records ({detail})")
+        elif code == "nf" and self._phase == PUSH_SEND and item["offers"] < MAX_ATTEMPTS:
+            self._offer(now)  # the Flipper dropped the half-received record: from the start
+        else:
+            self._push_fail(now, f"the Flipper refused {item['event_id']} ({detail})")
 
     # ================================================================== round control
+    def _send_hello(self, now: float, then: str) -> None:
+        """``RO|pc_id`` before the listing or the push; the answer (or its absence) moves on."""
+        self._phase = HELLO
+        self._after_hello = then
+        self._attempts = 1
+        self._sent_at = now
+        self._out.append(f"RO|{self.pc_id}")
+
+    def _hello_done(self, now: float, carrying: bool) -> None:
+        if self._after_hello == PUSH_LOAD:
+            if not carrying:
+                self._abort_round(now, "the Flipper app is too old to carry records "
+                                       "(it updates itself from the companion)")
+                return
+            self._next_push(now)
+        else:
+            self._send_list(now)
+
     def _start_round(self, now: float, manual: bool) -> None:
         self._gen += 1
         self._manual = manual
@@ -389,7 +544,7 @@ class RfSync:
         self._clear_record()
         self._status["syncing"] = True
         log.info("RF sync round started (%s)", "manual" if manual else "pending on Flipper")
-        self._send_list(now)
+        self._send_hello(now, then=LIST)
 
     def _finish_round(self, now: float) -> None:
         del now
@@ -404,9 +559,17 @@ class RfSync:
                  self._status["imported"], self._status["failed"])
 
     def _abort_round(self, now: float, message: str, backoff: bool = False) -> None:
+        pushing = self._phase in PUSH_PHASES or (self._phase == HELLO and self._after_hello == PUSH_LOAD)
         self._gen += 1
         self._phase = IDLE
         self._clear_record()
+        self._push = None
+        if pushing:
+            self._status["pushing"] = False
+            if message:
+                self._status["push_error"] = message
+                log.warning("RF push: %s", message)
+            return
         self._status["syncing"] = False
         if message:
             self._set_error(message)
@@ -500,6 +663,85 @@ class RfSync:
         self._cursor = next_cursor  # skip the record; it stays on the Flipper
         self._send_list(now)
 
+    # ================================================================== push (PC -> Flipper)
+    def _start_push(self, now: float) -> None:
+        self._gen += 1
+        self._want_push = False
+        events = self.store.events
+        self._push_ids = sorted(events, key=lambda eid: (str(events[eid].captured_at_utc), eid))
+        self._push_index = 0
+        self._push = None
+        self._status.update(pushing=True, push_total=len(self._push_ids), push_done=0, push_sent=0,
+                            push_present=0, push_failed=0, push_error="")
+        log.info("RF push to the Flipper started: %d record(s)", len(self._push_ids))
+        self._send_hello(now, then=PUSH_LOAD)
+
+    def _next_push(self, now: float) -> None:
+        self._push = None
+        if self._push_index >= len(self._push_ids):
+            self._finish_push(now)
+            return
+        self._phase = PUSH_LOAD  # urgent_lines() reads the record outside the lock
+
+    def _offer(self, now: float) -> None:
+        item = self._push
+        item["offers"] += 1
+        self._phase = PUSH_OFFER
+        self._attempts = 1
+        self._sent_at = now
+        self._out.append(f"RP|{item['event_id']}|{item['size']}|{item['crc32']}")
+
+    def _send_window(self, now: float) -> None:
+        item = self._push
+        payload = item["payload"]
+        while item["next"] < item["size"] and item["next"] - item["acked"] < PUSH_WINDOW * PUSH_CHUNK:
+            offset = item["next"]
+            chunk = payload[offset:offset + PUSH_CHUNK]
+            self._out.append(f"RW|{item['event_id']}|{offset}|{base64.b64encode(chunk).decode('ascii')}")
+            item["next"] = offset + len(chunk)
+            item["sent_at"] = now
+
+    def _push_record_done(self, now: float) -> None:
+        self._status["push_done"] += 1
+        self._push_index += 1
+        self._next_push(now)
+
+    def _push_fail(self, now: float, message: str) -> None:
+        self._status["push_failed"] += 1
+        self._status["push_error"] = message
+        log.warning("RF push: %s", message)
+        self._push_record_done(now)
+
+    def _finish_push(self, now: float) -> None:
+        del now
+        self._gen += 1
+        self._phase = IDLE
+        self._push = None
+        self._status["pushing"] = False
+        self._status["last_push"] = self._wall_clock()
+        if not self._status["push_failed"]:
+            self._status["push_error"] = ""
+        log.info("RF push done: %d sent, %d already on the Flipper, %d failed",
+                 self._status["push_sent"], self._status["push_present"], self._status["push_failed"])
+
+    def _tick_push(self, now: float) -> None:
+        item = self._push
+        if self._phase == PUSH_OFFER:
+            if now - self._sent_at >= REQUEST_TIMEOUT:
+                if self._attempts >= MAX_ATTEMPTS:
+                    self._push_fail(now, f"no answer from the Flipper about {item['event_id']}")
+                    return
+                self._attempts += 1
+                self._sent_at = now
+                self._out.append(f"RP|{item['event_id']}|{item['size']}|{item['crc32']}")
+        elif self._phase == PUSH_SEND and now - item["progress_at"] >= REQUEST_TIMEOUT:
+            item["stalls"] += 1
+            if item["stalls"] > PUSH_STALLS:
+                self._push_fail(now, f"sending {item['event_id']} stalled at {item['acked']}/{item['size']} bytes")
+                return
+            item.update(next=item["acked"], rewind=None, progress_at=now)  # send again from there
+            self._send_window(now)
+
     # ================================================================== timers
     def _clock_line(self) -> str:
         utc = int(self._wall_clock())
@@ -519,6 +761,16 @@ class RfSync:
         if phase == IDLE:
             if self._want_round and self._link_up:
                 self._start_round(now, manual=True)
+            elif self._want_push and self._link_up:
+                self._start_push(now)
+        elif phase == HELLO:
+            if now - self._sent_at >= REQUEST_TIMEOUT:
+                if self._attempts < 2:
+                    self._attempts += 1
+                    self._sent_at = now
+                    self._out.append(f"RO|{self.pc_id}")
+                else:
+                    self._hello_done(now, carrying=False)  # no answer: list without carried records
         elif phase == LIST:
             if now - self._sent_at >= REQUEST_TIMEOUT:
                 self._retry_list(now, f"no reply to RL|{self._cursor}")
@@ -527,6 +779,8 @@ class RfSync:
         elif phase == ACK:
             if now - self._sent_at >= REQUEST_TIMEOUT:
                 self._resend_ack(now, f"no RK for {self._item['event_id']}")
+        elif phase in (PUSH_OFFER, PUSH_SEND):
+            self._tick_push(now)
 
     def _tick_read(self, now: float) -> None:
         item = self._item
@@ -573,7 +827,12 @@ class RfSync:
 
     # ================================================================== store jobs
     def _claim_job(self) -> Optional[tuple]:
-        if self._busy or self._phase not in (CHECK, COMMIT) or self._item is None:
+        if self._busy:
+            return None
+        if self._phase == PUSH_LOAD:
+            self._busy = True
+            return (PUSH_LOAD, self._gen, {"event_id": self._push_ids[self._push_index]}, b"")
+        if self._phase not in (CHECK, COMMIT) or self._item is None:
             return None
         self._busy = True
         return (self._phase, self._gen, dict(self._item), self._payload)
@@ -583,6 +842,14 @@ class RfSync:
         phase, _gen, item, payload = job
         event_id = item["event_id"]
         store = self.store
+        if phase == PUSH_LOAD:
+            event = store.events.get(event_id)
+            if event is None:
+                return ("skip", f"{event_id} is no longer in the store")
+            payload = push_payload(store, event)
+            if len(payload) > PUSH_RECORD_MAX:
+                return ("skip", f"{event_id} is larger than the Flipper keeps ({len(payload)} bytes)")
+            return ("loaded", payload)
         if phase == CHECK:
             existing = store.events.get(event_id)
             if existing is None:
@@ -624,7 +891,19 @@ class RfSync:
             return ("reject", f"cannot import {event_id}: {exc}")
 
     def _apply_job(self, job: tuple, result: tuple, now: float) -> None:
-        phase, gen, _item, _payload = job
+        phase, gen, item, _payload = job
+        if phase == PUSH_LOAD:
+            if gen != self._gen or self._phase != PUSH_LOAD:
+                return  # the push ended meanwhile (link loss)
+            action, detail = result
+            if action != "loaded":
+                self._push_fail(now, detail)
+                return
+            self._push = {"event_id": item["event_id"], "payload": detail, "size": len(detail),
+                          "crc32": _crc32(detail), "offers": 0, "acked": 0, "next": 0, "rewind": None,
+                          "progress_at": now, "stalls": 0, "sent_at": now}
+            self._offer(now)
+            return
         if gen != self._gen or self._phase != phase or self._item is None:
             return  # the round ended meanwhile (link loss); a commit stays valid
         action, detail = result
@@ -654,5 +933,5 @@ class RfSync:
                 self._abort_round(now, detail, backoff=True)
 
 
-__all__ = ["RfSync", "default_store_root", "RF_TAGS", "READ_CHUNK", "MAX_INFLIGHT_READS",
-           "REQUEST_TIMEOUT", "RECORD_TIMEOUT"]
+__all__ = ["RfSync", "default_store_root", "local_pc_id", "push_payload", "RF_TAGS", "READ_CHUNK",
+           "MAX_INFLIGHT_READS", "REQUEST_TIMEOUT", "RECORD_TIMEOUT", "PUSH_CHUNK", "PUSH_WINDOW"]

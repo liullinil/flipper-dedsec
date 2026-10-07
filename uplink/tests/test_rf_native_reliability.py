@@ -353,3 +353,88 @@ def test_companion_rf_sync_imports_from_the_real_flipper_journal(harness, tmp_pa
         assert longest.frequency_hz == 315000000
     finally:
         flipper.close()
+
+
+def _drive(sync, flipper, done, steps=5000):
+    """Play the link loop between an RfSync and the protocol REPL until done(status)."""
+    for _ in range(steps):
+        lines = sync.urgent_lines()
+        for line in lines:
+            reply = flipper.ask(line)
+            assert sync.handle_line(reply.split("|")), reply
+        status = sync.status()
+        if not lines and done(status):
+            return status
+    raise AssertionError(f"did not settle: {sync.status()}")
+
+
+def test_records_carried_by_the_flipper_reach_another_pc(harness, tmp_path):
+    """PC A puts its records on the Flipper (the real C journal), PC B imports them, and PC A
+    never gets its own carried records back."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from uplink.rf_hunter import EventStore
+    from uplink.rf_sync import RfSync
+
+    flipper = _Flipper(harness)
+    try:
+        assert flipper.ask("#keep 0") == "#ok"
+        pc_a = RfSync(str(tmp_path / "a"), send_clock=False, pc_id="aaaaaaaa11111111")
+        pc_a.on_link(True)
+        pc_a.sync_now()
+        _drive(pc_a, flipper, lambda st: not st["syncing"] and st["imported"] == 4)
+        assert flipper.ask("#stats") == "#stats 0 0"
+
+        pc_a.push_now()
+        status = _drive(pc_a, flipper, lambda st: not st["pushing"])
+        assert (status["push_total"], status["push_sent"], status["push_failed"]) == (4, 4, 0), status
+        assert flipper.ask("#carry") == "#carry 4 0"   # carried, but not for the PC that brought them
+        pc_a.push_now()                                 # a second push has nothing to send
+        status = _drive(pc_a, flipper, lambda st: not st["pushing"])
+        assert (status["push_sent"], status["push_present"]) == (0, 4), status
+        pc_a.sync_now()
+        status = _drive(pc_a, flipper, lambda st: not st["syncing"])
+        assert status["imported"] == 4 and status["pending"] == 0 and status["carry"] == 4
+
+        pc_b = RfSync(str(tmp_path / "b"), send_clock=False, pc_id="bbbbbbbb22222222")
+        pc_b.on_link(True)
+        pc_b.sync_now()
+        status = _drive(pc_b, flipper, lambda st: not st["syncing"] and st["imported"] == 4)
+        assert status["failed"] == 0, status
+        assert flipper.ask("#carry") == "#carry 0 0"   # imported and removed from the Flipper
+        store_a = EventStore(str(tmp_path / "a"), read_only=True)
+        store_b = EventStore(str(tmp_path / "b"), read_only=True)
+        assert sorted(store_b.events) == sorted(store_a.events)
+        for event_id in store_a.events:   # byte for byte what the Flipper recorded
+            assert store_b.read_capture(event_id) == store_a.read_capture(event_id)
+    finally:
+        flipper.close()
+
+
+def test_carry_protocol_lines(harness):
+    """RO/RP/RW as the companion sends them: replies, gaps, repeats, refusals."""
+    flipper = _Flipper(harness)
+    try:
+        record = b'{"event_id":"pc-1","schema_version":1}\n'
+        crc = binascii.crc32(record)
+        assert flipper.ask(f"RP|pc-1|{len(record)}|{crc}") == "RX|bad|pc-1 send RO first"
+        assert flipper.ask("RO|not-hex") .startswith("RX|bad|")
+        assert flipper.ask("RO|0123456789abcdef") == "RO|4|0"
+        assert flipper.ask(f"RP|pc-1|{len(record)}|{crc}") == "RG|pc-1|0"
+        b64 = base64.b64encode
+        assert flipper.ask(f"RW|pc-1|20|{b64(record[20:]).decode()}") == "RG|pc-1|0"   # a gap
+        assert flipper.ask(f"RW|pc-1|0|{b64(record[:20]).decode()}") == "RG|pc-1|20"
+        assert flipper.ask(f"RW|pc-1|0|{b64(record[:20]).decode()}") == "RG|pc-1|20"  # a repeat
+        assert flipper.ask("RW|pc-1|20|!!!!").startswith("RX|bad|pc-1 ")
+        assert flipper.ask(f"RW|pc-1|20|{b64(record[20:]).decode()}") == f"RG|pc-1|{len(record)}"
+        assert flipper.ask(f"RP|pc-1|{len(record)}|{crc}") == "RH|pc-1"
+        assert flipper.ask("#carry") == "#carry 1 4"
+        too_long = "A" * 244   # 183 bytes, more than one RW line may carry
+        assert flipper.ask(f"RP|pc-2|{len(record)}|{crc}") == "RG|pc-2|0"
+        assert flipper.ask(f"RW|pc-2|0|{too_long}").startswith("RX|bad|pc-2 ")
+        assert flipper.ask("#idle") == "#ok"            # the PC went quiet: the half copy is gone
+        assert flipper.ask(f"RW|pc-2|0|{b64(record[:10]).decode()}") == "RX|nf|pc-2 not being received"
+        assert flipper.ask("#carry") == "#carry 1 4"
+    finally:
+        flipper.close()

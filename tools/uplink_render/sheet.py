@@ -51,7 +51,8 @@ def main():
          "rf_scout_v_normal", "offline_v_normal"],
         os.path.join(DOCS, "uplink_vertical.png"), 6)
     sheet(
-        ["cdx_list_h_micro", "cdx_list_h_small", "cdx_list_h_normal", "cdx_list_h_large"],
+        [f"{screen}_h_{size}" for screen in ("sys_bars", "cdx_list", "rf_scout")
+         for size in ("micro", "small", "normal", "large")],
         os.path.join(DOCS, "uplink_fonts.png"), 4)
     sheet(["rf_scout_h_normal", "rf_follow_h_normal", "rf_nfc_h_normal", "rf_full_h_normal"],
           os.path.join(DOCS, "uplink_rf.png"), 2)

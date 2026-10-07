@@ -92,6 +92,7 @@ Records are the schema-1 JSON of the former standalone app, one object per file 
 | `events/<id>.json` | Pending records |
 | `events/<id>.bad` | Quarantined malformed records (never listed) |
 | `uploaded/<id>.json` | Records kept after an ACK when `keep_uploaded` is set |
+| `carry/<pc_id>/<id>.json` | Records PC `<pc_id>` put here for another PC (`RP`/`RW`) |
 | `device_id` | 16 hex characters, created once |
 | `inflight` | 64-byte intent marker: `W <id>` (writing) or `M <id>` (moving) |
 
@@ -113,19 +114,28 @@ journal never renames a record:
 - **Listing:** `RL` streams the record to compute size and crc32. A file that is not one
   complete JSON object is renamed to `<id>.bad` so it cannot block every sync round.
 - `uploaded/` keeps at most 512 copies (directory order, roughly oldest first).
+- **Carrying:** `RO|pc_id` tells the store which PC is on the link. `RP` opens
+  `carry/<pc_id>/<id>.json` (`RH` when the same record is already pending or carried, a refusal
+  when another record has this id), `RW` chunks must arrive in order and are answered with the
+  bytes stored; at the announced size the CRC-32 and the `{` ... `}` + newline shape are checked and
+  the file is synced. A record left unfinished (3 s without requests, another `RP`, a different
+  PC) is deleted. `RL` lists `events/` first, then the other PCs' `carry/` folders, and only to a
+  PC that sent `RO`; `RR`/`RA` find a record in either place. A carried copy that is not one
+  complete record is deleted instead of quarantined: the PC that brought it still has it.
 - One read handle is cached for the record being synced (closed after 3 s without
   requests, before any remove), so the `RR` chunks of a record do not each rescan the folder.
 
-`R|pending|stored|free_kb|state|errors`: `stored` = files in `events/` + `uploaded/`; `state` 0 off,
-1 Sub-GHz RX, 2 NFC detect. The engine never sends `R|` itself; it calls `changed` when
+`R|listed|stored|free_kb|state|errors|carry`: `listed` = what the PC on the link can import
+(`events/` plus the other PCs' carried records), `stored` = files in `events/` + `uploaded/` +
+`carry/`, `carry` = carried records of every PC; `state` 0 off, 1 Sub-GHz RX, 2 NFC detect. The engine never sends `R|` itself; it calls `changed` when
 `pending` (or anything else) changes and the app sends the line. `RX|off` is for the app to
 send when RF sync is disabled; the engine only produces `nf`, `bad` and `io`. The text of an
 `RX` line starts with the event id when the request had a valid one.
 
 ## Limits
 
-- Heap ≈ 17 KiB: ring 4 KiB, timings 2 KiB, record buffer 4 KiB, store ≈ 2 KiB,
-  queue ≈ 0.8 KiB, worker stack 3 KiB, engine state ≈ 1 KiB.
+- Heap ≈ 19 KiB: ring 4 KiB, timings 2 KiB, record buffer 4 KiB, store ≈ 2.5 KiB,
+  queue ≈ 2.4 KiB (eight requests up to an `RW` line), worker stack 4 KiB, engine state ≈ 1 KiB.
 - The engine is narrowband: one frequency at a time, OOK demodulation only.
 - A channel that stays above the threshold produces one event per `capture_ms`.
 - FAT directory lookups are linear: saving and listing slow down with thousands of pending

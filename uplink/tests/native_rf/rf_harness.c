@@ -362,6 +362,132 @@ static void test_uploaded_cap(void) {
     rf_store_free(store);
 }
 
+/* Send `length` bytes of record_text as RW chunks of `chunk` bytes; returns the last *received. */
+static uint32_t put_all(RfStore* store, const char* id, size_t length, size_t chunk) {
+    uint32_t received = 0;
+    for(size_t offset = 0; offset < length; offset += chunk) {
+        size_t n = length - offset < chunk ? length - offset : chunk;
+        CHECK(
+            rf_store_put_write(
+                store, id, (uint32_t)offset, (const uint8_t*)record_text + offset, n, &received) ==
+            RfStoreOk);
+        CHECK(received == offset + n);
+    }
+    return received;
+}
+
+static void test_carry(void) {
+    static const char* const pc_a = "aaaaaaaa11111111";
+    static const char* const pc_b = "bbbbbbbb22222222";
+    char id[RF_STORE_ID_MAX + 1];
+    uint32_t size = 0, crc = 0, received = 0;
+    fake_reset();
+    RfStore* store = boot();
+    CHECK(!rf_store_set_peer(store, "XYZ") && !rf_store_set_peer(store, "abc"));
+    CHECK(!rf_store_set_peer(store, "aaaaaaaa111111112")); /* 17 digits */
+    save_ok(store, "ev-1", 1);
+    uint32_t length = (uint32_t)build("c-1", 7, 40, 500);
+    uint32_t record_crc = rf_store_crc32(0, record_text, length);
+    /* carrying needs to know the PC */
+    CHECK(rf_store_put_begin(store, "c-1", length, record_crc) == RfStoreErrNoPeer);
+    CHECK(rf_store_set_peer(store, pc_a));
+    CHECK(rf_store_put_begin(store, "c-1", RF_STORE_RECORD_MAX + 1U, record_crc) == RfStoreErrInvalid);
+    CHECK(rf_store_put_begin(store, "c-1", length, record_crc) == RfStoreOk);
+    /* a gap and a repeat change nothing: the PC continues from *received */
+    CHECK(
+        rf_store_put_write(store, "c-1", 100, (const uint8_t*)record_text + 100, 50, &received) ==
+        RfStoreOk);
+    CHECK(received == 0);
+    CHECK(rf_store_put_write(store, "c-1", 0, (const uint8_t*)record_text, 100, &received) == RfStoreOk);
+    CHECK(received == 100);
+    CHECK(rf_store_put_write(store, "c-1", 0, (const uint8_t*)record_text, 100, &received) == RfStoreOk);
+    CHECK(received == 100);
+    CHECK(
+        rf_store_put_write(store, "other", 100, (const uint8_t*)record_text, 10, &received) ==
+        RfStoreErrNotFound);
+    for(size_t offset = 100; offset < length; offset += 180) {
+        size_t n = length - offset < 180 ? length - offset : 180;
+        CHECK(
+            rf_store_put_write(
+                store, "c-1", (uint32_t)offset, (const uint8_t*)record_text + offset, n, &received) ==
+            RfStoreOk);
+    }
+    CHECK(received == length);
+    char carry_path[160];
+    snprintf(carry_path, sizeof(carry_path), "%s/%s", RF_STORE_CARRY_DIR, pc_a);
+    CHECK(file_equals(carry_path, "c-1", record_text, length));
+    CHECK(rf_store_carry(store) == 1 && rf_store_pending(store) == 1);
+    CHECK(rf_store_listed(store) == 1); /* never listed back to the PC that brought it */
+    CHECK(rf_store_list(store, 0, id, sizeof(id), &size, &crc) == RfStoreOk && !strcmp(id, "ev-1"));
+    CHECK(rf_store_list(store, 1, id, sizeof(id), &size, &crc) == RfStoreErrNotFound);
+    /* the same record again, or one pending here: already present */
+    CHECK(rf_store_put_begin(store, "c-1", length, record_crc) == RfStoreErrExists);
+    CHECK(rf_store_put_begin(store, "c-1", length, record_crc ^ 1U) == RfStoreErrMismatch);
+    uint32_t ev_length = (uint32_t)build("ev-1", 1, 24, 400);
+    CHECK(
+        rf_store_put_begin(store, "ev-1", ev_length, rf_store_crc32(0, record_text, ev_length)) ==
+        RfStoreErrExists);
+    /* a wrong checksum at the end drops the copy */
+    length = (uint32_t)build("c-bad", 8, 10, 300);
+    CHECK(rf_store_put_begin(store, "c-bad", length, rf_store_crc32(0, record_text, length) ^ 1U) == RfStoreOk);
+    for(size_t offset = 0; offset < length; offset += 180) {
+        size_t n = length - offset < 180 ? length - offset : 180;
+        RfStoreResult result = rf_store_put_write(
+            store, "c-bad", (uint32_t)offset, (const uint8_t*)record_text + offset, n, &received);
+        CHECK(offset + n < length ? result == RfStoreOk : result == RfStoreErrMismatch);
+    }
+    CHECK(!has_file(carry_path, "c-bad", ".json") && rf_store_carry(store) == 1);
+    /* the PC goes quiet in the middle of a record: the half copy is removed */
+    length = (uint32_t)build("c-2", 9, 40, 500);
+    CHECK(rf_store_put_begin(store, "c-2", length, rf_store_crc32(0, record_text, length)) == RfStoreOk);
+    CHECK(rf_store_put_write(store, "c-2", 0, (const uint8_t*)record_text, 100, &received) == RfStoreOk);
+    rf_store_idle(store);
+    CHECK(!has_file(carry_path, "c-2", ".json") && rf_store_carry(store) == 1);
+    CHECK(fake_open_handles() == 0);
+    /* power fails in the middle of a record: the torn copy survives the reboot ... */
+    length = (uint32_t)build("c-3", 10, 40, 500);
+    CHECK(rf_store_put_begin(store, "c-3", length, rf_store_crc32(0, record_text, length)) == RfStoreOk);
+    CHECK(rf_store_put_write(store, "c-3", 0, (const uint8_t*)record_text, 100, &received) == RfStoreOk);
+    fake_power_cut_after(10);
+    CHECK(
+        rf_store_put_write(store, "c-3", 100, (const uint8_t*)record_text + 100, 100, &received) ==
+        RfStoreErrIo);
+    power_cycle(&store);
+    CHECK(has_file(carry_path, "c-3", ".json") && rf_store_carry(store) == 2);
+    /* ... and is deleted, not served, when another PC lists the carried records */
+    CHECK(rf_store_listed(store) == 1); /* nobody identified: no carried records */
+    CHECK(rf_store_set_peer(store, pc_b));
+    CHECK(rf_store_listed(store) == 3);
+    CHECK(rf_store_list(store, 0, id, sizeof(id), &size, &crc) == RfStoreOk && !strcmp(id, "ev-1"));
+    uint32_t c1_size = 0, c1_crc = 0;
+    CHECK(rf_store_list(store, 1, id, sizeof(id), &c1_size, &c1_crc) == RfStoreOk);
+    CHECK(!strcmp(id, "c-1") && c1_crc == record_crc);
+    CHECK(rf_store_list(store, 2, id, sizeof(id), &size, &crc) == RfStoreErrNotFound);
+    CHECK(!has_file(carry_path, "c-3", ".json") && rf_store_carry(store) == 1);
+    CHECK(rf_store_listed(store) == 2);
+    /* the other PC reads and acknowledges it like a pending record (kept copy in uploaded/) */
+    uint8_t chunk[RF_PROTO_CHUNK];
+    size_t got = 0;
+    CHECK(rf_store_read(store, "c-1", 0, chunk, sizeof(chunk), &got, &size) == RfStoreOk);
+    CHECK(got == sizeof(chunk) && size == c1_size);
+    CHECK(rf_store_ack(store, "c-1", c1_size, c1_crc, true) == RfStoreOk);
+    CHECK(!has_file(carry_path, "c-1", ".json") && has_file(RF_STORE_UPLOADED_DIR, "c-1", ".json"));
+    CHECK(rf_store_carry(store) == 0 && rf_store_listed(store) == 1);
+    CHECK(rf_store_ack(store, "c-1", c1_size, c1_crc, true) == RfStoreOk); /* a repeated ACK */
+    /* the PC that brought it can bring it again (uploaded/ is history, not presence) */
+    CHECK(rf_store_set_peer(store, pc_a));
+    length = (uint32_t)build("c-1", 7, 40, 500);
+    CHECK(rf_store_put_begin(store, "c-1", length, record_crc) == RfStoreOk);
+    CHECK(put_all(store, "c-1", length, 150) == length);
+    CHECK(rf_store_carry(store) == 1 && rf_store_listed(store) == 1);
+    /* forgetting the PC hides carried records again */
+    CHECK(rf_store_set_peer(store, ""));
+    CHECK(rf_store_listed(store) == 1 && rf_store_carry(store) == 1);
+    CHECK(rf_store_put_begin(store, "c-9", length, record_crc) == RfStoreErrNoPeer);
+    rf_store_free(store);
+    CHECK(fake_open_handles() == 0);
+}
+
 static int run_store_tests(void) {
     test_crc_and_ids();
     test_round_trip();
@@ -370,6 +496,7 @@ static int run_store_tests(void) {
     test_quarantine_and_names();
     test_low_space();
     test_uploaded_cap();
+    test_carry();
     puts("RF store tests passed");
     return 0;
 }
@@ -540,6 +667,14 @@ static int run_proto(void) {
         if(line[0] == '#') {
             if(strncmp(line, "#keep ", 6) == 0) {
                 keep_uploaded = line[6] == '1';
+                puts("#ok");
+            } else if(strcmp(line, "#carry") == 0) {
+                printf(
+                    "#carry %lu %lu\n",
+                    (unsigned long)rf_store_carry(store),
+                    (unsigned long)rf_store_listed(store));
+            } else if(strcmp(line, "#idle") == 0) {
+                rf_store_idle(store);
                 puts("#ok");
             } else if(strcmp(line, "#stats") == 0) {
                 printf(
