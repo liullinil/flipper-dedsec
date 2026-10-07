@@ -167,3 +167,35 @@ def test_never_locks_before_a_link_ever_existed():
     b.on_link("searching")
     clock.t += bo.LINK_GRACE * 10
     assert not b.tick()
+
+
+def test_the_flipper_coming_back_unlocks_after_an_absence():
+    clock = Clock()
+    b, *_ = make(auto=True, clock=clock)
+    clock.t += bo.ARM_AFTER + 1
+    b.on_link("connected")
+    b.on_link("searching")
+    clock.t += bo.LINK_GRACE
+    assert b.tick() and b.active and b.reason == "link lost"
+    clock.t += 600
+    b.on_link("connected")                        # back at the desk
+    assert not b.active and b.frame_line() == "BO|0|2"
+    # a blackout from the Flipper at the desk: a short BLE hiccup must not open it
+    b.lock("flipper")
+    b.on_link("searching")
+    clock.t += 5
+    b.on_link("connected")
+    assert b.active
+    # ... but coming back after a real absence does
+    b.on_link("searching")
+    clock.t += bo.LINK_GRACE
+    b.on_link("connected")
+    assert not b.active
+
+
+def test_a_tray_blackout_while_the_flipper_is_away_opens_when_it_arrives():
+    b, cfg, saved, desktop, clock = make()
+    clock.t += 100                                # the link was never up
+    b.lock("tray")
+    b.on_link("connected")
+    assert not b.active

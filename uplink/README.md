@@ -58,18 +58,29 @@ OK on the banner opens that session.
 ![Blackout](../docs/uplink_blackout.png)
 
 OK on the SYS tab asks `BLACKOUT THE PC?`; OK again and the companion minimises every window, mutes the
-sound and covers every monitor with a DedSec lock screen: a glitching wordmark, code rain, the profiler
-reticle or a scanned skyline (picked at random each time), the clock, a ticker of taglines, a **PIN**
-field and a **POWER OFF** button (click it twice). The PIN unlocks it; so does OK on the Flipper's SYS tab,
-which now shows `>> BLACKOUT <<` — the Flipper is the key. On unlock the windows come back where they were
-and the sound is unmuted (if it was on). The Windows key and Alt+Tab / Alt+F4 are swallowed while the
-screen is up; Ctrl+Alt+Del still works, this is a curtain, not a Windows credential provider.
+sound and covers every monitor with a DedSec lock screen. One of eight scenes is picked at random, each
+with its own accent palette, so it never looks the same twice: a glitching wordmark, code rain, the
+profiler reticle, a scanned skyline, circuit traces, a radar sweep, an RF spectrum analyzer or the ctOS
+node map (no skulls). On top: the clock, a ticker of taglines, a **PIN** field and a **POWER OFF** button
+(click it twice). The PIN unlocks it; so does OK on the Flipper's SYS tab, which shows `>> BLACKOUT <<` —
+the Flipper is the key. On unlock the windows come back where they were and the sound is unmuted (if it
+was on).
+
+**Coming back unlocks.** When you return and the Flipper reconnects after you were away, the screen
+lifts by itself — no PIN needed, the key is in your pocket. A blackout you made at the desk, with the
+Flipper right next to the PC, stays until OK on the Flipper or the PIN, so a brief Bluetooth hiccup can
+never open it.
+
+The curtain does not fight the operating system: it never keeps the PC awake and never blocks Windows'
+own lock or sleep, so the machine still sleeps and Windows still auto-locks on their own schedule. Only
+Alt+Tab and Alt+F4 are swallowed so a stray key cannot tear it down; the Windows key, Win+L and
+Ctrl+Alt+Del all pass through. This is a privacy curtain, not a Windows credential provider.
 
 **Auto Blackout** (tray panel, off by default): the PC blacks out by itself when the Flipper's link is
-lost for 45 s, which is what happens when you walk away with the Flipper in your pocket. It arms ten
-minutes after the companion starts (the panel shows `ARMS IN n MIN`), so after a reboot there is time
-to turn it off; closing the Uplink app on the Flipper on purpose, or pausing the uplink, never triggers
-it. The first use asks for a PIN (4-12 digits, `SET BLACKOUT PIN` in the panel changes it later); it is
+lost for 45 s, which is what happens when you walk away with the Flipper in your pocket, and lifts again
+when you come back and it reconnects. It arms ten minutes after the companion starts (the panel shows
+`ARMS IN n MIN`), so after a reboot there is time to turn it off; closing the Uplink app on the Flipper
+on purpose, or pausing the uplink, never triggers it. The first use asks for a PIN (4-12 digits, `SET BLACKOUT PIN` in the panel changes it later); it is
 stored as a salted PBKDF2 hash in `config.json`. `BLACKOUT NOW` in the panel locks straight away.
 
 ## Vertical mode and font sizes

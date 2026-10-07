@@ -9,6 +9,11 @@ the owner walked away with the Flipper in their pocket.  It arms ten minutes aft
 starts, so after a reboot there is time to turn it off; a Flipper app that is closed on purpose
 says ``BB`` first and never triggers it.
 
+Coming back unlocks: when the Flipper's link returns after the owner has been away (an
+auto-blackout, or any blackout during which the link was gone for the grace period), the screen
+goes away by itself.  A blackout made at the desk with the Flipper next to the PC stays until OK
+on the Flipper or the PIN, so a BLE hiccup cannot open it.
+
 This module holds the decision logic (testable without Tk) and the Windows helpers; the screen
 itself is :mod:`uplink.blackout_screen` on the UI thread.
 """
@@ -261,6 +266,7 @@ class Blackout:
         self.reason = ""
         self.link_up = False
         self.link_lost_at = None
+        self.link_down_since = clock()   # the link has not been up since (None while up)
         self.flipper_said_bye = False
         self.fails = 0
         self.locked_at = 0.0
@@ -303,14 +309,22 @@ class Blackout:
     # ------------------------------------------------------------------ the link (BLE thread)
     def on_link(self, status):
         up = status == "connected"
+        now = self.clock()
         if up:
+            returned = not self.link_up
+            away = self.link_down_since is not None and now - self.link_down_since >= LINK_GRACE
             self.link_up = True
             self.link_lost_at = None
+            self.link_down_since = None
             self.flipper_said_bye = False
+            if returned and self.active and (self.reason == "link lost" or away):
+                # the owner is back with the key in their pocket
+                self.unlock("flipper back")
         elif self.link_up:
             self.link_up = False
+            self.link_down_since = now
             # a paused uplink is the user's doing, not a Flipper that walked away
-            self.link_lost_at = None if status == "paused" else self.clock()
+            self.link_lost_at = None if status == "paused" else now
 
     def handle_line(self, parts):
         """Flipper -> PC: ``BO|1`` / ``BO|0`` / ``BB``.  True when the line was ours."""

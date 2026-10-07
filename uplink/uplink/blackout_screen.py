@@ -1,14 +1,19 @@
 """The Blackout lock screen and the PIN dialog (Tk, on the companion's UI thread).
 
 One borderless, topmost window per monitor; the primary one carries the clock, the PIN field and
-the POWER OFF button.  A scene picked at random animates behind them (glitching wordmark, code
-rain, the profiler reticle, a scanned skyline) so the screen never looks the same twice.  While
-the screen is up a low-level keyboard hook swallows the Windows key and Alt+Tab, Alt+F4, Alt+Esc
-and Ctrl+Esc; Ctrl+Alt+Del and Task Manager stay available, this is a DedSec curtain, not a
-Windows credential provider.
+the POWER OFF button.  A scene picked at random animates behind them, with a random accent palette,
+so the screen never looks the same twice.
+
+This is a privacy curtain, not a Windows credential provider, and it deliberately does not fight
+the operating system: it never keeps the PC awake (no execution-state request, no synthetic input)
+and it never blocks Windows' own lock or power management.  The keyboard hook only swallows Alt+Tab
+and Alt+F4 so a stray key cannot tear the curtain down; the Windows key, Win+L, Ctrl+Alt+Del and
+sleep shortcuts all pass straight through, so the machine still sleeps and Windows still auto-locks
+on their own schedule.
 """
 import ctypes
 import logging
+import math
 import os
 import random
 import socket
@@ -21,6 +26,8 @@ from . import dedsec_ui as ui
 log = logging.getLogger("uplink.blackout_screen")
 
 FPS_MS = 70
+SLOW_AFTER_S = 180       # after this long the animation slows down (battery; never blocks sleep)
+SLOW_FPS_MS = 200
 TAGLINES = [
     "WE ARE DEDSEC", "ctOS 2.0  //  ACCESS DENIED", "THIS TERMINAL HAS GONE DARK",
     "YOUR DATA IS NOT FOR SALE", "WRENCH SAYS: TOUCH NOTHING", "BLUME CAN'T SEE YOU HERE",
@@ -28,6 +35,18 @@ TAGLINES = [
     "SF BAY AREA  ·  NODE OFFLINE", "SIGNAL LOST  ·  RETRY LATER", "THE KEY IS IN A POCKET",
 ]
 GLYPHS = "0123456789ABCDEF<>/\\|[]{}#$%&*+=-_~^"
+# accent colour pairs a blackout picks from, so each one has its own mood
+PALETTES = (
+    (ui.CYAN, ui.MAGENTA), (ui.ORANGE, ui.CYAN), (ui.GREEN, ui.MAGENTA), (ui.YELLOW, ui.CYAN),
+    (ui.MAGENTA, ui.ORANGE), (ui.CYAN, ui.GREEN),
+)
+
+
+def dim(color, factor):
+    """A darker shade of a ``#rrggbb`` colour (factor 0..1)."""
+    color = color.lstrip("#")
+    r, g, b = (int(color[i:i + 2], 16) for i in (0, 2, 4))
+    return "#%02x%02x%02x" % (int(r * factor), int(g * factor), int(b * factor))
 
 
 # --------------------------------------------------------------------------- monitors
@@ -63,10 +82,12 @@ def monitors():
 
 # --------------------------------------------------------------------------- keyboard hook
 class KeyboardGuard:
-    """WH_KEYBOARD_LL hook that swallows the shortcuts that would leave the lock screen."""
+    """WH_KEYBOARD_LL hook that swallows only Alt+Tab and Alt+F4 (window switch / close).
 
-    SWALLOW_ALT = {0x09, 0x1B, 0x73, 0x20}   # Tab, Esc, F4, Space with Alt held
-    WIN = {0x5B, 0x5C}
+    It intentionally lets everything else through, including the Windows key, Win+L, Ctrl+Esc and
+    Ctrl+Alt+Del, so the curtain never interferes with Windows' own lock or power management."""
+
+    SWALLOW_ALT = {0x09, 0x73}   # Tab, F4 with Alt held
 
     def __init__(self):
         self._hook = None
@@ -101,8 +122,7 @@ class KeyboardGuard:
                         key = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                         vk = key.vkCode
                         alt = bool(key.flags & 0x20)
-                        ctrl = bool(user32.GetAsyncKeyState(0x11) & 0x8000)
-                        if vk in self.WIN or (alt and vk in self.SWALLOW_ALT) or (ctrl and vk == 0x1B):
+                        if alt and vk in self.SWALLOW_ALT:
                             return 1
                 except Exception:
                     pass
@@ -128,12 +148,15 @@ class KeyboardGuard:
 
 # --------------------------------------------------------------------------- scenes
 class Scene:
-    """Draws on a canvas of w x h; ``tick(frame)`` advances the animation."""
+    """Draws on a canvas of w x h; ``tick(frame)`` advances the animation.  ``a1``/``a2`` are the
+    accent colours of this blackout; ``fx`` is a font size scaled to the screen."""
 
     name = "scene"
 
-    def __init__(self, canvas, w, h, rnd):
+    def __init__(self, canvas, w, h, rnd, palette=None):
         self.c, self.w, self.h, self.rnd = canvas, w, h, rnd
+        self.a1, self.a2 = palette or (ui.CYAN, ui.MAGENTA)
+        self.fx = max(10, h // 70)
 
     def tick(self, frame):
         pass
@@ -149,14 +172,22 @@ class Scene:
             y = self.rnd.randint(0, self.h)
             x = self.rnd.randint(0, self.w)
             self.c.create_rectangle(x, y, x + self.rnd.randint(20, self.w // 4), y + self.rnd.choice((1, 2, 3)),
-                                    fill=self.rnd.choice((ui.MAGENTA, ui.CYAN, ui.ORANGE)), outline="", tags=tag)
+                                    fill=self.rnd.choice((self.a1, self.a2, ui.ORANGE)), outline="", tags=tag)
+
+    def glitch_word(self, frame, every=3):
+        """Jitter the DEDSEC wordmark and throw a few neon slices (the common idle animation)."""
+        if frame % every == 0:
+            self.slices(self.rnd.randint(1, 4))
+            shift = self.rnd.choice((0, 0, 0, 2, -2, 4))
+            self.c.move("word", shift, 0)
+            self.c.after(60, lambda: self.c.move("word", -shift, 0))
 
 
 class WordmarkScene(Scene):
     name = "wordmark"
 
-    def __init__(self, canvas, w, h, rnd):
-        super().__init__(canvas, w, h, rnd)
+    def __init__(self, canvas, w, h, rnd, palette=None):
+        super().__init__(canvas, w, h, rnd, palette)
         self.size = max(40, h // 6)
         self.wordmark(w // 2, h * 0.36, self.size)
         self.c.create_text(w // 2, h * 0.36 + self.size * 0.9, text="//  BLACKOUT  //", fill=ui.ORANGE,
@@ -178,8 +209,8 @@ class WordmarkScene(Scene):
 class RainScene(Scene):
     name = "rain"
 
-    def __init__(self, canvas, w, h, rnd):
-        super().__init__(canvas, w, h, rnd)
+    def __init__(self, canvas, w, h, rnd, palette=None):
+        super().__init__(canvas, w, h, rnd, palette)
         self.font_px = max(12, h // 50)
         self.cols = []
         step = int(self.font_px * 1.3)
@@ -213,8 +244,8 @@ class ProfilerScene(Scene):
              "THREAT: THE PIN", "FOLLOWERS: +1", "STATUS: NOT HERE", "ctOS LINK: SEVERED",
              "NOTE: KEY IN POCKET"]
 
-    def __init__(self, canvas, w, h, rnd):
-        super().__init__(canvas, w, h, rnd)
+    def __init__(self, canvas, w, h, rnd, palette=None):
+        super().__init__(canvas, w, h, rnd, palette)
         self.size = max(32, h // 9)
         self.wordmark(w // 2, h * 0.24, self.size)
         self.box = [w * 0.3, h * 0.42, w * 0.7, h * 0.72]
@@ -257,8 +288,8 @@ class ProfilerScene(Scene):
 class SkylineScene(Scene):
     name = "skyline"
 
-    def __init__(self, canvas, w, h, rnd):
-        super().__init__(canvas, w, h, rnd)
+    def __init__(self, canvas, w, h, rnd, palette=None):
+        super().__init__(canvas, w, h, rnd, palette)
         base = h * 0.78
         x = 0
         self.windows = []
@@ -291,7 +322,191 @@ class SkylineScene(Scene):
             self.slices(self.rnd.randint(0, 2))
 
 
-SCENES = (WordmarkScene, RainScene, ProfilerScene, SkylineScene)
+class CircuitScene(Scene):
+    """PCB traces on a grid with pulses running along them."""
+    name = "circuit"
+
+    def __init__(self, canvas, w, h, rnd, palette=None):
+        super().__init__(canvas, w, h, rnd, palette)
+        grid = max(24, w // 60)
+        self.traces = []
+        trace = dim(self.a1, 0.35)
+        for _ in range(28):
+            x, y = rnd.randrange(0, max(grid, w), grid), rnd.randrange(0, max(grid, h), grid)
+            points = [(x, y)]
+            for _ in range(rnd.randint(3, 8)):
+                if rnd.random() < 0.5:
+                    x = max(0, min(w, x + rnd.choice((-1, 1)) * grid * rnd.randint(1, 6)))
+                else:
+                    y = max(0, min(h, y + rnd.choice((-1, 1)) * grid * rnd.randint(1, 5)))
+                points.append((x, y))
+            self.c.create_line(*[v for p in points for v in p], fill=trace, width=2)
+            self.c.create_oval(points[-1][0] - 4, points[-1][1] - 4, points[-1][0] + 4, points[-1][1] + 4,
+                               fill=trace, outline="")
+            self.traces.append(points)
+        for _ in range(5):
+            x, y = rnd.randrange(0, max(grid, w - grid * 3), grid), rnd.randrange(0, max(grid, h - grid * 2), grid)
+            self.c.create_rectangle(x, y, x + grid * 3, y + grid * 2, fill="#081219", outline=self.a1)
+            self.c.create_text(x + grid * 1.5, y + grid, text=rnd.choice(("ctOS", "BLUME", "CPU", "RF", "SoC")),
+                               fill=dim(self.a1, 0.7), font=(ui.MONO, self.fx, "bold"))
+        self.pulses = [[rnd.randrange(len(self.traces)), rnd.random(),
+                        self.c.create_oval(0, 0, 0, 0, fill=self.a2, outline="")] for _ in range(14)]
+        self.wordmark(w // 2, h * 0.32, max(40, h // 7))
+
+    def _point(self, points, t):
+        segs = len(points) - 1
+        pos = t * segs
+        i = min(segs - 1, int(pos))
+        f = pos - i
+        (x0, y0), (x1, y1) = points[i], points[i + 1]
+        return x0 + (x1 - x0) * f, y0 + (y1 - y0) * f
+
+    def tick(self, frame):
+        for pulse in self.pulses:
+            pulse[1] += 0.02
+            if pulse[1] >= 1.0:
+                pulse[0], pulse[1] = self.rnd.randrange(len(self.traces)), 0.0
+            x, y = self._point(self.traces[pulse[0]], pulse[1])
+            self.c.coords(pulse[2], x - 4, y - 4, x + 4, y + 4)
+        self.glitch_word(frame, every=9)
+
+
+class RadarScene(Scene):
+    """A sweep with fading blips, labelled with the RF Hunter's bands."""
+    name = "radar"
+
+    def __init__(self, canvas, w, h, rnd, palette=None):
+        super().__init__(canvas, w, h, rnd, palette)
+        self.cx, self.cy, self.r = w * 0.5, h * 0.52, min(w, h) * 0.36
+        ring = dim(self.a1, 0.35)
+        for k in (0.25, 0.5, 0.75, 1.0):
+            rr = self.r * k
+            self.c.create_oval(self.cx - rr, self.cy - rr, self.cx + rr, self.cy + rr, outline=ring)
+        for a in range(0, 360, 30):
+            rad = math.radians(a)
+            self.c.create_line(self.cx, self.cy, self.cx + self.r * math.cos(rad), self.cy + self.r * math.sin(rad),
+                               fill="#0b1f27")
+        for text, k, a in (("315", 0.3, 200), ("433.92", 0.55, 320), ("868", 0.85, 60), ("NFC", 0.16, 120)):
+            rad = math.radians(a)
+            self.c.create_text(self.cx + self.r * k * math.cos(rad), self.cy + self.r * k * math.sin(rad),
+                               text=text, fill=dim(self.a1, 0.6), font=(ui.MONO, self.fx))
+        self.sweep = self.c.create_line(0, 0, 0, 0, fill=self.a1, width=3)
+        self.trail = [self.c.create_line(0, 0, 0, 0, fill=dim(self.a1, 0.6 - i * 0.1), width=2) for i in range(5)]
+        self.blips = []
+        self.angle = 0.0
+        size = max(26, h // 12)
+        self.wordmark(w // 2, h * 0.1, size)
+        self.c.create_text(w // 2, h * 0.1 + size * 0.85, text="SCANNING  ·  NO OPERATOR IN RANGE",
+                           fill=ui.ORANGE, font=(ui.MONO, self.fx, "bold"))
+
+    def tick(self, frame):
+        self.angle = (self.angle + 3) % 360
+        for i, item in enumerate([self.sweep] + self.trail):
+            rad = math.radians(self.angle - i * 2.5)
+            self.c.coords(item, self.cx, self.cy, self.cx + self.r * math.cos(rad), self.cy + self.r * math.sin(rad))
+        if self.rnd.random() < 0.08:
+            rad, k = math.radians(self.angle), self.rnd.uniform(0.1, 0.98)
+            x, y = self.cx + self.r * k * math.cos(rad), self.cy + self.r * k * math.sin(rad)
+            self.blips.append([self.c.create_oval(x - 5, y - 5, x + 5, y + 5, fill=self.a2, outline=""), 0])
+        for blip in list(self.blips):
+            blip[1] += 1
+            if blip[1] > 110:
+                self.c.delete(blip[0])
+                self.blips.remove(blip)
+            elif blip[1] % 20 == 0:
+                self.c.itemconfigure(blip[0], fill=dim(self.a2, max(0.15, 1 - blip[1] / 120)))
+        self.glitch_word(frame, every=12)
+
+
+class SpectrumScene(Scene):
+    """A spectrum analyzer: a few steady signals over a noise floor that breathes."""
+    name = "spectrum"
+
+    def __init__(self, canvas, w, h, rnd, palette=None):
+        super().__init__(canvas, w, h, rnd, palette)
+        self.n = 72
+        self.x0, self.x1 = w * 0.08, w * 0.92
+        self.base, self.height = h * 0.78, h * 0.38
+        self.bw = (self.x1 - self.x0) / self.n
+        self.bars = [self.c.create_rectangle(0, 0, 0, 0, fill=dim(self.a1, 0.7), outline="") for _ in range(self.n)]
+        self.peaks = [self.c.create_line(0, 0, 0, 0, fill=self.a2, width=2) for _ in range(self.n)]
+        self.peak = [0.0] * self.n
+        self.signals = {rnd.randrange(self.n): rnd.uniform(0.5, 0.95) for _ in range(4)}
+        self.c.create_line(self.x0, self.base, self.x1, self.base, fill=self.a1)
+        for k in range(1, 5):
+            y = self.base - self.height * k / 4
+            self.c.create_line(self.x0, y, self.x1, y, fill="#0b1f27")
+        size = max(34, h // 9)
+        self.wordmark(w // 2, h * 0.16, size)
+        self.c.create_text(w // 2, h * 0.16 + size * 0.85, text="RF HUNTER  ·  PASSIVE  ·  NOTHING TRANSMITTED",
+                           fill=ui.ORANGE, font=(ui.MONO, self.fx, "bold"))
+
+    def tick(self, frame):
+        breath = 0.08 + 0.04 * math.sin(frame / 9.0)
+        for i in range(self.n):
+            level = breath + self.rnd.random() * 0.12
+            if i in self.signals and (frame // 25 + i) % 4 != 0:
+                level = self.signals[i] + self.rnd.uniform(-0.05, 0.05)
+            if self.rnd.random() < 0.01:
+                level += self.rnd.uniform(0.2, 0.6)
+            level = max(0.02, min(1.0, level))
+            x = self.x0 + i * self.bw
+            self.c.coords(self.bars[i], x + 1, self.base - self.height * level, x + self.bw - 1, self.base)
+            self.peak[i] = max(level, self.peak[i] - 0.01)
+            py = self.base - self.height * self.peak[i]
+            self.c.coords(self.peaks[i], x + 1, py, x + self.bw - 1, py)
+        self.glitch_word(frame, every=10)
+
+
+class NetworkScene(Scene):
+    """The ctOS node map: nodes, links, packets, one node pulsing."""
+    name = "network"
+
+    def __init__(self, canvas, w, h, rnd, palette=None):
+        super().__init__(canvas, w, h, rnd, palette)
+        self.nodes = [(rnd.uniform(w * 0.06, w * 0.94), rnd.uniform(h * 0.1, h * 0.72)) for _ in range(26)]
+        self.edges = []
+        link = dim(self.a1, 0.35)
+        for i, (x, y) in enumerate(self.nodes):
+            near = sorted(range(len(self.nodes)),
+                          key=lambda j: (self.nodes[j][0] - x) ** 2 + (self.nodes[j][1] - y) ** 2)
+            for j in near[1:3]:
+                self.edges.append((i, j))
+                self.c.create_line(x, y, self.nodes[j][0], self.nodes[j][1], fill=link)
+        for i, (x, y) in enumerate(self.nodes):
+            r = 4 if rnd.random() < 0.8 else 7
+            self.c.create_oval(x - r, y - r, x + r, y + r, fill=dim(self.a1, 0.8), outline="")
+            if rnd.random() < 0.3:
+                self.c.create_text(x + 10, y - 10, text="NODE %02X" % rnd.randrange(256), anchor="w",
+                                   fill=dim(self.a1, 0.6), font=(ui.MONO, max(9, self.fx - 1)))
+        self.packets = [[rnd.randrange(len(self.edges)), rnd.random(), rnd.choice((1, -1)),
+                         self.c.create_oval(0, 0, 0, 0, fill=self.a2, outline="")] for _ in range(12)]
+        self.pulse = self.c.create_oval(0, 0, 0, 0, outline=self.a2, width=2)
+        self.pulse_node = rnd.randrange(len(self.nodes))
+        self.wordmark(w // 2, h * 0.84, max(36, h // 8))
+
+    def tick(self, frame):
+        for packet in self.packets:
+            packet[1] += 0.015
+            if packet[1] >= 1.0:
+                packet[0], packet[1], packet[2] = self.rnd.randrange(len(self.edges)), 0.0, self.rnd.choice((1, -1))
+            i, j = self.edges[packet[0]]
+            if packet[2] < 0:
+                i, j = j, i
+            (x0, y0), (x1, y1) = self.nodes[i], self.nodes[j]
+            x, y = x0 + (x1 - x0) * packet[1], y0 + (y1 - y0) * packet[1]
+            self.c.coords(packet[3], x - 3, y - 3, x + 3, y + 3)
+        r = 6 + (frame % 30)
+        if frame % 30 == 0:
+            self.pulse_node = self.rnd.randrange(len(self.nodes))
+        x, y = self.nodes[self.pulse_node]
+        self.c.coords(self.pulse, x - r, y - r, x + r, y + r)
+        self.c.itemconfigure(self.pulse, outline=dim(self.a2, max(0.1, 1 - (frame % 30) / 30)))
+        self.glitch_word(frame, every=12)
+
+
+SCENES = (WordmarkScene, RainScene, ProfilerScene, SkylineScene, CircuitScene, RadarScene,
+          SpectrumScene, NetworkScene)
 
 
 # --------------------------------------------------------------------------- the screen
@@ -317,6 +532,7 @@ class LockScreen:
         if not any(s[4] for s in screens):
             screens[0] = screens[0][:4] + (True,)
         scene_cls = scene or self.rnd.choice(SCENES)
+        palette = self.rnd.choice(PALETTES)
         for x, y, w, h, primary in screens:
             win = tk.Toplevel(root)
             win.overrideredirect(True)
@@ -327,7 +543,7 @@ class LockScreen:
             canvas.pack(fill="both", expand=True)
             self.windows.append(win)
             self.canvases.append(canvas)
-            self.scenes.append(scene_cls(canvas, w, h, self.rnd))
+            self.scenes.append(scene_cls(canvas, w, h, self.rnd, palette))
             if primary:
                 self._overlay(win, canvas, w, h)
         self.guard.install()
@@ -424,7 +640,10 @@ class LockScreen:
         if self.power_armed_until and time.time() > self.power_armed_until:
             self.power_armed_until = 0.0
             self.power.configure(text="POWER OFF")
-        self.root.after(FPS_MS, self._tick)
+        # after a few idle minutes the animation runs slower, so an unattended blackout does not
+        # keep a core busy or drain the battery (it never prevents sleep in the first place)
+        delay = SLOW_FPS_MS if time.time() - self.blackout.locked_at > SLOW_AFTER_S else FPS_MS
+        self.root.after(delay, self._tick)
 
     # ---- PIN
     def _refresh_dots(self):
