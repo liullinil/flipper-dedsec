@@ -1590,34 +1590,33 @@ static void draw_ota(Canvas* c, App* app) {
     fg(c);
 }
 
+/* Drawn below the tab bar (the header is always up now) while the PC is away: the hood, the state
+ * and the BLE name, plus a reminder that the RF tab works without the PC. */
 static void draw_offline(Canvas* c, App* app) {
     int W = canvas_width(c), H = canvas_height(c);
     bool n = narrow(c);
-    canvas_draw_box(c, 0, 0, W, 12);
-    bg(c);
-    canvas_set_font(c, FontPrimary);
-    canvas_draw_str_aligned(c, W / 2, 2, AlignCenter, AlignTop, n ? "UPLINK" : "DEDSEC // UPLINK");
-    fg(c);
     canvas_set_font(c, FontSecondary);
     const char* state = app->host_closed ? "HOST WENT DARK" : "WAITING FOR HOST";
     if(n) {
-        canvas_draw_icon(c, (W - 26) / 2, 15, &I_hood_26x30);
-        int y = 49;
+        canvas_draw_icon(c, (W - 26) / 2, 13, &I_hood_26x30);
+        int y = 46;
         canvas_draw_str_aligned(c, W / 2, y, AlignCenter, AlignTop, app->host_closed ? "HOST WENT" : "WAITING");
         canvas_draw_str_aligned(c, W / 2, y + 9, AlignCenter, AlignTop, app->host_closed ? "DARK" : "FOR HOST");
-        canvas_draw_str_aligned(c, W / 2, y + 23, AlignCenter, AlignTop, "BLE name:");
-        canvas_draw_str_aligned(c, W / 2, y + 32, AlignCenter, AlignTop, UPLINK_NAME_PREFIX);
-        canvas_draw_str_aligned(c, W / 2, y + 41, AlignCenter, AlignTop, furi_hal_version_get_name_ptr());
-        canvas_draw_str_aligned(c, W / 2, y + 55, AlignCenter, AlignTop, "run uplink");
-        canvas_draw_str_aligned(c, W / 2, y + 64, AlignCenter, AlignTop, "on the PC");
+        canvas_draw_str_aligned(c, W / 2, y + 21, AlignCenter, AlignTop, "BLE name:");
+        canvas_draw_str_aligned(c, W / 2, y + 30, AlignCenter, AlignTop, UPLINK_NAME_PREFIX);
+        canvas_draw_str_aligned(c, W / 2, y + 39, AlignCenter, AlignTop, furi_hal_version_get_name_ptr());
+        canvas_draw_line(c, 6, y + 51, W - 6, y + 51);
+        canvas_draw_str_aligned(c, W / 2, y + 54, AlignCenter, AlignTop, "RF HUNTER");
+        canvas_draw_str_aligned(c, W / 2, y + 63, AlignCenter, AlignTop, "WORKS HERE");
     } else {
         char name[32];
         snprintf(name, sizeof(name), "%s %s", UPLINK_NAME_PREFIX, furi_hal_version_get_name_ptr());
-        canvas_draw_icon(c, 2, 16, &I_hood_26x30);
-        canvas_draw_str_aligned(c, 32, 17, AlignLeft, AlignTop, state);
-        canvas_draw_str_aligned(c, 32, 27, AlignLeft, AlignTop, "BLE name:");
-        canvas_draw_str_aligned(c, 32, 36, AlignLeft, AlignTop, name);
-        canvas_draw_str_aligned(c, 32, 46, AlignLeft, AlignTop, "run uplink on PC");
+        canvas_draw_icon(c, 2, 13, &I_hood_26x30);
+        canvas_draw_str_aligned(c, 32, 14, AlignLeft, AlignTop, state);
+        canvas_draw_str_aligned(c, 32, 24, AlignLeft, AlignTop, "BLE name:");
+        canvas_draw_str_aligned(c, 32, 33, AlignLeft, AlignTop, name);
+        canvas_draw_line(c, 6, H - 21, W - 6, H - 21);
+        canvas_draw_str_aligned(c, W / 2, H - 18, AlignCenter, AlignTop, "RF HUNTER WORKS OFFLINE");
     }
     int span = W - 16;
     int pos = (app->tick * 3) % (span * 2);
@@ -2019,28 +2018,25 @@ static void main_draw(Canvas* c, void* model) {
     canvas_clear(c);
     fg(c);
     ScreenId screen = current_screen(app);
-    // CMD and RF stay usable without the PC (RF is meant to run in a pocket)
-    bool offline = (!app->link || app->host_closed) && screen != ScreenCmd && screen != ScreenRf;
-    if(offline) {
+    // RF Hunter listens without the PC, so its tab stays live even with no link; the other tabs
+    // need the host and show the waiting screen. The tab bar is drawn either way, so you can still
+    // reach RF and the settings (Right on the last tab, or holding OK) without a connection.
+    bool offline = (!app->link || app->host_closed) && screen != ScreenRf;
+    draw_header(c, app);
+    if(offline)
         draw_offline(c, app);
-    } else {
-        draw_header(c, app);
-        if(screen == ScreenSys) {
-            draw_sys(c, app);
-            draw_blackout(c, app);
-        } else if(screen == ScreenRf)
-            draw_rf(c, app);
-        else if(screen == ScreenCmd) {
-            if(!app->link)
-                draw_message(c, app, "link down");
-            else
-                draw_cmd(c, app);
-        } else if(app->detail)
-            draw_detail(c, app, screen_kind(screen));
-        else
-            draw_list(c, app, screen_kind(screen));
-        if(app->alert) draw_alert(c, app);
-    }
+    else if(screen == ScreenSys) {
+        draw_sys(c, app);
+        draw_blackout(c, app);
+    } else if(screen == ScreenRf)
+        draw_rf(c, app);
+    else if(screen == ScreenCmd)
+        draw_cmd(c, app);
+    else if(app->detail)
+        draw_detail(c, app, screen_kind(screen));
+    else
+        draw_list(c, app, screen_kind(screen));
+    if(app->alert) draw_alert(c, app);
     if(app->ota.state != OtaIdle) draw_ota(c, app);
     furi_mutex_release(app->mutex);
 }

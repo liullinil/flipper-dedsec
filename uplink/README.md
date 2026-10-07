@@ -28,7 +28,9 @@ Target: Flipper Zero on Unleashed `unlshd-093c` (API 88.9), Windows 10/11 with B
 - **CMD** — remote shell. Type a command on the Flipper, it runs on the PC, the output and `[exit N]` come back.
   On Windows the companion uses a ConPTY pseudo-terminal, so interactive programs such as `codex`
   can start. While a command is running, press OK again to send another line to its stdin.
-- **RF** — RF Hunter, see below. Unlike the other tabs it works without the PC.
+- **RF** — RF Hunter, see below. Unlike the other tabs it works without the PC: with no companion
+  connected, the other tabs show the waiting screen but the tab bar stays, so you can move to RF
+  (and the settings) and run it on its own.
 
 Status icons: spinner = working · blinking `!` = needs your answer or approval · `>_` = your turn.
 Idle sessions are left out of the lists. A finished session (`>_`) stays until you open its details
@@ -170,8 +172,9 @@ A passive RF logger in the **RF** tab. The Flipper only listens: it never transm
 
 Each event is one JSON record on the SD card (`apps_data/dedsec_uplink/rf/events/`) with the exact time,
 frequency, RSSI min/avg/max, duration and pulse timings. The tab counts events and distinct signal
-families, shows what still waits for the PC, free space and the last event. It works without the PC: start
-it and put the Flipper in a pocket.
+families, shows what still waits for the PC, free space and the last event. It works without the PC: even
+with no Bluetooth link the RF tab and the settings stay live (the other tabs wait for the host), so you
+can start it and put the Flipper in a pocket; the records are imported later when the companion connects.
 
 **What was that?** Every capture is decoded on the Flipper before it is saved, from the pulse timings
 alone, and the tab says so: `12:41 KeeLoq 66b -63dB` with `sn 0ABCDEF btn 2` under it, `Princeton 24b` with
