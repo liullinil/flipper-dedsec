@@ -74,13 +74,18 @@ def install_native_hook():
                 with open(NATIVE_HOOK, "rb") as fh:
                     current = fh.read()
             if current != data:
+                # written in place: MoveFileEx into AppData failed with "not the same device"
+                # (WinError 17) on a real machine, and the file is tiny
                 os.makedirs(APP_DIR, exist_ok=True)
-                tmp = NATIVE_HOOK + ".tmp"
-                with open(tmp, "wb") as fh:
+                with open(NATIVE_HOOK, "wb") as fh:
                     fh.write(data)
-                os.replace(tmp, NATIVE_HOOK)
+                log.info("native hook installed: %s", NATIVE_HOOK)
     except OSError as exc:      # e.g. Claude runs the old copy right now: keep it
         log.warning("cannot update the native hook: %s", exc)
+    try:
+        os.remove(NATIVE_HOOK + ".tmp")     # left by 1.2.1's first build
+    except OSError:
+        pass
     return os.path.exists(NATIVE_HOOK)
 
 
