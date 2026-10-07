@@ -54,6 +54,15 @@
  * demodulator keeps producing noise edges.  OOK spaces read as weak RSSI, so
  * this must span many 5 ms samples of a low-duty burst. */
 #define RF_QUIET_MIN_MS      150U
+/* The trigger never sits closer than this to the noise floor of the frequency: next to a PC
+ * the 315 MHz floor can be -77 dBm, and a -75 dBm trigger then fires on noise. */
+#define RF_FLOOR_MARGIN_DB   8.0f
+#define RF_FLOOR_SAMPLES     8U /* RSSI samples on a frequency before it may trigger */
+/* What makes a burst a signal rather than a noise spike: OOK edges over a few RSSI samples,
+ * or a carrier that stays up. Anything less is not recorded. */
+#define RF_MIN_EDGES         16U
+#define RF_MIN_STRONG_MS     10U
+#define RF_MIN_CARRIER_MS    50U
 #define RF_NFC_MERGE_MS      1000U /* field gaps shorter than this are one event */
 #define RF_NFC_RETRY_MS      1000U
 #define RF_FEEDBACK_MIN_MS   1000U
@@ -122,6 +131,10 @@ struct RfEngine {
     uint32_t hop_tick;
     uint32_t rssi_tick;
     float last_rssi;
+    float floor[RF_FREQ_COUNT]; /* noise floor per frequency: the lower envelope of RSSI */
+    uint8_t floor_samples[RF_FREQ_COUNT];
+    float trigger; /* level of the burst being captured */
+    bool signal; /* the burst being captured is a signal (feedback given) */
 
     bool capturing;
     uint32_t capture_tick;
@@ -441,8 +454,35 @@ static void rf_pre_clear(RfEngine* engine) {
     engine->pre_head = 0;
 }
 
+/* The trigger: the configured level, but at least RF_FLOOR_MARGIN_DB above the noise. */
+static float rf_trigger(const RfEngine* engine) {
+    float trigger = (float)engine->config.rssi_threshold_dbm;
+    float floor = engine->floor[engine->freq_index] + RF_FLOOR_MARGIN_DB;
+    return floor > trigger ? floor : trigger;
+}
+
+/* The lower envelope: quiet stretches pull it down quickly, bursts lift it slowly. */
+static void rf_floor_track(RfEngine* engine, float rssi) {
+    uint8_t i = engine->freq_index;
+    if(!engine->floor_samples[i]) {
+        engine->floor[i] = rssi;
+    } else {
+        float k = rssi < engine->floor[i] ? 0.125f : 0.015625f;
+        engine->floor[i] += (rssi - engine->floor[i]) * k;
+    }
+    if(engine->floor_samples[i] < 255U) engine->floor_samples[i]++;
+}
+
+/* A signal, not a noise spike: OOK edges over a few RSSI samples, or a carrier that stays up. */
+static bool rf_capture_is_signal(const RfEngine* engine) {
+    uint32_t strong_ms = engine->strong_tick - engine->capture_tick;
+    return (engine->pulse_count >= RF_MIN_EDGES && strong_ms >= RF_MIN_STRONG_MS) ||
+           strong_ms >= RF_MIN_CARRIER_MS;
+}
+
 static void rf_capture_reset(RfEngine* engine) {
     engine->capturing = false;
+    engine->signal = false;
     engine->timing_count = 0;
     engine->pulse_count = 0;
     engine->capture_us = 0;
@@ -481,12 +521,16 @@ static void rf_capture_open(RfEngine* engine, float rssi, uint32_t now) {
     engine->rssi_count = 1;
     engine->capture_rtc = rf_rtc_now();
     engine->capture_mono = now - engine->session_tick;
-    /* Immediate feedback; Follow waits until the burst matches its profile. */
-    if(engine->mode != RfModeFollow || !engine->follow_valid) rf_feedback(engine, false);
+    engine->signal = false; /* feedback once it proves to be a signal (rf_rx_service) */
 }
 
 static void rf_capture_close(RfEngine* engine) {
     if(!engine->capturing) return;
+    if(!rf_capture_is_signal(engine)) {
+        /* a noise spike above the trigger: nothing worth recording */
+        rf_capture_reset(engine);
+        return;
+    }
     uint32_t frequency = rf_frequencies[engine->freq_index];
     RfShape shape;
     rf_shape_compute(&shape, engine->timings, engine->timing_count);
@@ -594,16 +638,21 @@ static void rf_on_timing(RfEngine* engine, uint32_t timing) {
 
 static void rf_on_rssi(RfEngine* engine, float rssi, uint32_t now) {
     engine->last_rssi = rssi;
-    float threshold = (float)engine->config.rssi_threshold_dbm;
     if(!engine->capturing) {
-        if(rssi >= threshold) rf_capture_open(engine, rssi, now);
+        float trigger = rf_trigger(engine);
+        if(engine->floor_samples[engine->freq_index] >= RF_FLOOR_SAMPLES && rssi >= trigger) {
+            engine->trigger = trigger; /* fixed for the whole burst */
+            rf_capture_open(engine, rssi, now);
+        } else {
+            rf_floor_track(engine, rssi);
+        }
         return;
     }
     if(rssi < engine->rssi_min) engine->rssi_min = rssi;
     if(rssi > engine->rssi_max) engine->rssi_max = rssi;
     engine->rssi_sum += rssi;
     engine->rssi_count++;
-    if(rssi >= threshold) engine->strong_tick = now;
+    if(rssi >= engine->trigger) engine->strong_tick = now;
 }
 
 static void rf_rx_drain(RfEngine* engine) {
@@ -659,6 +708,7 @@ static void rf_radio_off(RfEngine* engine) {
     }
     rf_capture_discard(engine->ring);
     rf_pre_clear(engine);
+    memset(engine->floor_samples, 0, sizeof(engine->floor_samples));
 }
 
 static void rf_rx_service(RfEngine* engine, uint32_t now) {
@@ -668,11 +718,16 @@ static void rf_rx_service(RfEngine* engine, uint32_t now) {
         rf_on_rssi(engine, furi_hal_subghz_get_rssi(), now);
     }
     if(engine->capturing) {
+        if(!engine->signal && rf_capture_is_signal(engine)) {
+            engine->signal = true;
+            /* Feedback as soon as it is a signal; Follow waits until it matches its profile. */
+            if(engine->mode != RfModeFollow || !engine->follow_valid) rf_feedback(engine, false);
+        }
         uint32_t silence_ms = engine->config.silence_us / 1000U + 1U;
         uint32_t quiet_ms = silence_ms > RF_QUIET_MIN_MS ? silence_ms : RF_QUIET_MIN_MS;
         bool window = now - engine->capture_tick >= engine->config.capture_ms;
         bool edges_idle = now - engine->ring->last_edge_tick > silence_ms;
-        bool weak_now = engine->last_rssi < (float)engine->config.rssi_threshold_dbm;
+        bool weak_now = engine->last_rssi < engine->trigger;
         bool quiet = now - engine->strong_tick >= quiet_ms;
         if(window || (edges_idle && weak_now) || quiet) rf_capture_close(engine);
     }

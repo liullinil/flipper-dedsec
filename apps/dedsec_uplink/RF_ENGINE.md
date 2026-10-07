@@ -53,11 +53,18 @@ profile and ignores `band`.
 
 ## Bursts and events
 
-- **Trigger:** an RSSI sample (every 5 ms) at or above `rssi_threshold_dbm`. The event starts
-  with the pre-trigger timings of the last 10 ms (at most 64). The pre-trigger is cleared, so
-  it never leaks into the next event.
+- **Noise floor:** every frequency keeps the lower envelope of its RSSI samples outside bursts
+  (falls with 1/8 of a quieter sample, rises with 1/64 of a louder one) and may trigger only after
+  8 samples. Stopping the receiver forgets the floors.
+- **Trigger:** an RSSI sample (every 5 ms) at or above max(`rssi_threshold_dbm`, floor + 8 dB);
+  the level is kept for the whole burst. The event starts with the pre-trigger timings of the
+  last 10 ms (at most 64). The pre-trigger is cleared, so it never leaks into the next event.
+- **Signal or noise:** a burst counts as a signal once it has 16 timings with its first and
+  last strong RSSI samples at least 10 ms apart, or strong samples 50 ms apart (a carrier without
+  edges). Only signals are recorded, counted and give feedback; a spike that crossed the trigger
+  for one sample is dropped.
 - **End:** a space longer than `silence_us`; or no edge for `silence_us` while RSSI is below the
-  threshold; or no RSSI sample above the threshold for max(150 ms, `silence_us`), for noisy
+  trigger; or no RSSI sample above the trigger for max(150 ms, `silence_us`), for noisy
   channels where the demodulator keeps toggling; or `capture_ms` elapsed.
 - **Record:** up to 512 timings are kept in RAM and written while they fit the 4 KiB record
   buffer; `pulse_count` counts every timing of the event. `duration_us` is the sum of the
@@ -74,8 +81,10 @@ profile and ignores `band`.
   Follow records like Capture and the first event becomes the profile.
 - **NFC:** a field event starts at field-on and ends after 1 s without a field (merges a
   reader's polling bursts). `nfc_field_count` is the session's count of field-on detections.
-- **Feedback** (`feedback`): one 50 ms vibro + cyan LED pulse at the trigger (NFC: at
-  field-on), at most once per second; Follow matches give a double pulse. A failed journal write
+- **Feedback** (`feedback`): one 50 ms vibro + cyan LED pulse as soon as a burst proves to be
+  a signal (NFC: at field-on), at most once per second; Follow matches give a double pulse. While
+  events are unseen the app (`uplink.c`) blinks the LED cyan for 25 ms every 4 s; looking at the RF
+  tab marks them seen. A failed journal write
   gives a 50 ms red blink (at most every 5 s, regardless of `feedback`) and increments
   `errors`; `storage_full` is set while the reserve is reached.
 

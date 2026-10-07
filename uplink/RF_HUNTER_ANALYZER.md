@@ -143,12 +143,24 @@ interpreter.
   `sync=None` it is a viewer and both are disabled.
 * Exports and extra read-only folders are on the command line (below); failures of user actions
   are shown in a dialog and logged.
-* Filters: text, source, **MHz** (`433.92` matches ±0.2 MHz, `433.92+-0.05` sets the tolerance,
-  `433-434` is a range), RSSI bounds and **From/To UTC** (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM[:SS]`;
-  a date as the end means the whole day). An unreadable filter is reported and ignored.
-* Views: sampled RSSI waterfall (newest event at the top; a click selects the row under the cursor),
-  frequency spectrum, UTC timeline, family navigator with detail (time-of-day, RSSI, variants,
-  hypothesis, raw/imported counts) and a nearest-observation panel with plain-language reasons.
+* A summary on top: signals, noise, NFC fields, the frequencies in use (captures less than 100 kHz
+  apart count as one channel), the last capture and the strongest one.
+* **ACTIVITY**: local time across, one lane per band (315 / 433 / 868 MHz always, then NFC and
+  other frequencies when present), one dot per capture: radius from the length, colour from the
+  peak RSSI, hollow for noise; a click selects the nearest dot. Even one capture gets a readable
+  axis (at least ten minutes wide).
+* **CAPTURES**: a table, newest first, in local time: MHz, peak dBm, length, recorded edges,
+  group (`#1` is the most frequent family of real signals) and the verdict. Search, the band chips
+  (ALL / 315 / 433 / 868 / NFC) and HIDE NOISE filter it.
+* The selected capture: details with the verdict explained in plain words, the **recorded
+  pulses** drawn as a pulse train (alternating levels, scaled to fit), the captures it **looks
+  like** (same family of real signals, with the match and its reason; a click selects one) and a
+  note.
+* Verdict (`signal_verdict(event)`): an NFC record is an *NFC field*; a Sub-GHz capture with
+  fewer than 16 edges in less than 50 ms is *noise* (interference that crossed the trigger for a
+  moment, which Flipper apps before 1.4.0 recorded); everything else is a *signal*.
+* `EventFilter` keeps the full filter set (MHz ranges, RSSI bounds, From/To UTC) for the
+  headless API; the window uses text, band and noise.
 
 Signal families are computed on the PC by complete-link structural grouping and kept in memory
 (`project.family_key(event)`, `project.fingerprint_key(event)`). They are **never written into the
@@ -181,6 +193,6 @@ windowed build `--help` and argument errors are shown in a dialog instead of cra
 console, and errors are logged to `%LOCALAPPDATA%\DedSecUplink\rf_hunter.log` (inside the companion
 the analyzer logs to the companion log).
 
-The waterfall is a visualization of timestamped event samples and RSSI values. It is not
+The activity chart is a visualization of timestamped event samples and RSSI values. It is not
 continuous IQ or a direction finder. Similarity is provisional and keeps the original event IDs
 visible so later grouping can split or merge families without discarding evidence.

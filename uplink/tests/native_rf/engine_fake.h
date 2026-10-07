@@ -30,6 +30,9 @@ void world_add_tx(
     uint32_t space_us);
 /* Random demodulator noise edges (RSSI stays at the noise floor). */
 void world_set_noise(uint32_t start_ms, uint32_t end_ms);
+/* A raised noise floor on one frequency (315 MHz next to a PC) with a single-sample RSSI spike
+ * every `spike_every_ms` (no demodulator edges); 0 Hz turns it off. */
+void world_set_floor(uint32_t frequency, float floor_dbm, float spike_dbm, uint32_t spike_every_ms);
 void world_add_nfc_field(uint32_t start_ms, uint32_t end_ms);
 void world_nfc_busy(uint32_t attempts);
 void world_at(uint32_t at_ms, WorldStep step); /* in time order */

@@ -404,10 +404,14 @@ void notification_message_block(NotificationApp* app, const NotificationSequence
     (void)app;
     (void)seq;
 }
+void notification_message(NotificationApp* app, const NotificationSequence* seq) {
+    (void)app;
+    (void)seq;
+}
 const NotificationMessage message_red_255, message_red_0, message_green_255, message_green_0,
     message_blue_255, message_blue_0, message_display_backlight_on, message_force_vibro_setting_on,
-    message_force_vibro_setting_off, message_vibro_on, message_vibro_off, message_delay_100,
-    message_delay_250;
+    message_force_vibro_setting_off, message_vibro_on, message_vibro_off, message_delay_25,
+    message_delay_100, message_delay_250;
 void bt_disconnect(Bt* bt) {
     (void)bt;
 }

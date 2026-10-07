@@ -6,8 +6,10 @@ from types import SimpleNamespace
 import pytest
 
 from uplink import rf_analyzer
-from uplink.rf_analyzer import (AnalyzerProject, EventFilter, main, parse_frequency_filter,
-                                parse_time_filter, sync_status_text, waterfall_index_at)
+from uplink.rf_analyzer import (AnalyzerProject, EventFilter, activity_lanes, activity_window,
+                                default_selection, format_duration_us, frequency_clusters, format_local, group_numbers, main,
+                                parse_frequency_filter, parse_time_filter, signal_verdict, store_summary,
+                                sync_status_text, time_ticks)
 from uplink.rf_hunter import EventStore, RfEvent
 
 
@@ -223,15 +225,78 @@ def test_time_filter_rejects_garbage_instead_of_1970():
             parse_time_filter(bad)
 
 
-def test_waterfall_click_maps_to_the_drawn_row():
-    # Three rows on a 330 px canvas: oldest at the bottom, newest at the top.
-    assert waterfall_index_at(320, 330, 3) == 0
-    assert waterfall_index_at(165, 330, 3) == 1
-    assert waterfall_index_at(10, 330, 3) == 2
-    # A full canvas (27 rows of 12 px): the top pixel is the newest drawn row.
-    assert waterfall_index_at(0, 330, 27) == 26
-    assert waterfall_index_at(329, 330, 27) == 0
-    assert waterfall_index_at(10, 330, 0) is None
+def _noise(seq, when="2026-10-07T09:48:20Z", freq=315000000):
+    """What the Flipper app before the noise-floor trigger saved next to a PC: one 5 ms sample."""
+    return RfEvent(device_uuid="dev", session_id="s1", sequence_number=seq, captured_at_utc=when,
+                   monotonic_ms=seq, frequency_hz=freq, rssi_min_dbm=-77.5, rssi_avg_dbm=-76.2,
+                   rssi_max_dbm=-75.0, duration_us=5000, pulse_timings_us=(34, 1097))
+
+
+def _signal(seq, when="2026-10-07T10:00:00Z", freq=433920000, rssi=-52.0, pulses=(400, 800) * 40):
+    return RfEvent(device_uuid="dev", session_id="s1", sequence_number=seq, captured_at_utc=when,
+                   monotonic_ms=seq, frequency_hz=freq, rssi_min_dbm=rssi - 30, rssi_avg_dbm=rssi - 10,
+                   rssi_max_dbm=rssi, duration_us=sum(pulses), pulse_timings_us=pulses)
+
+
+def test_verdict_tells_noise_from_signals_in_plain_words():
+    kind, text = signal_verdict(_noise(1))
+    assert kind == "noise" and "2 edge(s) in 5.0 ms" in text and "Interference" in text
+    kind, text = signal_verdict(_signal(2))
+    assert kind == "signal" and text.startswith("80 edges over 48 ms")
+    # a long carrier without edges is not dismissed as noise
+    carrier = _noise(3)
+    carrier.duration_us = 120_000
+    assert signal_verdict(carrier)[0] == "signal"
+    nfc = RfEvent(device_uuid="dev", session_id="s1", sequence_number=4, captured_at_utc="2026-10-07T10:00:00Z",
+                  monotonic_ms=4, source_type="nfc", nfc_field_duration_ms=900)
+    assert signal_verdict(nfc)[0] == "nfc"
+    assert activity_lanes([nfc, _noise(5)]) == ["315", "433", "868", "NFC"]
+    assert activity_lanes([_signal(6, freq=915000000)]) == ["315", "433", "868", "OTHER"]
+
+
+def test_summary_and_groups_count_only_real_signals():
+    events = [_noise(1), _noise(2), _signal(3), _signal(4, when="2026-10-07T11:00:00Z", rssi=-40.0),
+              _signal(5, freq=868350000, pulses=(1200, 400) * 20)]
+    summary = store_summary(events, now=datetime(2026, 10, 7, 12, 0))
+    assert (summary["signals"], summary["noise"], summary["nfc"]) == (3, 2, 0)
+    assert summary["bands"] == "433.92, 868.35" and summary["strongest"] == "-40 dBm"
+    assert summary["last"] == format_local(events[3].captured_at_unix, now=datetime(2026, 10, 7, 12, 0))
+    only_noise = store_summary([_noise(1)])
+    assert only_noise["signals"] == 0 and only_noise["bands"] == "315.00" and only_noise["strongest"] == ""
+    project = AnalyzerProject()
+
+    class Store:
+        root = "one"
+
+    Store.events = {event.event_id: event for event in events}
+    project.add_store(Store())
+    groups = group_numbers(project, events)
+    assert sorted(groups.values()) == ["#1", "#2"]          # noise has no group
+    assert groups[project.family_key(events[2])] == "#1"    # the two 433.92 MHz remotes
+    assert default_selection(events) == events[3].event_id   # the newest real signal
+    assert default_selection([_noise(1)]) == _noise(1).event_id
+    assert default_selection([]) == ""
+
+
+def test_time_axis_and_formats():
+    lo, hi = activity_window([1000.0])
+    assert hi - lo >= 600 and lo < 1000 < hi                # a single capture still gets a readable axis
+    lo, hi = activity_window([0.0, 86400.0])
+    assert lo < 0 and hi > 86400
+    ticks = time_ticks(1791370000.0, 1791373600.0)
+    assert 2 <= len(ticks) <= 9
+    steps = {round(b[0] - a[0]) for a, b in zip(ticks, ticks[1:])}
+    assert len(steps) == 1 and all(label.count(":") == 1 for _t, label in ticks)
+    day_ticks = time_ticks(1791370000.0, 1791370000.0 + 6 * 86400)
+    assert all(label.count("-") == 1 for _t, label in day_ticks)
+    assert format_duration_us(850) == "850 \u00b5s" and format_duration_us(5000) == "5.0 ms"
+    assert format_duration_us(96000) == "96 ms" and format_duration_us(2_500_000) == "2.5 s"
+    epoch = datetime(2026, 10, 7, 12, 30, 5).timestamp()     # local time
+    assert format_local(epoch, now=datetime(2026, 10, 7, 20, 0)) == "12:30:05"
+    assert format_local(epoch, now=datetime(2026, 10, 9, 8, 0)) == "10-07 12:30"
+    assert format_local(epoch, full=True).startswith("2026-10-07 12:30:05")
+    assert format_local(None) == "?"
+    assert frequency_clusters([433912000, 433928000, 868342000, 868358000, 0]) == [433920000, 868350000]
 
 
 def test_load_problems_are_reported(tmp_path):
@@ -289,6 +354,7 @@ def test_main_exports_and_survives_windowed_python(tmp_path, monkeypatch):
 class FakeSync:
     def __init__(self):
         self.calls = 0
+        self.pushes = 0
 
     def status(self):
         return {"link_up": True, "pending": 2, "stored": 4, "free_kb": 1024, "state": 1, "errors": 0,
@@ -299,7 +365,7 @@ class FakeSync:
         self.calls += 1
 
     def push_now(self):
-        self.pushes = getattr(self, "pushes", 0) + 1
+        self.pushes += 1
 
 
 def test_analyzer_window_smoke(tmp_path):
@@ -313,48 +379,64 @@ def test_analyzer_window_smoke(tmp_path):
         store_root = tmp_path / "store"
         writer = EventStore(store_root)
         for seq in range(1, 4):
-            writer.add(RfEvent.from_dict(_flipper_record(seq)), b"raw")
+            writer.add(RfEvent.from_dict(_flipper_record(seq, pulses=(400, 800) * 20)), b"raw")
+        writer.add(_noise(30), b"raw")
         journal = tmp_path / "copied" / "events"
         journal.mkdir(parents=True)
-        (journal / "rf-dev-s1-40.json").write_text(json.dumps(_flipper_record(40)), encoding="utf-8")
+        (journal / "rf-dev-s1-40.json").write_text(
+            json.dumps(_flipper_record(40, pulses=(400, 800) * 20)), encoding="utf-8")
         closed = []
         sync = FakeSync()
         window = rf_analyzer.AnalyzerWindow(root, str(store_root), sync=sync, extra_roots=[str(journal)],
                                             on_close=lambda: closed.append(True))
-        window.window.geometry("1200x800")
+        window.window.geometry("1280x820")
         root.update()
         window.refresh()
         root.update()
-        assert len(window.project.events) == 4
+        assert len(window.project.events) == 5
         assert "2 pending" in window.sync_label.cget("text")
         assert "read-only" in window.store_label.cget("text")
+        assert window._cards["signals"].cget("text") == "4" and window._cards["noise"].cget("text") == "1"
         window.sync_now()
         assert sync.calls == 1
         window.push_now()
         assert sync.pushes == 1
 
+        # Every capture is a row, newest first; the newest real signal is selected and drawn.
+        rows = window.table.get_children()
+        noise_id = _noise(30).event_id
+        assert len(rows) == 5 and rows[0] == noise_id and rows[1] == "rf-dev-s1-40"
+        assert window._selected_event == "rf-dev-s1-40"
+        assert window.table.item("rf-dev-s1-40")["values"][-1] == "signal"
+        assert window.table.item(noise_id)["values"][-1] == "noise"
+        assert len(window._dots) == 5
+
+        # A click on a dot selects that capture; the details explain it.
+        x, y, event_id = next(dot for dot in window._dots if dot[2] == noise_id)
+        window.activity_click(SimpleNamespace(x=x + 2, y=y - 2))
+        assert window._selected_event == noise_id and window.table.selection() == (noise_id,)
+        details = window.details.get("1.0", "end")
+        assert "NOISE" in details and "Interference" in details
+
+        # Filters: hiding noise and picking a band narrow the list.
+        window._toggle_noise()
+        assert len(window.table.get_children()) == 4 and window._selected_event != noise_id
+        window.set_band("868")
+        assert window.table.get_children() == ()
+        window.set_band("433")
+        assert len(window.table.get_children()) == 4
+        window.search.set("s1-2")
+        window.refresh()
+        assert window.table.get_children() == ("rf-dev-s1-2",)
+        window.search.set("")
+        window.set_band("ALL")
+        window._toggle_noise()
+
         # A record committed by the companion shows up after the folder poll.
-        writer.add(RfEvent.from_dict(_flipper_record(9)), b"raw")
+        writer.add(RfEvent.from_dict(_flipper_record(9, pulses=(400, 800) * 20)), b"raw")
         window._poll_folders()
         root.update()
-        assert len(window.project.events) == 5
-
-        # Clicking the top row of the waterfall selects the newest event.
-        assert window._waterfall_rows
-        window.canvas_event(SimpleNamespace(x=10, y=1))
-        assert window._selected_event == window._waterfall_rows[-1]["event_id"]
-        newest = max(window.project.events.values(), key=lambda event: event.captured_at_utc)
-        assert window._selected_event == newest.event_id
-
-        # Filters: invalid input is reported and ignored, not turned into 1970.
-        window.start_time.set("not a date")
-        window.refresh()
-        assert "From" in window.filter_error.cget("text")
-        assert len(window._events) == 5
-        window.start_time.set("")
-        window.frequency.set("433.9")
-        window.refresh()
-        assert len(window._events) == 5
+        assert len(window.project.events) == 6 and len(window.table.get_children()) == 6
 
         # A second window can share the same Tk root (single companion UI thread).
         other = rf_analyzer.AnalyzerWindow(root, str(store_root))

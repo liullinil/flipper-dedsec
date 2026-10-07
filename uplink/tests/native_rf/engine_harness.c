@@ -250,6 +250,36 @@ static void scenario_noise(void) {
     CHECK(json_u32(record->text, "monotonic_ms") >= 500 && json_u32(record->text, "monotonic_ms") <= 505);
 }
 
+/* ------------------------------------------------------------------ 3b: a noisy floor */
+
+static void floor_stronger_spikes(void) {
+    /* spikes above floor + margin now, but one sample without edges: still no signal */
+    world_set_floor(F315, -77.5f, -62.0f, 300);
+}
+
+static void floor_check(void) {
+    RfStatus s = status();
+    CHECK(s.events == 0 && s.pending == 0 && s.unseen == 0);
+}
+
+static void scenario_noisy_floor(void) {
+    /* Next to a PC the 315 MHz floor sits at -77.5 dBm and spikes reach the -75 dBm trigger:
+     * that must not record anything, while a real remote on top of it still does. */
+    begin("noisy_floor", RfBand315, RfModeScout, true);
+    world_set_floor(F315, -77.5f, -75.0f, 300);
+    world_at(1500, floor_stronger_spikes);
+    world_at(2900, floor_check);
+    world_add_tx(3000, 3100, F315, -60.0f, 400, 800);
+    world_end_at(3500);
+    finish();
+    CHECK(record_count == 1);
+    const Record* record = &records[0];
+    CHECK(count_value(record, 400) + count_value(record, 800) >= 150);
+    CHECK(json_u32(record->text, "frequency_hz") == F315);
+    CHECK(json_u32(record->text, "monotonic_ms") >= 3000 && json_u32(record->text, "monotonic_ms") <= 3005);
+    CHECK(world_feedback(1) == 1 && world_red_blinks() == 0);
+}
+
 /* ------------------------------------------------------------------ 4: NFC */
 
 static void nfc_switch(void) { rf_engine_set_mode(engine, RfModeNfc); }
@@ -457,6 +487,7 @@ int main(void) {
     scenario_hopping();
     scenario_bursts();
     scenario_noise();
+    scenario_noisy_floor();
     scenario_nfc();
     scenario_nfc_busy();
     scenario_follow();

@@ -162,7 +162,8 @@ def text_box(parent, height=None):
     text.tag_configure("title", foreground=CYAN, font=(MONO, 10, "bold"))
     text.tag_configure("head", foreground=MAGENTA, font=(MONO, 9, "bold"))
     text.tag_configure("muted", foreground=DIM)
-    text.tag_configure("good", foreground=GREEN)
+    text.tag_configure("good", foreground=GREEN, font=(MONO, 9, "bold"))
+    text.tag_configure("warn", foreground=YELLOW, font=(MONO, 9, "bold"))
     return frame, text
 
 
@@ -175,3 +176,39 @@ def style_scrollbars(widget):
                         bordercolor=PANEL, lightcolor=LINE, darkcolor=LINE, arrowcolor=CYAN,
                         gripcount=0, relief="flat")
         style.map(f"DedSec.{orient}.TScrollbar", background=[("active", HOVER)])
+
+
+def style_treeview(widget):
+    """Dark ``DedSec.Treeview`` rows with a magenta selection (tag colours stay visible)."""
+    from tkinter import ttk
+
+    style = ttk.Style(widget)
+    style.configure("DedSec.Treeview", background=PANEL, fieldbackground=PANEL, foreground=TEXT,
+                    bordercolor=PANEL, lightcolor=PANEL, darkcolor=PANEL, borderwidth=0, rowheight=22,
+                    font=(MONO, 9))
+    style.map("DedSec.Treeview", background=[("selected", MAGENTA)], foreground=[("selected", BG)])
+    style.configure("DedSec.Treeview.Heading", background=BG, foreground=CYAN, relief="flat",
+                    bordercolor=LINE, lightcolor=BG, darkcolor=BG, font=(MONO, 8, "bold"), padding=(6, 4))
+    style.map("DedSec.Treeview.Heading", background=[("active", HOVER)], foreground=[("active", MAGENTA)])
+    style.layout("DedSec.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+
+
+class Chip:
+    """A small toggle: lit magenta while on. ``command`` runs on a click."""
+
+    def __init__(self, parent, text, command):
+        import tkinter as tk
+
+        self.on = False
+        self.widget = tk.Label(parent, text=text, font=(MONO, 8, "bold"), padx=8, pady=2, cursor="hand2",
+                               bg=BG, fg=DIM, highlightthickness=1, highlightbackground=LINE)
+        self.widget.bind("<ButtonRelease-1>", lambda _event: command())
+
+    def set(self, on):
+        self.on = bool(on)
+        self.widget.configure(bg=MAGENTA if self.on else BG, fg=BG if self.on else DIM,
+                              highlightbackground=MAGENTA if self.on else LINE)
+
+    def pack(self, **kwargs):
+        self.widget.pack(**kwargs)
+        return self

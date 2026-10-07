@@ -83,10 +83,10 @@ Saved to `SD/apps_data/dedsec_uplink/.uplink.settings`.
 | Orientation | Horizontal / Vertical (main screens) |
 | Tab 1…5 | SYS / CDX / CLD / CMD / RF / Off — order and visibility of the tabs |
 | RF band | All / 433 / 315 / 868 MHz |
-| RF trigger level | −100 … −40 dBm (default −75): weaker bursts are ignored |
+| RF trigger level | −100 … −40 dBm (default −75): weaker bursts are ignored; the Flipper also stays 8 dB above the noise it measures on each frequency |
 | RF hop time | 100 … 2000 ms on each frequency in Scout |
 | RF capture window | 250 … 2000 ms, the longest single capture |
-| RF vibrate on signal | on / off (short pulse, at most once a second) |
+| RF vibrate on signal | on / off: a short pulse on a signal (at most once a second), and a short cyan LED blink every 4 s while there are captures you have not looked at (opening the RF tab stops it) |
 | RF after import | Delete / Keep — what happens to a record on the SD card once the PC has it |
 | RF on at app start | on / off |
 | RF import by PC | on / off |
@@ -141,14 +141,28 @@ frequency, RSSI min/avg/max, duration and pulse timings. The tab counts events a
 families, shows what still waits for the PC, free space and the last event. It works without the PC: start
 it and put the Flipper in a pocket.
 
+Only real transmissions become events. The Flipper learns the noise floor of each frequency and triggers at
+least 8 dB above it (next to a PC the 315 MHz floor can sit at −77 dBm, right at the default trigger level),
+and a burst is kept only if it shows on/off keyed edges over a few RSSI samples (16 edges in 10 ms or more) or
+a carrier that stays up for 50 ms. Interference blips are dropped instead of filling the journal.
+
 When the companion is connected it imports the records over the same BLE link, checks size and CRC-32,
 writes them to `%LOCALAPPDATA%\DedSecUplink\rf_hunter` and only then tells the Flipper, which deletes them
 (or keeps them, see *RF after import*). An interrupted import continues where it stopped; a record is never
 imported twice.
 
-**RF analyzer** (tray panel → *RF Hunter analyzer*): a waterfall of frequency over
-time, a timeline, signal families grouped by structure (carrier, modulation, pulse timing, repetition — not
-by payload or RSSI), similarity explanations and notes. Two buttons:
+**RF analyzer** (tray panel → *RF Hunter analyzer*), meant to be read at a glance:
+
+- a summary: signals, noise, NFC fields, frequencies, the last capture and the strongest one;
+- **ACTIVITY**: time across, one lane per band (315 / 433 / 868, NFC), one dot per capture — bigger is
+  longer, the colour is the strength, a hollow dot is noise; a click selects it;
+- **CAPTURES**: every capture in local time with frequency, strength, length, recorded edges, its group
+  (captures that look alike: #1 is the most frequent) and a verdict — *signal*, *noise* or *NFC field*;
+  search, band chips and *hide noise* narrow the list;
+- for the selected capture: the details with a plain explanation of the verdict, the **recorded pulses**
+  drawn as a pulse train, the captures it **looks like**, and a note.
+
+Two buttons:
 
 - **FLIPPER → PC** imports the Flipper's records now (it also happens by itself while connected).
 - **FLIPPER ← PC** puts every record of this PC on the Flipper, to take them to another PC. Connect the
@@ -163,7 +177,7 @@ Exports (JSON/CSV) and copied SD-card folders are on the command line. Details:
 
 ![RF analyzer](../docs/companion_rf_analyzer.png)
 
-The Flipper's Sub-GHz radio is a narrowband receiver: the waterfall shows sampled events, not a continuous
+The Flipper's Sub-GHz radio is a narrowband receiver: the analyzer shows sampled events, not a continuous
 spectrum, and RSSI helps a search but is not direction finding.
 
 ## Companion

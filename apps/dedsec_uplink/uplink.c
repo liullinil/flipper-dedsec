@@ -59,6 +59,7 @@ enum { ViewMain = 0, ViewKeyboard, ViewSettings };
 enum { EvRx = 1, EvTick, EvRf, EvRfTx };
 
 #define RF_STATUS_TICKS (10 * 4) // R| status line to the PC every 10 s
+#define RF_REMIND_TICKS (4 * 4) // LED reminder of RF events nobody has looked at, every 4 s
 #define RF_TX_BUF       2048
 
 typedef enum { KindCodex, KindClaude, KindCount } Kind;
@@ -938,6 +939,23 @@ static void rf_refresh_status(App* app) {
                      app->rf_status.carry != app->rf_status_carry ||
                      app->tick - app->rf_status_tick > RF_STATUS_TICKS))
         rf_send_status(app);
+}
+
+/* Like the missed-call light of a phone: while RF events wait to be looked at, a short cyan blink
+ * every few seconds (with "RF vibrate on signal"); opening the RF tab stops it. */
+static const NotificationSequence rf_remind_sequence = {
+    &message_green_255,
+    &message_blue_255,
+    &message_delay_25,
+    &message_green_0,
+    &message_blue_0,
+    NULL,
+};
+
+static void rf_remind(App* app) {
+    if(!app->rf || !app->rf_status.unseen || !app->settings.rf_feedback) return;
+    if(app->tick % RF_REMIND_TICKS) return;
+    notification_message(app->notifications, &rf_remind_sequence);
 }
 
 static void rf_request(App* app, const char* line) {
@@ -2334,6 +2352,7 @@ static bool custom_event(void* context, uint32_t event) {
         }
         if(app->link && app->tick - app->last_rx_tick > LINK_TICKS) app->link = false;
         rf_refresh_status(app);
+        rf_remind(app);
         furi_mutex_release(app->mutex);
     } else if(event == EvRf) {
         app->rf_event_posted = false; // clear first: a change after this posts a new event

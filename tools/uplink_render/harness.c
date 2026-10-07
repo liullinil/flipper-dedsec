@@ -257,7 +257,7 @@ static void render_all(App* base, int orientation, int font) {
         app->alert_state = 'I';
         render(app, "alert_turn");
         app->alert_update = true;
-        strlcpy(app->ota.tag, "v1.4.0", sizeof(app->ota.tag));
+        strlcpy(app->ota.tag, "v2.0.0", sizeof(app->ota.tag));
         render(app, "alert_update");
         app->alert = false;
         app->alert_update = false;

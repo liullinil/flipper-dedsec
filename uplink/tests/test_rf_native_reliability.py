@@ -302,7 +302,7 @@ def test_native_rf_engine_scenarios_keep_the_hal_contract(engine_harness):
             data = _check_record(text, len(json.loads(text).get("pulse_timings_us", [])))
             records.setdefault(line.split()[1], []).append(data)
     assert {name: len(found) for name, found in records.items()} == {
-        "bursts": 2, "noise": 1, "nfc": 2, "nfc_busy": 1, "follow": 3, "storage_full": 1,
+        "bursts": 2, "noise": 1, "noisy_floor": 1, "nfc": 2, "nfc_busy": 1, "follow": 3, "storage_full": 1,
         "gaps": 5, "churn": 1}
     for found in records.values():
         ids = [data["event_id"] for data in found]

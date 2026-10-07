@@ -42,6 +42,8 @@ static uint32_t now_ms;
 static WorldTx txs[MAX_TX];
 static uint32_t tx_count;
 static WorldSpan noise;
+static uint32_t floor_frequency, spike_every;
+static float floor_dbm, spike_dbm;
 static WorldSpan fields[MAX_FIELDS];
 static uint32_t field_count;
 static WorldEvent steps[MAX_STEPS];
@@ -70,6 +72,7 @@ void world_reset(void) {
     now_ms = 0;
     tx_count = field_count = step_count = 0;
     noise.start_ms = noise.end_ms = 0;
+    floor_frequency = spike_every = 0;
     end_ms = 0;
     in_worker = in_script = false;
     queue_drops = 0;
@@ -102,6 +105,13 @@ void world_add_tx(
 void world_set_noise(uint32_t start_ms, uint32_t end) {
     noise.start_ms = start_ms;
     noise.end_ms = end;
+}
+
+void world_set_floor(uint32_t at_frequency, float at_floor, float at_spike, uint32_t every_ms) {
+    floor_frequency = at_frequency;
+    floor_dbm = at_floor;
+    spike_dbm = at_spike;
+    spike_every = every_ms;
 }
 
 void world_add_nfc_field(uint32_t start_ms, uint32_t end) {
@@ -479,6 +489,10 @@ float furi_hal_subghz_get_rssi(void) {
     uint64_t t_us = now_ms * 1000ULL;
     const WorldTx* tx = active_tx(t_us);
     if(tx && world_level(t_us)) return tx->rssi;
+    if(floor_frequency && frequency == floor_frequency) {
+        if(spike_every && now_ms % spike_every < 5U) return spike_dbm; /* one 5 ms sample */
+        return floor_dbm + (float)(now_ms % 3U) * 0.5f;
+    }
     return -100.0f + (float)(now_ms % 5U);
 }
 

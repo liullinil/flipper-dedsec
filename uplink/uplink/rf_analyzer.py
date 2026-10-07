@@ -1,17 +1,17 @@
-"""Desktop RF Signal Hunter analyzer (investigation window of the DedSec Uplink companion).
+"""Desktop RF Hunter analyzer (investigation window of the DedSec Uplink companion).
 
 :class:`AnalyzerProject` is headless: it merges any number of event stores
 (opened read-only), deduplicates them by event ID and keeps desktop family
 grouping in memory.  :class:`AnalyzerWindow` is a ``tk.Toplevel`` that the
 companion opens on its single Tk UI thread; it reloads the companion's store
-when the folder changes, shows :meth:`RfSync.status` and offers "Sync now".
-It never opens a BLE connection - imports are done by
-:class:`uplink.rf_sync.RfSync` over the companion's link.
+when the folder changes, shows :meth:`RfSync.status` and offers
+FLIPPER -> PC / FLIPPER <- PC.  It never opens a BLE connection - transfers
+are done by :class:`uplink.rf_sync.RfSync` over the companion's link.
 
-The views render sampled RF observations (discrete bursts, RSSI values and
-pulse timing) as a waterfall, spectrum, timeline and family comparison; they
-are not continuous IQ.  ``main(argv)`` keeps the CLI: exports and a standalone
-viewer with its own Tk root.
+The window shows sampled RF observations (discrete bursts with RSSI values and
+pulse timing), not continuous IQ: a summary, an activity chart, the list of
+captures with a plain verdict and the recorded pulses of one capture.
+``main(argv)`` keeps the CLI: exports and a standalone viewer with its own Tk root.
 """
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ import io
 import json
 import logging
 import logging.handlers
+import math
 import os
 import re
 import statistics
@@ -40,7 +41,6 @@ log = logging.getLogger("uplink.rf_analyzer")
 
 POLL_MS = 3000            # folder change check
 STATUS_MS = 1000          # RfSync status refresh
-PLAY_MS = 350
 LOG_NAME = "rf_hunter.log"
 FREQUENCY_TOLERANCE_MHZ = 0.2
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -56,7 +56,7 @@ ERROR = "#ff6b6b"
 
 __all__ = ["AnalyzerProject", "AnalyzerWindow", "EventFilter", "default_store_root", "main",
            "open_analyzer", "parse_frequency_filter", "parse_time", "parse_time_filter",
-           "waterfall_index_at"]
+           "signal_verdict", "store_summary", "format_local", "format_duration_us"]
 
 
 # =========================================================================== parsing
@@ -140,28 +140,6 @@ class EventFilter:
     max_rssi: Optional[float] = None
     min_frequency_hz: Optional[int] = None
     max_frequency_hz: Optional[int] = None
-
-
-# =========================================================================== waterfall geometry
-def waterfall_capacity(height: int) -> int:
-    """Rows that fit the canvas: the newest ``height // 12`` events are drawn."""
-    return max(1, int(height) // 12)
-
-
-def waterfall_row_height(height: int, count: int) -> float:
-    return max(4.0, height / max(1, count))
-
-
-def waterfall_index_at(y: float, height: int, count: int) -> Optional[int]:
-    """Index into the drawn rows (oldest first) for a click at ``y``.
-
-    Row ``i`` is drawn from ``height - (i + 1) * row_h`` to ``height - i * row_h``,
-    so the newest row is at the top of the canvas.
-    """
-    if count <= 0 or height <= 0:
-        return None
-    index = int((height - y) // waterfall_row_height(height, count))
-    return min(count - 1, max(0, index))
 
 
 # =========================================================================== project
@@ -619,6 +597,179 @@ def sync_status_text(status: Optional[dict]) -> tuple:
     return " · ".join(parts), "   ".join(errors)
 
 
+# =========================================================================== reading captures
+# Plain-language views of the records for the window (pure functions, tested headless).
+BANDS = {"ALL": (None, None, ""), "315": (300_000_000, 330_000_000, ""),
+         "433": (420_000_000, 450_000_000, ""), "868": (860_000_000, 880_000_000, ""),
+         "NFC": (None, None, "nfc")}
+VERDICT_TEXT = {"signal": "signal", "noise": "noise", "nfc": "NFC field"}
+NOISE_EDGES = 16            # fewer recorded edges than this ...
+NOISE_LENGTH_US = 50_000    # ... in a shorter burst: a noise spike, not a transmission
+TICK_STEPS = (60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800)
+
+
+def format_duration_us(us) -> str:
+    us = max(0, int(us or 0))
+    if us < 1000:
+        return f"{us} µs"
+    if us < 10_000:
+        return f"{us / 1000:.1f} ms"
+    if us < 1_000_000:
+        return f"{us / 1000:.0f} ms"
+    return f"{us / 1e6:.1f} s"
+
+
+def format_local(epoch, full: bool = False, now: Optional[datetime] = None) -> str:
+    """Local time: ``HH:MM:SS`` today, ``MM-DD HH:MM`` on other days; ``full`` adds the date and UTC."""
+    try:
+        local = datetime.fromtimestamp(float(epoch))
+        utc = datetime.fromtimestamp(float(epoch), timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "?"
+    if full:
+        return f"{local:%Y-%m-%d %H:%M:%S}  ({utc:%H:%M} UTC)"
+    if local.date() == (now or datetime.now()).date():
+        return f"{local:%H:%M:%S}"
+    return f"{local:%m-%d %H:%M}"
+
+
+def signal_verdict(event: RfEvent) -> tuple:
+    """``(kind, explanation)``: ``signal``, ``noise`` or ``nfc``, in plain words."""
+    if event.source_type == "nfc":
+        return "nfc", ("A reader's 13.56 MHz field was next to the Flipper: a card reader, a door lock "
+                       "or a phone with NFC.")
+    edges = len(event.pulse_timings_us)
+    length = format_duration_us(event.duration_us)
+    if edges < NOISE_EDGES and event.duration_us < NOISE_LENGTH_US:
+        return "noise", (f"Only {edges} edge(s) in {length}: too short for a remote or a sensor. Interference "
+                         "next to the Flipper crossed the trigger level for a moment; the current Flipper app "
+                         "no longer saves these.")
+    return "signal", (f"{edges} edges over {length}: an on/off keyed transmission. Remotes, key fobs, "
+                      "doorbells and weather sensors look like this.")
+
+
+def lane_of(event: RfEvent) -> str:
+    if event.source_type == "nfc":
+        return "NFC"
+    for name in ("315", "433", "868"):
+        low, high, _source = BANDS[name]
+        if low <= event.frequency_hz <= high:
+            return name
+    return "OTHER"
+
+
+def activity_lanes(events) -> list:
+    """The three Sub-GHz bands always (they give the picture context), then what else occurs."""
+    present = {lane_of(event) for event in events}
+    return ["315", "433", "868"] + [lane for lane in ("OTHER", "NFC") if lane in present]
+
+
+def activity_window(times) -> tuple:
+    """Time range to draw: the captures with a margin, at least ten minutes wide."""
+    lo, hi = min(times), max(times)
+    span = hi - lo
+    pad = (600 - span) / 2 + 30 if span < 600 else span * 0.04
+    return lo - pad, hi + pad
+
+
+def time_ticks(t0: float, t1: float, most: int = 8) -> list:
+    """``(epoch, label)`` gridlines on whole local minutes / hours / days."""
+    span = max(1.0, t1 - t0)
+    step = next((s for s in TICK_STEPS if span / s <= most), TICK_STEPS[-1])
+    try:
+        offset = datetime.fromtimestamp(t0).astimezone().utcoffset().total_seconds()
+    except (OverflowError, OSError, ValueError, AttributeError):
+        offset = 0.0
+    first = math.ceil((t0 + offset) / step) * step - offset
+    ticks = []
+    t = first
+    while t <= t1 and len(ticks) <= most + 1:
+        local = datetime.fromtimestamp(t)
+        ticks.append((t, f"{local:%m-%d}" if step >= 86400 else f"{local:%H:%M}"))
+        t += step
+    return ticks
+
+
+def dot_radius(event: RfEvent) -> float:
+    """3 px for a blip, up to 9 px for a capture of a second or more."""
+    us = event.nfc_field_duration_ms * 1000 if event.source_type == "nfc" else event.duration_us
+    return 3.0 + min(6.0, math.log10(max(1, us) / 1000.0 + 1.0) * 2.0)
+
+
+def neon(rssi) -> str:
+    """Weak signals deep cyan, strong ones magenta, the strongest yellow."""
+    t = max(0.0, min(1.0, ((rssi if rssi is not None else -110) + 100) / 60.0))
+    if t < 0.6:
+        k = t / 0.6
+        r, g, b = 0x10 + (0x27 - 0x10) * k, 0x50 + (0xe0 - 0x50) * k, 0x60 + (0xe8 - 0x60) * k
+    elif t < 0.9:
+        k = (t - 0.6) / 0.3
+        r, g, b = 0x27 + (0xff - 0x27) * k, 0xe0 + (0x2b - 0xe0) * k, 0xe8 + (0xd6 - 0xe8) * k
+    else:
+        k = (t - 0.9) / 0.1
+        r, g, b = 0xff, 0x2b + (0xe1 - 0x2b) * k, 0xd6 + (0x4d - 0xd6) * k
+    return "#%02x%02x%02x" % (int(r), int(g), int(b))
+
+
+def strength_bar(dbm) -> str:
+    """Five blocks: -100 dBm empty, -50 dBm and stronger full."""
+    level = max(0, min(5, int(((dbm or -110) + 100) // 10)))
+    return "▮" * level + "▯" * (5 - level)
+
+
+def group_numbers(project: "AnalyzerProject", events) -> dict:
+    """Family id -> ``#n`` among real signals, the most frequent first."""
+    project.ensure_families()
+    counts: dict = {}
+    for event in events:
+        if signal_verdict(event)[0] == "signal":
+            key = project.family_key(event)
+            counts[key] = counts.get(key, 0) + 1
+    ordered = sorted(counts, key=lambda key: (-counts[key], key))
+    return {key: f"#{index + 1}" for index, key in enumerate(ordered)}
+
+
+def store_summary(events, now: Optional[datetime] = None) -> dict:
+    """The few numbers on top of the window."""
+    events = list(events)
+    kinds = [signal_verdict(event)[0] for event in events]
+    signals = [event for event, kind in zip(events, kinds) if kind == "signal"]
+    sub_ghz = signals or [event for event, kind in zip(events, kinds) if kind == "noise"]
+    frequencies = frequency_clusters(event.frequency_hz for event in sub_ghz)
+    bands = ", ".join(f"{hz / 1e6:.2f}" for hz in frequencies[:3])
+    if len(frequencies) > 3:
+        bands += f" +{len(frequencies) - 3}"
+    newest = max(events, key=lambda event: event.captured_at_unix or 0, default=None)
+    strongest = max(signals, key=lambda event: event.rssi_max_dbm, default=None)
+    return {"signals": len(signals), "noise": kinds.count("noise"), "nfc": kinds.count("nfc"),
+            "bands": bands, "last": format_local(newest.captured_at_unix, now=now) if newest else "",
+            "strongest": f"{strongest.rssi_max_dbm:.0f} dBm" if strongest else ""}
+
+
+def frequency_clusters(frequencies, gap_hz: int = 100_000) -> list:
+    """One frequency per transmitter channel: captures less than 100 kHz apart are one channel
+    (its median), so 433.912 and 433.928 MHz read as 433.92."""
+    values = sorted(hz for hz in frequencies if hz)
+    clusters, current = [], []
+    for hz in values:
+        if current and hz - current[-1] >= gap_hz:
+            clusters.append(int(statistics.median(current)))
+            current = []
+        current.append(hz)
+    if current:
+        clusters.append(int(statistics.median(current)))
+    return clusters
+
+
+def default_selection(events) -> str:
+    """The newest real capture, else the newest of all."""
+    ordered = sorted(events, key=lambda event: (event.captured_at_unix or 0, event.event_id), reverse=True)
+    for event in ordered:
+        if signal_verdict(event)[0] != "noise":
+            return event.event_id
+    return ordered[0].event_id if ordered else ""
+
+
 class AnalyzerWindow:
     """RF investigation window: a ``tk.Toplevel`` on an existing Tk root.
 
@@ -626,9 +777,14 @@ class AnalyzerWindow:
     come from that root's thread.  ``store_root`` is the companion's event
     store (polled for changes every few seconds, opened read-only), ``sync``
     an optional :class:`uplink.rf_sync.RfSync` whose status is shown and whose
-    ``sync_now()`` the "Sync now" button calls.  ``extra_roots`` are further
-    folders opened read-only (for example a copied SD journal) and
+    ``sync_now()`` / ``push_now()`` the two buttons call.  ``extra_roots`` are
+    further folders opened read-only (for example a copied SD journal) and
     ``on_close`` is called after the window was destroyed.
+
+    The window is meant to be read at a glance: a summary, an activity chart
+    (time across, one lane per band), the list of captures in local time with
+    a plain verdict (signal / noise / NFC), and for the selected capture its
+    details, the recorded pulses and the captures that look like it.
     """
 
     def __init__(self, parent, store_root, sync=None, *, extra_roots: Sequence = (),
@@ -645,18 +801,17 @@ class AnalyzerWindow:
         self._alive = True
         self._after_ids: dict = {}
         self._folder_signatures: dict = {}
-        self._selected_family = ""
         self._selected_event = ""
         self._events: list = []
-        self._family_rows: list = []
-        self._waterfall_rows: list = []
-        self._waterfall_height = 1
+        self._groups: dict = {}
+        self._dots: list = []
+        self._similar_rows: list = []
+        self._band = "ALL"
         self._last_imported = None
-        self.playing = False
         self.window = tk.Toplevel(parent)
         self.window.title("DEDSEC // RF HUNTER")
         self.window.geometry("1280x820")
-        self.window.minsize(900, 600)
+        self.window.minsize(980, 700)
         self.window.configure(bg=ui.BG)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         self._build()
@@ -690,7 +845,6 @@ class AnalyzerWindow:
         if not self._alive:
             return
         self._alive = False
-        self.playing = False
         for after_id in list(self._after_ids.values()):
             try:
                 self.window.after_cancel(after_id)
@@ -738,6 +892,7 @@ class AnalyzerWindow:
         tk, ttk = self.tk, self.ttk
         window = self.window
         ui.style_scrollbars(window)
+        ui.style_treeview(window)
         self._images = []
         try:
             from PIL import ImageTk
@@ -754,12 +909,9 @@ class AnalyzerWindow:
         top.pack(fill="x", padx=10, pady=(8, 0))
         ui.glitch_header(top, "RF HUNTER", "DEDSEC  //  SIGNAL INVESTIGATION", image=hood).pack(
             side="left", fill="x", expand=True)
-        self.status = tk.Label(top, text="No observations loaded", fg=ui.DIM, bg=ui.BG,
-                               font=(ui.MONO, 9), anchor="e")
-        self.status.pack(side="right", anchor="n", pady=(6, 0))
 
         toolbar = tk.Frame(window, bg=ui.BG)
-        toolbar.pack(fill="x", padx=12, pady=(4, 2))
+        toolbar.pack(fill="x", padx=12, pady=(2, 2))
         self.sync_button = ui.NeonButton(toolbar, "FLIPPER → PC", self.sync_now,
                                          style="primary").pack(side="left", padx=(0, 8))
         self.push_button = ui.NeonButton(toolbar, "FLIPPER ← PC", self.push_now,
@@ -771,117 +923,127 @@ class AnalyzerWindow:
                                "for another PC", fg=ui.MUTED, bg=ui.BG, font=(ui.MONO, 8)).pack(
             side="left", padx=(12, 0))
 
-        info = tk.Frame(window, bg=ui.BG)
-        info.pack(fill="x", padx=12, pady=(6, 2))
-        line = tk.Frame(info, bg=ui.BG)
-        line.pack(fill="x")
+        line = tk.Frame(window, bg=ui.BG)
+        line.pack(fill="x", padx=12, pady=(6, 0))
         self.sync_dot = tk.Label(line, text="●", fg=ui.MUTED, bg=ui.BG, font=(ui.MONO, 10))
         self.sync_dot.pack(side="left")
         self.sync_label = tk.Label(line, text="", fg=ui.TEXT, bg=ui.BG, font=(ui.MONO, 9, "bold"),
                                    anchor="w")
         self.sync_label.pack(side="left", padx=(4, 0))
-        self.sync_error = tk.Label(info, text="", fg=ui.RED, bg=ui.BG, font=(ui.MONO, 9), anchor="w")
-        self.sync_error.pack(fill="x")
-        self.store_label = tk.Label(info, text="", fg=ui.MUTED, bg=ui.BG, font=(ui.MONO, 8), anchor="w")
-        self.store_label.pack(fill="x")
+        self.sync_error = tk.Label(window, text="", fg=ui.RED, bg=ui.BG, font=(ui.MONO, 9), anchor="w")
+        self.sync_error.pack(fill="x", padx=12)
 
-        filters = tk.Frame(window, bg=ui.BG)
-        filters.pack(fill="x", padx=12, pady=(6, 0))
+        # summary: what the store holds, in a few big numbers
+        cards = tk.Frame(window, bg=ui.BG)
+        cards.pack(fill="x", padx=12, pady=(4, 8))
+        self._cards = {}
+        for key, label, color in (("signals", "SIGNALS", ui.GREEN), ("noise", "NOISE", ui.DIM),
+                                  ("nfc", "NFC FIELDS", ui.CYAN), ("bands", "FREQUENCIES", ui.TEXT),
+                                  ("last", "LAST CAPTURE", ui.TEXT), ("strongest", "STRONGEST", ui.MAGENTA)):
+            card = tk.Frame(cards, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.LINE)
+            card.pack(side="left", padx=(0, 8), ipadx=10, ipady=2)
+            value = tk.Label(card, text="—", fg=color, bg=ui.PANEL, font=(ui.MONO, 15, "bold"),
+                             anchor="w")
+            value.pack(anchor="w", padx=8, pady=(4, 0))
+            tk.Label(card, text=label, fg=ui.MUTED, bg=ui.PANEL, font=(ui.MONO, 7, "bold"),
+                     anchor="w").pack(anchor="w", padx=8, pady=(0, 4))
+            self._cards[key] = value
 
-        def field(label, width, padx=(10, 0)):
-            tk.Label(filters, text=label, fg=ui.DIM, bg=ui.BG, font=(ui.MONO, 8, "bold")).pack(
-                side="left", padx=padx)
-            variable = tk.StringVar(master=window)
-            widget = ui.entry(filters, variable, width)
-            widget.pack(side="left", padx=4, ipady=2)
-            widget.bind("<Return>", lambda _event: self.refresh())
-            return variable
-
-        self.search = field("SEARCH", 24, padx=(0, 0))
-        self.source = field("SOURCE", 8)
-        self.frequency = field("MHZ", 13)
-        self.rssi = field("RSSI ≥", 6)
-        self.max_rssi = field("≤", 6, padx=(2, 0))
-        self.start_time = field("FROM UTC", 16)
-        self.end_time = field("TO", 16, padx=(2, 0))
-        ui.NeonButton(filters, "APPLY", self.refresh, style="accent").pack(side="left", padx=(10, 0))
-        self.filter_error = tk.Label(window, text="", fg=ui.YELLOW, bg=ui.BG, font=(ui.MONO, 9), anchor="w")
-        self.filter_error.pack(fill="x", padx=12)
-
+        # packed before the panes so that a small window clips the panes, not this line
+        self.store_label = tk.Label(window, text="", fg=ui.MUTED, bg=ui.BG, font=(ui.MONO, 8), anchor="w")
+        self.store_label.pack(side="bottom", fill="x", padx=12, pady=(0, 6))
         body = tk.PanedWindow(window, orient="horizontal", bg=ui.LINE, sashwidth=3, borderwidth=0,
                               sashrelief="flat", opaqueresize=True)
-        body.pack(fill="both", expand=True, padx=12, pady=(4, 10))
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 4))
         left = tk.Frame(body, bg=ui.BG)
-        center = tk.Frame(body, bg=ui.BG)
         right = tk.Frame(body, bg=ui.BG)
-        body.add(left, minsize=200, width=240, stretch="never")
-        body.add(center, minsize=360, stretch="always")
-        body.add(right, minsize=300, width=380, stretch="never")
+        body.add(left, minsize=520, stretch="always")
+        body.add(right, minsize=330, width=410, stretch="never")
 
-        ui.section(left, "SIGNAL_FAMILIES", ui.MAGENTA).pack(fill="x", padx=(0, 8))
-        box = tk.Frame(left, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.LINE)
-        box.pack(fill="both", expand=True, pady=6, padx=(0, 8))
-        self.families = tk.Listbox(box, bg=ui.PANEL, fg=ui.TEXT, selectbackground=ui.MAGENTA,
-                                   selectforeground=ui.BG, relief="flat", exportselection=False,
-                                   font=(ui.MONO, 9), activestyle="none", highlightthickness=0,
-                                   borderwidth=0)
-        family_scroll = ttk.Scrollbar(box, orient="vertical", command=self.families.yview,
-                                      style="DedSec.Vertical.TScrollbar")
-        self.families.configure(yscrollcommand=family_scroll.set)
-        self.families.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=4)
-        family_scroll.pack(side="right", fill="y")
-        self.families.bind("<<ListboxSelect>>", self.family_selected)
-        ui.NeonButton(left, "SHOW ALL", self.clear_family).pack(anchor="e", padx=(0, 8), pady=(0, 2))
+        # ---- left: activity chart, then the list
+        head = tk.Frame(left, bg=ui.BG)
+        head.pack(fill="x", padx=(0, 8))
+        ui.section(head, "ACTIVITY").pack(side="left", fill="x", expand=True)
+        tk.Label(head, text="one dot per capture · bigger = longer · colour = stronger · "
+                            "hollow = noise", fg=ui.MUTED, bg=ui.BG, font=(ui.MONO, 8)).pack(
+            side="right", padx=(8, 0))
+        self.activity = tk.Canvas(left, bg="#020507", highlightthickness=1, highlightbackground=ui.LINE,
+                                  height=190)
+        self.activity.pack(fill="x", padx=(0, 8), pady=(4, 8))
+        self.activity.bind("<Button-1>", self.activity_click)
+        self.activity.bind("<Configure>", lambda _event: self._schedule("activity", 80, self._draw_activity))
 
-        scrub = tk.Frame(center, bg=ui.BG)
-        scrub.pack(side="bottom", fill="x", padx=8, pady=(0, 2))
-        ui.section(center, "WATERFALL").pack(fill="x", padx=8)
-        self.waterfall_canvas = tk.Canvas(center, bg="#020507", highlightthickness=1,
-                                          highlightbackground=ui.LINE, height=220)
-        self.waterfall_canvas.pack(fill="both", expand=True, padx=8, pady=(4, 6))  # takes the spare height
-        ui.section(center, "TIMELINE").pack(fill="x", padx=8)
-        self.timeline_canvas = tk.Canvas(center, bg="#020507", highlightthickness=1,
-                                         highlightbackground=ui.LINE, height=86)
-        self.timeline_canvas.pack(fill="x", padx=8, pady=(4, 6))
-        ui.section(center, "RSSI_SPECTRUM").pack(fill="x", padx=8)
-        self.spectrum_canvas = tk.Canvas(center, bg="#020507", highlightthickness=1,
-                                         highlightbackground=ui.LINE, height=96)
-        self.spectrum_canvas.pack(fill="x", padx=8, pady=(4, 6))
-        self.play_button = ui.NeonButton(scrub, "PLAY", self.toggle_play, style="accent").pack(side="left")
-        self.scrub = tk.IntVar(master=window, value=0)
-        self.scrub_scale = tk.Scale(scrub, variable=self.scrub, from_=0, to=0, orient="horizontal",
-                                    showvalue=False, command=self.scrub_changed, bg=ui.CYAN,
-                                    activebackground=ui.MAGENTA, troughcolor=ui.PANEL,
-                                    highlightthickness=0, borderwidth=0, sliderrelief="flat",
-                                    sliderlength=22, width=10)
-        self.scrub_scale.pack(side="left", fill="x", expand=True, padx=(10, 0))
+        list_head = tk.Frame(left, bg=ui.BG)
+        list_head.pack(fill="x", padx=(0, 8))
+        ui.section(list_head, "CAPTURES").pack(side="left", fill="x", expand=True)
+        filters = tk.Frame(left, bg=ui.BG)
+        filters.pack(fill="x", padx=(0, 8), pady=(4, 4))
+        self.search = tk.StringVar(master=window)
+        search = ui.entry(filters, self.search, 22)
+        search.pack(side="left", ipady=2)
+        search.bind("<KeyRelease>", lambda _event: self._schedule("search", 250, self.refresh))
+        tk.Label(filters, text="search", fg=ui.MUTED, bg=ui.BG, font=(ui.MONO, 8)).pack(
+            side="left", padx=(4, 12))
+        self._band_chips = {}
+        for band in ("ALL", "315", "433", "868", "NFC"):
+            chip = ui.Chip(filters, band, lambda band=band: self.set_band(band))
+            chip.pack(side="left", padx=(0, 4))
+            self._band_chips[band] = chip
+        self._band_chips["ALL"].set(True)
+        self.hide_noise = ui.Chip(filters, "HIDE NOISE", self._toggle_noise)
+        self.hide_noise.pack(side="left", padx=(12, 0))
 
-        ui.section(right, "FAMILY_DETAIL", ui.MAGENTA).pack(fill="x", padx=(8, 0))
-        family_box, self.family_details = ui.text_box(right, height=11)
-        family_box.pack(fill="x", padx=(8, 0), pady=(4, 8))
-        ui.section(right, "OBSERVATION // SIMILARITY", ui.MAGENTA).pack(fill="x", padx=(8, 0))
-        details_box, self.details = ui.text_box(right)
-        details_box.pack(fill="both", expand=True, padx=(8, 0), pady=(4, 8))
-        ui.section(right, "NOTE // LOCATION", ui.MAGENTA).pack(fill="x", padx=(8, 0))
-        self.note_entry = ui.entry(right)
-        self.note_entry.pack(fill="x", padx=(8, 0), pady=(4, 2), ipady=2)
-        self.location_entry = ui.entry(right)
-        self.location_entry.pack(fill="x", padx=(8, 0), pady=2, ipady=2)
-        buttons = tk.Frame(right, bg=ui.BG)
-        buttons.pack(fill="x", padx=(8, 0), pady=(4, 0))
-        ui.NeonButton(buttons, "EXPORT FOLLOW PROFILE", self.export_follow).pack(side="right")
-        ui.NeonButton(buttons, "SAVE NOTE", self.save_note, style="accent").pack(side="right", padx=6)
+        table = tk.Frame(left, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.LINE)
+        table.pack(fill="both", expand=True, padx=(0, 8), pady=(0, 4))
+        columns = (("time", "TIME", 128, "w"), ("mhz", "MHZ", 74, "e"), ("dbm", "DBM", 56, "e"),
+                   ("length", "LENGTH", 72, "e"), ("edges", "EDGES", 60, "e"), ("group", "GROUP", 64, "center"),
+                   ("verdict", "VERDICT", 90, "w"))
+        self.table = ttk.Treeview(table, columns=[c[0] for c in columns], show="headings",
+                                  selectmode="browse", style="DedSec.Treeview")
+        for key, title, width, anchor in columns:
+            self.table.heading(key, text=title, anchor=anchor)
+            self.table.column(key, width=width, minwidth=40, anchor=anchor, stretch=key == "verdict")
+        self.table.tag_configure("noise", foreground=ui.MUTED)
+        self.table.tag_configure("nfc", foreground=ui.CYAN)
+        self.table.tag_configure("signal", foreground=ui.TEXT)
+        scroll = ttk.Scrollbar(table, orient="vertical", command=self.table.yview,
+                               style="DedSec.Vertical.TScrollbar")
+        self.table.configure(yscrollcommand=scroll.set)
+        self.table.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.table.bind("<<TreeviewSelect>>", self._table_selected)
 
-        self.waterfall_canvas.bind("<Button-1>", self.canvas_event)
-        self.timeline_canvas.bind("<Button-1>", self.timeline_event)
-        for canvas in (self.waterfall_canvas, self.timeline_canvas, self.spectrum_canvas):
-            canvas.bind("<Configure>", lambda _event: self._schedule("redraw", 120, self._redraw))
+        # ---- right: the selected capture
+        ui.section(right, "CAPTURE", ui.MAGENTA).pack(fill="x", padx=(8, 0))
+        details_box, self.details = ui.text_box(right, height=11)
+        details_box.pack(fill="x", padx=(8, 0), pady=(4, 8))
+        ui.section(right, "RECORDED PULSES", ui.MAGENTA).pack(fill="x", padx=(8, 0))
+        self.pulses = tk.Canvas(right, bg="#020507", highlightthickness=1, highlightbackground=ui.LINE,
+                                height=100)
+        self.pulses.pack(fill="x", padx=(8, 0), pady=(4, 8))
+        self.pulses.bind("<Configure>", lambda _event: self._schedule("pulses", 80, self._draw_pulses))
+        # the note sits at the bottom; "looks like" takes what is left between
+        notes = tk.Frame(right, bg=ui.BG)
+        notes.pack(side="bottom", fill="x", padx=(8, 0), pady=(4, 0))
+        self.note_entry = ui.entry(notes)
+        self.note_entry.pack(side="left", fill="x", expand=True, ipady=2)
+        ui.NeonButton(notes, "SAVE NOTE", self.save_note, style="accent").pack(side="left", padx=(6, 0))
+        ui.section(right, "NOTE", ui.MAGENTA).pack(side="bottom", fill="x", padx=(8, 0))
+        ui.section(right, "LOOKS LIKE", ui.MAGENTA).pack(fill="x", padx=(8, 0))
+        box = tk.Frame(right, bg=ui.PANEL, highlightthickness=1, highlightbackground=ui.LINE)
+        box.pack(fill="both", expand=True, padx=(8, 0), pady=(4, 8))
+        self.similar = tk.Listbox(box, bg=ui.PANEL, fg=ui.TEXT, selectbackground=ui.MAGENTA,
+                                  selectforeground=ui.BG, relief="flat", exportselection=False,
+                                  font=(ui.MONO, 9), activestyle="none", highlightthickness=0,
+                                  borderwidth=0, height=3)
+        self.similar.pack(fill="both", expand=True, padx=6, pady=4)
+        self.similar.bind("<<ListboxSelect>>", self._similar_selected)
 
     # ------------------------------------------------------------------ folders
     def _open_root(self, path, report: bool = True) -> bool:
         try:
+            self.project.add_root(path)
             root = resolve_store_root(path)
-            self.project.add_root(root)
             self._folder_signatures[root] = folder_signature(root)
             return True
         except Exception as exc:
@@ -972,84 +1134,195 @@ class AnalyzerWindow:
         self._schedule("status", STATUS_MS, self._tick_status)
 
     # ------------------------------------------------------------------ filters / refresh
+    def set_band(self, band: str):
+        self._band = band if band in BANDS else "ALL"
+        for name, chip in self._band_chips.items():
+            chip.set(name == self._band)
+        self.refresh()
+
+    def _toggle_noise(self):
+        self.hide_noise.set(not self.hide_noise.on)
+        self.refresh()
+
     def _spec(self) -> EventFilter:
-        errors = []
-
-        def number(variable, label):
-            text = variable.get().strip().replace(",", ".")
-            if not text:
-                return None
-            try:
-                return float(text)
-            except ValueError:
-                errors.append(f"{label} '{text}' is not a number")
-                return None
-
-        try:
-            frequency = parse_frequency_filter(self.frequency.get())
-        except ValueError as exc:
-            frequency = None
-            errors.append(str(exc))
-        try:
-            start = parse_time_filter(self.start_time.get())
-        except ValueError as exc:
-            start = None
-            errors.append(f"From: {exc}")
-        try:
-            end = parse_time_filter(self.end_time.get(), end=True)
-        except ValueError as exc:
-            end = None
-            errors.append(f"To: {exc}")
-        spec = EventFilter(source_type=self.source.get().strip(), family_id=self._selected_family,
-                           text=self.search.get().strip(), start=start, end=end,
-                           min_rssi=number(self.rssi, "RSSI ≥"), max_rssi=number(self.max_rssi, "RSSI ≤"),
-                           min_frequency_hz=frequency[0] if frequency else None,
-                           max_frequency_hz=frequency[1] if frequency else None)
-        self.filter_error.configure(text=("Filter ignored: " + "; ".join(errors)) if errors else "")
-        return spec
+        low, high, source = BANDS.get(self._band, (None, None, ""))
+        return EventFilter(source_type=source, text=self.search.get().strip(),
+                           min_frequency_hz=low, max_frequency_hz=high)
 
     def refresh(self):
         if not self._alive:
             return
-        spec = self._spec()
-        events = self.project.filtered(spec)
-        # Keep the navigator complete while the center view is filtered to a
-        # selected family; otherwise selecting one row hides all others.
-        navigator = events if not spec.family_id else self.project.filtered(
-            dataclasses.replace(spec, family_id=""))
-        summaries = self.project.family_summary(navigator)
-        self._family_rows = [summary["family_id"] for summary in summaries]
-        self.families.delete(0, "end")
-        for summary in summaries:
-            short = str(summary["family_id"]).replace("family-", "")[:12].upper()
-            self.families.insert("end", f"▮ {short:<12} {summary['observation_count']:>4}")
-        if self._selected_family in self._family_rows:
-            index = self._family_rows.index(self._selected_family)
-            self.families.selection_set(index)
-            self.families.see(index)
-        self.status.configure(text=f"{len(events)} SHOWN  ·  {len(self.project.events)} OBSERVATIONS  ·  "
-                                   f"{len(self.project.grouper.families)} FAMILIES")
-        self._set_family_details(self._selected_family)
+        everything = self.project.filtered(EventFilter())
+        self._groups = group_numbers(self.project, everything)
+        events = self.project.filtered(self._spec())
+        if self.hide_noise.on:
+            events = [event for event in events if signal_verdict(event)[0] != "noise"]
         self._events = events
-        self.scrub_scale.configure(to=max(0, len(events) - 1))
-        self.scrub.set(min(self.scrub.get(), max(0, len(events) - 1)))
-        self.draw(events)
+        self._fill_summary(everything)
+        self._fill_table(events)
+        visible = {event.event_id for event in events}
+        if self._selected_event not in visible:
+            self._selected_event = default_selection(events)
+        self._select(self._selected_event, scroll=True)
         self._update_store_label()
 
-    def _redraw(self):
-        if self._alive:
-            self.draw(self._events)
+    def _fill_summary(self, events):
+        summary = store_summary(events)
+        cards = self._cards
+        cards["signals"].configure(text=str(summary["signals"]))
+        cards["noise"].configure(text=str(summary["noise"]))
+        cards["nfc"].configure(text=str(summary["nfc"]))
+        cards["bands"].configure(text=summary["bands"] or "—")
+        cards["last"].configure(text=summary["last"] or "—")
+        cards["strongest"].configure(text=summary["strongest"] or "—")
 
-    def family_selected(self, _event=None):
-        selected = self.families.curselection()
-        self._selected_family = self._family_rows[selected[0]] if selected and selected[0] < len(
-            self._family_rows) else ""
-        self.refresh()
+    def _fill_table(self, events):
+        table = self.table
+        table.delete(*table.get_children())
+        for event in sorted(events, key=lambda item: (item.captured_at_unix or 0, item.event_id), reverse=True):
+            kind, _text = signal_verdict(event)
+            edges = len(event.pulse_timings_us)
+            table.insert("", "end", iid=event.event_id, tags=(kind,), values=(
+                format_local(event.captured_at_unix),
+                "NFC" if event.source_type == "nfc" else f"{event.frequency_hz / 1e6:.2f}",
+                "" if event.source_type == "nfc" else f"{event.rssi_max_dbm:.0f}",
+                format_duration_us(event.duration_us if event.source_type != "nfc"
+                                   else event.nfc_field_duration_ms * 1000),
+                "" if event.source_type == "nfc" else str(edges),
+                "" if kind == "noise" else self._groups.get(self.project.family_key(event), ""),
+                VERDICT_TEXT[kind]))
 
-    def clear_family(self):
-        self._selected_family = ""
-        self.families.selection_clear(0, "end")
-        self.refresh()
+    # ------------------------------------------------------------------ selection
+    def _event(self, event_id):
+        return self.project.events.get(event_id) if event_id else None
+
+    def _select(self, event_id, scroll=False):
+        self._selected_event = event_id or ""
+        if event_id and self.table.exists(event_id):
+            if self.table.selection() != (event_id,):
+                self.table.selection_set(event_id)
+            if scroll:
+                self.table.see(event_id)
+        self.show_event(self._event(event_id))
+        self._draw_activity()
+
+    def _table_selected(self, _event=None):
+        selection = self.table.selection()
+        if selection and selection[0] != self._selected_event:
+            self._select(selection[0])
+
+    def _similar_selected(self, _event=None):
+        selection = self.similar.curselection()
+        if selection and selection[0] < len(self._similar_rows):
+            event_id = self._similar_rows[selection[0]]
+            if self.table.exists(event_id):
+                self._select(event_id, scroll=True)
+
+    def activity_click(self, event):
+        """Select the capture whose dot is nearest to the click (within 14 px)."""
+        best, distance = None, 14.0 ** 2
+        for x, y, event_id in self._dots:
+            d = (x - event.x) ** 2 + (y - event.y) ** 2
+            if d <= distance:
+                best, distance = event_id, d
+        if best:
+            self._select(best, scroll=True)
+
+    # ------------------------------------------------------------------ drawing
+    def _draw_activity(self):
+        canvas = self.activity
+        canvas.delete("all")
+        self._dots = []
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        events = self._events
+        if not events:
+            cx, cy = width // 2, height // 2
+            for dx, color in ((2, ui.MAGENTA), (-2, ui.CYAN), (0, "#f4fbff")):
+                canvas.create_text(cx + dx, cy - 16, text="NO CAPTURES YET", fill=color,
+                                   font=("Segoe UI Black", 16))
+            canvas.create_text(cx, cy + 12, text="start RF on the Flipper:  RF tab  >  OK", fill=ui.DIM,
+                               font=(ui.MONO, 9))
+            canvas.create_text(cx, cy + 30, text="captures arrive here while the Flipper is connected",
+                               fill=ui.MUTED, font=(ui.MONO, 8))
+            return
+        lanes = activity_lanes(events)
+        left, right, top, bottom = 58, width - 14, 8, height - 22
+        lane_h = (bottom - top) / len(lanes)
+        times = [event.captured_at_unix or 0 for event in events]
+        t0, t1 = activity_window(times)
+        span = max(1.0, t1 - t0)
+
+        def x_of(t):
+            return left + (t - t0) * (right - left) / span
+
+        for t, label in time_ticks(t0, t1):
+            x = x_of(t)
+            canvas.create_line(x, top, x, bottom, fill="#0b1d26")
+            canvas.create_text(x, bottom + 11, text=label, fill=ui.DIM, font=(ui.MONO, 8))
+        for index, lane in enumerate(lanes):
+            y0 = top + index * lane_h
+            canvas.create_line(left, y0 + lane_h / 2, right, y0 + lane_h / 2, fill=ui.LINE)
+            canvas.create_text(left - 8, y0 + lane_h / 2, text=lane, anchor="e", fill=ui.CYAN,
+                               font=(ui.MONO, 8, "bold"))
+        lane_index = {lane: index for index, lane in enumerate(lanes)}
+        for event in sorted(events, key=lambda item: item.captured_at_unix or 0):
+            kind, _text = signal_verdict(event)
+            x = x_of(event.captured_at_unix or 0)
+            y = top + (lane_index[lane_of(event)] + 0.5) * lane_h
+            radius = dot_radius(event)
+            if kind == "noise":
+                canvas.create_oval(x - radius, y - radius, x + radius, y + radius, outline=ui.DIM, width=1)
+            else:
+                color = ui.CYAN if kind == "nfc" else neon(event.rssi_max_dbm)
+                canvas.create_oval(x - radius - 2, y - radius - 2, x + radius + 2, y + radius + 2,
+                                   outline=color, width=1)
+                canvas.create_oval(x - radius, y - radius, x + radius, y + radius, fill=color, outline="")
+            self._dots.append((x, y, event.event_id))
+            if event.event_id == self._selected_event:
+                canvas.create_oval(x - radius - 6, y - radius - 6, x + radius + 6, y + radius + 6,
+                                   outline=ui.YELLOW, width=2)
+
+    def _draw_pulses(self):
+        canvas = self.pulses
+        canvas.delete("all")
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        event = self._event(self._selected_event)
+        if event is None:
+            return
+        if event.source_type == "nfc":
+            canvas.create_text(width // 2, height // 2, text="an NFC field has no pulses to show",
+                               fill=ui.DIM, font=(ui.MONO, 9))
+            return
+        timings = [max(0, int(value)) for value in event.pulse_timings_us]
+        total = sum(timings)
+        if len(timings) < 2 or total <= 0:
+            canvas.create_text(width // 2, height // 2 - 8, text="NOTHING RECORDED", fill=ui.YELLOW,
+                               font=(ui.MONO, 11, "bold"))
+            canvas.create_text(width // 2, height // 2 + 12, text=f"{len(timings)} edge(s): no pulse train to draw",
+                               fill=ui.DIM, font=(ui.MONO, 8))
+            return
+        left, right, high, low = 10, width - 10, 18, height - 26
+        x, level = float(left), True
+        points = [left, low]
+        for duration in timings:
+            y = high if level else low
+            points += [x, y]
+            x += duration * (right - left) / total
+            points += [x, y]
+            level = not level
+        points += [x, low]
+        canvas.create_line(*points, fill="#0d4a52", width=4)        # glow
+        canvas.create_line(*points, fill=ui.CYAN, width=1)
+        canvas.create_text(left, 8, anchor="w", text=f"{len(timings)} edges · {format_duration_us(total)}",
+                           fill=ui.TEXT, font=(ui.MONO, 8, "bold"))
+        shortest = min(value for value in timings if value > 0)
+        canvas.create_text(right, 8, anchor="e", text=f"shortest {shortest} µs", fill=ui.DIM,
+                           font=(ui.MONO, 8))
+        canvas.create_text(left, height - 10, anchor="w", text="0", fill=ui.DIM, font=(ui.MONO, 8))
+        canvas.create_text(right, height - 10, anchor="e", text=format_duration_us(total), fill=ui.DIM,
+                           font=(ui.MONO, 8))
 
     @staticmethod
     def _write(widget, segments):
@@ -1064,267 +1337,66 @@ class AnalyzerWindow:
     def _pairs(rows):
         segments = []
         for key, value in rows:
-            segments += [(f"{key:<13}", "muted"), (f"{value}\n", None)]
+            segments += [(f"{key:<11}", "muted"), (f"{value}\n", None)]
         return segments
 
-    def _set_family_details(self, family_id):
-        detail = self.project.family_detail(family_id) if family_id else {}
-        if not detail.get("observation_count"):
-            self._write(self.family_details, [("NO FAMILY SELECTED\n", "title"),
-                                              ("pick one on the left, or click the waterfall", "muted")])
-            return
-        frequencies = "—"
-        if detail["frequency_min_hz"]:
-            frequencies = f"{detail['frequency_min_hz'] / 1e6:.3f}"
-            if detail["frequency_max_hz"] != detail["frequency_min_hz"]:
-                frequencies += f" – {detail['frequency_max_hz'] / 1e6:.3f}"
-            frequencies += " MHz"
-        hours = ", ".join(f"{hour:02d}" for hour in detail["time_of_day_hours"]) or "—"
-        segments = [(f"{str(detail['family_id']).upper()}\n", "title")]
-        segments += self._pairs([
-            ("OBSERVED", f"{detail['observation_count']}×  ·  {frequencies}"),
-            ("FIRST SEEN", detail["first_seen"]),
-            ("LAST SEEN", detail["last_seen"]),
-            ("MODULATION", ", ".join(detail["modulations"]) or "unknown"),
-            ("VARIANTS", len(detail["waveform_variants"])),
-            ("RSSI", f"{detail['rssi_min_dbm']:.1f} … {detail['rssi_max_dbm']:.1f} dBm"),
-            ("ACTIVE (UTC)", hours),
-            ("HYPOTHESIS", f"{detail['source_hypothesis']}  ·  {detail['similarity_confidence']:.0%}"),
-            ("CAPTURES", f"{detail['raw_capture_count']} raw · {detail['imported_count']} imported · "
-                         f"{detail['pending_count']} pending"),
-            ("FOLLOW", "selected" if detail["follow_selected"] else "not selected"),
-        ])
-        self._write(self.family_details, segments)
-
-    # ------------------------------------------------------------------ drawing
-    def draw(self, events):
-        self.draw_waterfall(events)
-        self.draw_timeline(events)
-        self.draw_spectrum(events)
-        if events:
-            self.show_event(events[min(self.scrub.get(), len(events) - 1)])
-
-    @staticmethod
-    def _grid(canvas, width, height, step_x=64, step_y=24):
-        for x in range(step_x, width, step_x):
-            canvas.create_line(x, 0, x, height, fill="#08161d")
-        for y in range(step_y, height, step_y):
-            canvas.create_line(0, y, width, y, fill="#08161d")
-
-    @staticmethod
-    def _neon(rssi):
-        """Weak signals deep cyan, strong ones magenta, the strongest yellow."""
-        t = max(0.0, min(1.0, ((rssi if rssi is not None else -110) + 100) / 60.0))
-        if t < 0.6:
-            k = t / 0.6
-            r, g, b = 0x10 + (0x27 - 0x10) * k, 0x50 + (0xe0 - 0x50) * k, 0x60 + (0xe8 - 0x60) * k
-        elif t < 0.9:
-            k = (t - 0.6) / 0.3
-            r, g, b = 0x27 + (0xff - 0x27) * k, 0xe0 + (0x2b - 0xe0) * k, 0xe8 + (0xd6 - 0xe8) * k
-        else:
-            k = (t - 0.9) / 0.1
-            r, g, b = 0xff, 0x2b + (0xe1 - 0x2b) * k, 0xd6 + (0x4d - 0xd6) * k
-        return "#%02x%02x%02x" % (int(r), int(g), int(b))
-
-    def draw_waterfall(self, events):
-        canvas = self.waterfall_canvas
-        canvas.delete("all")
-        width = max(1, canvas.winfo_width())
-        height = max(1, canvas.winfo_height())
-        self._grid(canvas, width, height)
-        rows = self.project.waterfall(events)[-waterfall_capacity(height):]
-        self._waterfall_rows = rows
-        self._waterfall_height = height
-        frequencies = [row["frequency_hz"] for row in rows if row["frequency_hz"]]
-        if not rows or not frequencies:
-            cx, cy = width // 2, height // 2
-            for dx, color in ((2, ui.MAGENTA), (-2, ui.CYAN), (0, "#f4fbff")):
-                canvas.create_text(cx + dx, cy - 18, text="NO SIGNALS YET", fill=color,
-                                   font=("Segoe UI Black", 18))
-            canvas.create_text(cx, cy + 12, text="start RF on the Flipper:  RF tab  >  OK", fill=ui.DIM,
-                               font=(ui.MONO, 9))
-            canvas.create_text(cx, cy + 30, text="records arrive here while the Flipper is connected",
-                               fill=ui.MUTED, font=(ui.MONO, 8))
-            return
-        low, high = min(frequencies), max(frequencies)
-        span = max(1, high - low)
-        row_h = waterfall_row_height(height, len(rows))
-        for index, row in enumerate(rows):
-            x = 14 + (row["frequency_hz"] - low) * (width - 28) / span
-            y = height - (index + 1) * row_h  # newest row at the top
-            color = self._neon(row["rssi_dbm"])
-            canvas.create_rectangle(max(3, x - 4), y, min(width - 3, x + 4), y + max(1, row_h - 1),
-                                    fill=color, outline="")
-            if row["family_id"] == self._selected_family:
-                canvas.create_rectangle(x - 7, y - 1, x + 7, y + row_h, outline=ui.MAGENTA, width=1)
-            if row["event_id"] == self._selected_event:
-                canvas.create_rectangle(x - 9, y - 2, x + 9, y + row_h + 1, outline=ui.YELLOW, width=2)
-        canvas.create_text(10, 10, anchor="w", fill=ui.CYAN, font=(ui.MONO, 9, "bold"),
-                           text=f"{low / 1e6:.3f} – {high / 1e6:.3f} MHz")
-        canvas.create_text(width - 10, 10, anchor="e", fill=ui.MUTED, font=(ui.MONO, 8),
-                           text="sampled RSSI · newest on top")
-
-    def draw_timeline(self, events):
-        canvas = self.timeline_canvas
-        canvas.delete("all")
-        width = max(1, canvas.winfo_width())
-        height = max(1, canvas.winfo_height())
-        self._grid(canvas, width, height, step_x=48, step_y=1000)
-        rows = self.project.timeline(events)
-        y = height // 2 + 6
-        canvas.create_line(12, y, width - 12, y, fill=ui.LINE, width=2)
-        if not rows:
-            return
-        times = [row["when"].timestamp() for row in rows]
-        lo, hi = min(times), max(times)
-        span = max(1, hi - lo)
-        for row, timestamp in zip(rows, times):
-            x = 12 + (timestamp - lo) * (width - 24) / span
-            selected = row["family_id"] == self._selected_family
-            canvas.create_line(x, y - (10 if selected else 6), x, y + (10 if selected else 6),
-                               fill=ui.MAGENTA if selected else ui.CYAN, width=2 if selected else 1)
-        if self._selected_event:
-            for row, timestamp in zip(rows, times):
-                if row.get("event_id") == self._selected_event:
-                    x = 12 + (timestamp - lo) * (width - 24) / span
-                    canvas.create_polygon(x - 5, y - 16, x + 5, y - 16, x, y - 9, fill=ui.YELLOW, outline="")
-        start = (EPOCH + timedelta(seconds=lo)).strftime("%Y-%m-%d %H:%M:%S")
-        end = (EPOCH + timedelta(seconds=hi)).strftime("%Y-%m-%d %H:%M:%S")
-        canvas.create_text(12, 12, anchor="w", text=start + " UTC", fill=ui.DIM, font=(ui.MONO, 8))
-        canvas.create_text(width - 12, 12, anchor="e", text=end + " UTC", fill=ui.DIM, font=(ui.MONO, 8))
-
-    def draw_spectrum(self, events):
-        canvas = self.spectrum_canvas
-        canvas.delete("all")
-        width = max(1, canvas.winfo_width())
-        height = max(1, canvas.winfo_height())
-        self._grid(canvas, width, height, step_x=48, step_y=20)
-        rows = self.project.spectrum(events)
-        canvas.create_text(10, 10, anchor="w", text="peak RSSI by frequency", fill=ui.MUTED,
-                           font=(ui.MONO, 8))
-        if not rows:
-            return
-        points = []
-        for index, row in enumerate(rows):
-            if row["rssi_dbm"] is None:
-                continue
-            x = 10 + index * (width - 20) / max(1, len(rows) - 1)
-            y = height - 10 - max(0, min(1, (row["rssi_dbm"] + 110) / 80)) * (height - 28)
-            points.extend((x, y))
-        if len(points) >= 4:
-            canvas.create_line(*points, fill="#5a1050", width=6, smooth=True)    # glow
-            canvas.create_line(*points, fill=ui.MAGENTA, width=2, smooth=True)
-
-    # ------------------------------------------------------------------ selection
-    def _select_index(self, index: int):
-        if 0 <= index < len(self._events):
-            self.scrub.set(index)
-            self.draw(self._events)
-
-    def canvas_event(self, event):
-        """Select the waterfall row under the click (same mapping as the drawing)."""
-        index = waterfall_index_at(event.y, self._waterfall_height, len(self._waterfall_rows))
-        if index is None:
-            return
-        event_id = self._waterfall_rows[index]["event_id"]
-        for position, item in enumerate(self._events):
-            if item.event_id == event_id:
-                self._select_index(position)
-                return
-
-    def timeline_event(self, event):
-        events = self._events
-        if not events:
-            return
-        times = [parse_time(item.captured_at_utc).timestamp() for item in events]
-        lo, hi = min(times), max(times)
-        ratio = max(0.0, min(1.0, (event.x - 12) / max(1, self.timeline_canvas.winfo_width() - 24)))
-        target = lo + ratio * max(1, hi - lo)
-        self._select_index(min(range(len(times)), key=lambda i: abs(times[i] - target)))
-
-    def scrub_changed(self, _value=None):
-        if self._events:
-            self.draw(self._events)
-
-    def toggle_play(self):
-        self.playing = not self.playing
-        self.play_button.configure(text="PAUSE" if self.playing else "PLAY")
-        if self.playing:
-            self._play_step()
-
-    def _play_step(self):
-        if not self.playing or not self._alive:
-            return
-        if not self._events:
-            self.playing = False
-            self.play_button.configure(text="PLAY")
-            return
-        self.scrub.set((self.scrub.get() + 1) % len(self._events))
-        self.draw(self._events)
-        self._schedule("play", PLAY_MS, self._play_step)
-
     def show_event(self, event):
-        self._selected_event = event.event_id
-        project = self.project
-        family = project.family_key(event)
-        self._set_family_details(family)
-        hint = event.fingerprint_id or ""
-        nfc_details = ""
-        if event.source_type == "nfc":
-            nfc_details = (f"NFC {event.nfc_technology or 'unknown'} / "
-                           f"{event.nfc_protocol or 'unknown'}\n"
-                           f"Field interval {event.nfc_field_duration_ms} ms · "
-                           f"observations {event.nfc_field_count}\n")
-        segments = [(f"{event.event_id}\n", "title")]
-        segments += self._pairs([
-            ("CAPTURED", event.captured_at_utc),
-            ("FREQUENCY", f"{event.frequency_hz / 1e6:.3f} MHz · {event.modulation}"),
-            ("RSSI", f"{event.rssi_avg_dbm:.1f} dBm · {event.duration_us} us"),
-            ("FAMILY", family),
-            ("FINGERPRINT", project.fingerprint_key(event)
-             + (f"  (Flipper {hint})" if hint.startswith("local-") else "")),
-            ("PULSES", f"{len(event.pulse_timings_us)} timings"),
-            ("RAW", f"{len(project.capture_bytes(event))} bytes · {event.upload_state}"),
-            ("CLASS", f"{event.classification} ({event.classification_confidence:.0%})"),
-            ("DEVICE", f"{event.device_uuid} / {event.session_id}"),
-        ])
-        if nfc_details:
-            segments.append((nfc_details, None))
-        similar = project.similar_events(event, limit=5)
-        segments.append(("\nSIMILAR OBSERVATIONS\n", "head"))
-        if similar:
-            for row in similar:
-                comparison = row["comparison"]
-                reasons = "; ".join(comparison.get("reasons", ())) or "no stable feature match"
-                segments += [(f"{comparison.get('percent', 0):>3}%  ", "good"),
-                             (f"{row['event'].event_id[:18]}  {comparison.get('relationship_text', 'unknown')}\n", None),
-                             (f"      {reasons}\n", "muted")]
-        else:
-            segments.append(("no other observations\n", "muted"))
-        self._write(self.details, segments)
-        note = project.note(event.event_id)
+        """Fill the right column for one capture (None clears it)."""
+        self.similar.delete(0, "end")
+        self._similar_rows = []
         self.note_entry.delete(0, "end")
+        if event is None:
+            self._write(self.details, [("NOTHING SELECTED\n", "title"),
+                                       ("pick a capture in the list or a dot in the chart", "muted")])
+            self._draw_pulses()
+            return
+        project = self.project
+        kind, verdict = signal_verdict(event)
+        when = format_local(event.captured_at_unix, full=True)
+        if event.source_type == "nfc":
+            title = f"NFC FIELD  ·  {format_local(event.captured_at_unix)}\n"
+            rows = [("WHEN", when),
+                    ("FIELD", f"{format_duration_us(event.nfc_field_duration_ms * 1000)} · "
+                              f"{event.nfc_field_count} time(s)"),
+                    ("TYPE", f"{event.nfc_technology or 'unknown'} / {event.nfc_protocol or 'unknown'}")]
+        else:
+            title = f"{event.frequency_hz / 1e6:.2f} MHz  ·  {format_local(event.captured_at_unix)}\n"
+            group = self._groups.get(project.family_key(event), "")
+            seen = sum(1 for other in self._events_all() if project.family_key(other) == project.family_key(event))
+            rows = [("WHEN", when),
+                    ("STRENGTH", f"{strength_bar(event.rssi_max_dbm)}  {event.rssi_max_dbm:.0f} dBm "
+                                 f"(avg {event.rssi_avg_dbm:.0f})"),
+                    ("LENGTH", format_duration_us(event.duration_us)),
+                    ("EDGES", f"{len(event.pulse_timings_us)} recorded"),
+                    ("GROUP", "—" if kind == "noise" else f"{group} · seen {seen}×")]
+        segments = [(title, "title")]
+        segments += self._pairs(rows)
+        segments += [("\n" + VERDICT_TEXT[kind].upper() + "\n", {"signal": "good", "noise": "warn",
+                                                                  "nfc": "head"}[kind]),
+                     (verdict + "\n", None),
+                     (f"\n{event.event_id}", "muted")]
+        self._write(self.details, segments)
+        self._draw_pulses()
+        if kind != "noise":
+            pool = [other for other in self._events_all() if signal_verdict(other)[0] == kind]
+            for row in project.similar_events(event, limit=4, candidates=pool):
+                other = row["event"]
+                comparison = row["comparison"]
+                self._similar_rows.append(other.event_id)
+                self.similar.insert("end", f"{comparison.get('percent', 0):>3}%  {format_local(other.captured_at_unix)}"
+                                           f"  {comparison.get('relationship_text', '')}")
+        if not self._similar_rows:
+            self.similar.insert("end", "nothing similar" if kind != "noise" else "noise is not compared")
+        note = project.note(event.event_id)
         self.note_entry.insert(0, note.get("text", ""))
-        self.location_entry.delete(0, "end")
-        self.location_entry.insert(0, note.get("location", ""))
+
+    def _events_all(self):
+        return self.project.events.values()
 
     # ------------------------------------------------------------------ actions
     def save_note(self):
         if self._selected_event:
-            self.project.add_note(self._selected_event, self.note_entry.get(), self.location_entry.get())
-
-    def export_follow(self):
-        if not self._selected_family:
-            self.messagebox.showinfo("Export Follow profile", "Select a signal family first.", parent=self.window)
-            return
-        path = self.filedialog.asksaveasfilename(parent=self.window, defaultextension=".follow.json")
-        if not path:
-            return
-        try:
-            self.project.export_follow(self._selected_family, path)
-        except Exception as exc:
-            self._report_error("Cannot export Follow profile", exc)
-
+            self.project.add_note(self._selected_event, self.note_entry.get(), "")
 
 
 # =========================================================================== standalone / CLI
