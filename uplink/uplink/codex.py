@@ -13,12 +13,14 @@ import os
 import time
 
 from .common import (Session, JsonlTail, AttentionCounter, parse_ts, recent_files, utf8_text,
-                     strip_md, short_key, revision_token, join_text, WORKING, APPROVAL,
-                     YOUR_TURN, IDLE, ORDER)
+                     strip_md, short_key, revision_token, join_text, report_text, WORKING,
+                     APPROVAL, YOUR_TURN, IDLE, ORDER, NAME_BYTES, DETAIL_BYTES)
 
 ACTIVE_WINDOW = 3 * 3600    # rollout files touched within this window are watched
 YOUR_TURN_FOR = 20 * 60     # a finished turn counts as "your turn" this long
 STALL_AFTER = 20 * 60       # an open turn silent this long is treated as idle (process gone)
+HISTORY_WORKING_FOR = 2 * 60  # history-only chats: "working" this long after a prompt
+ROLLOUT_RETRY = 60          # seconds between searches for a history session's rollout file
 DAYS_BACK = 3
 
 
@@ -35,14 +37,9 @@ def _first_line(text):
     return out
 
 
-def _report(text, limit=220):
-    """Keep the useful body of the latest agent report for the detail view."""
-    parts = []
-    for line in (text or "").splitlines():
-        line = line.strip(" #*-")
-        if line:
-            parts.append(line)
-    return " ".join(parts)[:limit]
+def _detail(text):
+    """One field for the Flipper's detail view: flattened report capped to its 255-byte buffer."""
+    return utf8_text(report_text(strip_md(text)), DETAIL_BYTES)
 
 
 class Thread:
@@ -62,7 +59,9 @@ class Thread:
         self.question = ""
         self.approval = ""
         self.activity = ""
-        self.final = ""
+        self.final = ""             # every assistant message of the finished turn (body)
+        self.final_message = ""     # its last message: the report shown as detail
+        self.last_message = ""      # latest assistant message of the current turn
         self.response_parts = []
 
     @property
@@ -102,16 +101,22 @@ class Thread:
             self.turn_id = str(p.get("turn_id") or p.get("root_turn_id") or self.turn_serial)
             self.question = ""
             self.final = ""
+            self.final_message = ""
+            self.last_message = ""
             self.response_parts = []
         elif t == "task_complete":
             self.turn_open = False
             self.turn_end = ts or self.last_ts
-            self.final = join_text(self.response_parts + [p.get("last_agent_message") or ""])
+            last = (p.get("last_agent_message") or "").strip()
+            self.final = join_text(self.response_parts + [last])
+            # interim messages ("Converter missing, building the PDF another way...") stay in
+            # the body; the detail line is the final answer
+            self.final_message = last or self.last_message or self.final
             self.approval = ""
         elif t == "turn_aborted":
             self.turn_open = False
             self.turn_end = ts or self.last_ts
-            self.final = "turn aborted"
+            self.final = self.final_message = "turn aborted"
             self.approval = ""
         elif "approval_request" in t:
             cmd = p.get("command") or p.get("reason") or "approval"
@@ -156,6 +161,9 @@ class Thread:
             elif p.get("text"):
                 parts.append(p["text"])
             self.response_parts.extend(parts)
+            message = join_text(parts)
+            if message:
+                self.last_message = message
         elif t == "reasoning":
             summary = p.get("summary") or []
             if summary and isinstance(summary[-1], dict):
@@ -182,10 +190,12 @@ class Thread:
 class HistoryWatcher:
     """Recent Codex app/API conversations from CODEX_HOME/history.jsonl.
 
-    These conversations do not always have a rollout file, but the history journal still
-    gives us a stable session id, the first user message as a name, and the latest prompt
-    as useful activity. They are treated as working until they have been quiet for the
-    normal stall window, then omitted with other idle sessions.
+    The journal records only what the user sent: one {session_id, ts, text} line per prompt.
+    It has no reply and no completion marker, so CodexWatcher first looks for the session's
+    rollout file (which has task_started/task_complete); only conversations without one are
+    shown from the journal alone, with a guessed state: WORKING for HISTORY_WORKING_FOR after
+    the latest prompt, then YOUR_TURN (most likely answered by now) until YOUR_TURN_FOR has
+    passed, then IDLE (hidden).
     """
 
     def __init__(self, home):
@@ -194,22 +204,37 @@ class HistoryWatcher:
         self.sessions = {}
         self.attn = AttentionCounter()
 
-    def poll(self, now, known_ids):
-        if self.tail.changed():
-            for obj in self.tail.read():
-                sid = str(obj.get("session_id") or "")
-                text = str(obj.get("text") or "").strip()
-                if not sid or not text:
-                    continue
-                try:
-                    ts = float(obj.get("ts") or 0)
-                except (TypeError, ValueError):
-                    ts = 0.0
-                item = self.sessions.setdefault(sid, {"first": text, "last": text, "ts": ts})
-                item["first"] = item.get("first") or text
-                if ts >= item.get("ts", 0):
-                    item["last"], item["ts"] = text, ts
+    def read(self):
+        if not self.tail.changed():
+            return
+        for obj in self.tail.read():
+            sid = str(obj.get("session_id") or "")
+            text = str(obj.get("text") or "").strip()
+            if not sid or not text:
+                continue
+            try:
+                ts = float(obj.get("ts") or 0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            item = self.sessions.setdefault(sid, {"first": text, "last": text, "ts": ts})
+            item["first"] = item.get("first") or text
+            if ts >= item.get("ts", 0):
+                item["last"], item["ts"] = text, ts
 
+    def recent(self, now):
+        """Session ids with a prompt inside the active window."""
+        return [sid for sid, item in self.sessions.items()
+                if item.get("ts") and now - float(item["ts"]) <= ACTIVE_WINDOW]
+
+    @staticmethod
+    def state(age):
+        if age < HISTORY_WORKING_FOR:
+            return WORKING
+        if age < YOUR_TURN_FOR:
+            return YOUR_TURN
+        return IDLE
+
+    def rows(self, now, known_ids):
         rows = []
         for sid, item in self.sessions.items():
             if sid in known_ids:
@@ -217,14 +242,14 @@ class HistoryWatcher:
             ts = float(item.get("ts") or 0)
             if not ts or now - ts > ACTIVE_WINDOW:
                 continue
-            state = WORKING if now - ts < STALL_AFTER else IDLE
+            state = self.state(now - ts)
             key = short_key(sid)
             body = "chat: " + item["last"]
             row = Session(
                 key=key,
-                name=utf8_text(_first_line(item["first"]) or "Codex chat", 24),
+                name=utf8_text(_first_line(item["first"]) or "Codex chat", NAME_BYTES),
                 state=state,
-                detail=utf8_text(body, 220),
+                detail=utf8_text(body, DETAIL_BYTES),
                 last_ts=ts,
                 body=body,
                 revision=revision_token(sid, body),
@@ -234,6 +259,11 @@ class HistoryWatcher:
             if state != IDLE:
                 rows.append(row)
         return rows
+
+    def poll(self, now, known_ids):
+        self.read()
+        return self.rows(now, known_ids)
+
 
 class CodexWatcher:
     def __init__(self, home=None):
@@ -245,6 +275,8 @@ class CodexWatcher:
         self.names_mtime = 0.0
         self.attn = AttentionCounter()
         self.files = []
+        self.extra_files = set()    # rollouts of history sessions outside the scanned days
+        self.rollout_search = {}    # session id -> (path or None, time of the search)
         self.last_scan = 0.0
 
     def _scan(self, now):
@@ -253,11 +285,36 @@ class CodexWatcher:
         for back in range(DAYS_BACK):
             day = time.strftime("%Y/%m/%d", time.localtime(now - back * 86400))
             files += glob.glob(os.path.join(root, *day.split("/"), "*.jsonl"))
-        self.files = recent_files(files, ACTIVE_WINDOW, now)
+        self.files = recent_files(sorted(set(files) | self.extra_files), ACTIVE_WINDOW, now)
+        self.extra_files &= set(self.files)
         self.last_scan = now
         for p in list(self.threads):
             if p not in self.files:
                 del self.threads[p]
+
+    def _find_rollout(self, sid, now):
+        """The rollout file of a session, wherever its start day is (cached)."""
+        path, at = self.rollout_search.get(sid, (None, 0.0))
+        if path or now - at < ROLLOUT_RETRY:
+            return path
+        pattern = os.path.join(self.home, "sessions", "*", "*", "*",
+                               "rollout-*%s.jsonl" % glob.escape(sid))
+        found = sorted(glob.glob(pattern))
+        path = found[-1] if found else None
+        self.rollout_search[sid] = (path, now)
+        return path
+
+    def _adopt_history_rollouts(self, now):
+        """A chat continued days after it began still writes to the rollout file of its first
+        day, which _scan does not look at; follow it so its real state is shown."""
+        known = {t.id for t in self.threads.values() if t.id}
+        for sid in self.history.recent(now):
+            if sid in known:
+                continue
+            path = self._find_rollout(sid, now)
+            if path and path not in self.files and recent_files([path], ACTIVE_WINDOW, now):
+                self.files.append(path)
+                self.extra_files.add(path)
 
     def _load_names(self):
         path = os.path.join(self.home, "session_index.jsonl")
@@ -282,6 +339,8 @@ class CodexWatcher:
         if now - self.last_scan > 15:
             self._scan(now)
         self._load_names()
+        self.history.read()
+        self._adopt_history_rollouts(now)
         for p in self.files:
             th = self.threads.get(p)
             if th is None:
@@ -296,7 +355,7 @@ class CodexWatcher:
             if t.is_sub and t.parent in by_id:
                 kids.setdefault(t.parent, []).append(t)
 
-        rows = []
+        groups = []                 # (root row, its sub-agent rows)
         for t in threads:
             if t.is_sub and t.parent in by_id:
                 continue
@@ -310,12 +369,12 @@ class CodexWatcher:
             name = self.names.get(t.session) or self.names.get(t.id) or os.path.basename(t.cwd)
             if t.is_sub:
                 name = (t.agent_path.rsplit("/", 1)[-1] or "agent") + " (sub)"
-            s = Session(key=short_key(t.id), name=utf8_text(name, 24), state=st,
+            s = Session(key=short_key(t.id), name=utf8_text(name, NAME_BYTES), state=st,
                         last_ts=max([t.last_ts] + [k.last_ts for k in children]))
             s.total = len(children)
             s.done = len(children) - len(busy)
-            body = self._body(t, st, busy)
-            s.detail = utf8_text(body, 220)
+            body, detail = self._texts(t, st, busy)
+            s.detail = _detail(detail)
             s.body = body
             s.revision = revision_token(t.turn_id or t.id, body)
             s.full_name = name
@@ -326,40 +385,44 @@ class CodexWatcher:
                 continue
             subs = []
             for k in busy:
-                ks = Session(key=short_key(k.id),
-                             name=utf8_text("- " + (k.agent_path.rsplit("/", 1)[-1] or "agent")
-                                            + (" " + k.nickname if k.nickname else ""), 24),
-                             state=k.state(now), last_ts=k.last_ts,
-                             detail=utf8_text(k.activity, 220))
+                label = "- " + (k.agent_path.rsplit("/", 1)[-1] or "agent") + (
+                    " " + k.nickname if k.nickname else "")
+                ks = Session(key=short_key(k.id), name=utf8_text(label, NAME_BYTES),
+                             state=k.state(now), last_ts=k.last_ts, detail=_detail(k.activity))
                 ks.body = k.activity
                 ks.revision = revision_token(k.turn_id or k.id, k.activity)
-                ks.full_name = "- " + (k.agent_path.rsplit("/", 1)[-1] or "agent") + (
-                    " " + k.nickname if k.nickname else "")
+                ks.full_name = label
                 ks.attn = self.attn.update(ks.key, ks.state)
                 subs.append(ks)
-            rows.append((s, subs))
+            groups.append((s, subs))
 
-        rows.sort(key=lambda r: (ORDER.get(r[0].state, 9), -r[0].last_ts))
+        known_ids = {t.id for t in threads}
+        groups.extend((row, []) for row in self.history.rows(now, known_ids))
+        # sort whole groups, so sub-agents stay right under their root
+        groups.sort(key=lambda g: (ORDER.get(g[0].state, 9), -g[0].last_ts))
         out = []
-        for s, subs in rows:
+        for s, subs in groups:
             out.append(s)
             out.extend(sorted(subs, key=lambda k: -k.last_ts))
-        known_ids = {t.id for t in threads}
-        out.extend(self.history.poll(now, known_ids))
-        out.sort(key=lambda s: (ORDER.get(s.state, 9), -s.last_ts))
         return out
 
     @staticmethod
-    def _body(t, st, busy):
+    def _texts(t, st, busy):
+        """(body, detail): the full report for detail views and the line for the list."""
         if t.question:
-            return "Q: " + t.question
-        if t.approval:
-            return "approve: " + t.approval
-        if st == WORKING:
+            text = "Q: " + t.question
+        elif t.approval:
+            text = "approve: " + t.approval
+        elif st == WORKING:
             if t.turn_open and t.activity:
-                return t.activity
-            if busy:
-                return "agents: " + ", ".join(
+                text = t.activity
+            elif busy:
+                text = "agents: " + ", ".join(
                     (k.nickname or k.agent_path.rsplit("/", 1)[-1]) for k in busy)
-            return t.activity or "working"
-        return t.final or t.activity
+            else:
+                text = t.activity or "working"
+        else:
+            return (t.final or t.activity), (t.final_message or t.final or t.activity)
+        return text, text
+
+

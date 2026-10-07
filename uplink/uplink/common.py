@@ -195,9 +195,59 @@ _PUNCT = {
 }
 
 
-def utf8_text(text, limit):
+# Buffer sizes in the Flipper app (uplink.c) minus the terminating NUL. The Flipper copies
+# fields byte-wise, so every limit below is in UTF-8 bytes, not characters.
+NAME_BYTES = 63      # Item.name[64]
+DETAIL_BYTES = 255   # Item.detail[256]
+LINE_BYTES = 127     # one console line, CMD_COLW 128
+CWD_BYTES = 47       # Cmd.cwd[48]
+
+
+def utf8_cut(text, limit):
+    """Longest prefix of `text` that fits in `limit` UTF-8 bytes; never splits a character."""
+    text = text or ""
+    if limit is None:
+        return text
+    data = text.encode("utf-8")
+    if len(data) <= limit:
+        return text
+    return data[:max(0, limit)].decode("utf-8", "ignore")
+
+
+def utf8_tail(text, limit, marker="..."):
+    """`text` capped to `limit` UTF-8 bytes keeping its end (for paths), marked with `marker`."""
+    text = text or ""
+    data = text.encode("utf-8")
+    if len(data) <= limit:
+        return text
+    budget = max(0, limit - len(marker.encode("utf-8")))
+    # a cut in the middle of a character leaves stray continuation bytes; "ignore" drops them
+    return marker + (data[len(data) - budget:].decode("utf-8", "ignore") if budget else "")
+
+
+def utf8_chunks(text, limit):
+    """Split `text` into pieces of at most `limit` UTF-8 bytes (whole characters), preferring to
+    break at a space. Always returns at least one (possibly empty) piece."""
+    out = []
+    rest = text or ""
+    while len(rest.encode("utf-8")) > limit:
+        head = utf8_cut(rest, limit)
+        if not head:                     # limit smaller than one character: emit it anyway
+            head = rest[0]
+        space = head.rfind(" ")
+        if space > len(head) // 2:       # a word break that does not waste most of the line
+            head = head[:space]
+        out.append(head.rstrip())
+        rest = rest[len(head):].lstrip()
+    if rest or not out:
+        out.append(rest)
+    return out
+
+
+def utf8_text(text, limit=None):
     """Text for the Flipper's UTF-8 font (Latin + Cyrillic): keep ASCII and Cyrillic, map common
-    typography to ASCII, drop anything the font can't draw, squeeze spaces, cap by characters."""
+    typography to ASCII, drop anything the font can't draw, squeeze spaces, cap at `limit`
+    UTF-8 bytes (None = no cap) without splitting a character."""
     out = []
     for ch in text or "":
         if ch in _PUNCT:
@@ -208,8 +258,20 @@ def utf8_text(text, limit):
             out.append("/")          # protocol separator
         elif 32 <= ord(ch) < 127 or "Ѐ" <= ch <= "ӿ":
             out.append(ch)
-    return " ".join("".join(out).split())[:limit]
+    text = " ".join("".join(out).split())
+    return utf8_cut(text, limit).rstrip() if limit is not None else text
 
 
 def strip_md(text):
     return (text or "").replace("**", "").replace("`", "").strip()
+
+
+def report_text(text):
+    """A report flattened for the one-field detail view: non-empty lines joined by spaces, with
+    markdown bullets/headings stripped. Callers cap it with utf8_text(..., DETAIL_BYTES)."""
+    parts = []
+    for line in (text or "").splitlines():
+        line = line.strip(" #*-")
+        if line:
+            parts.append(line)
+    return " ".join(parts)

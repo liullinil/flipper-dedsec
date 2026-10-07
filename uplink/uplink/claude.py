@@ -14,8 +14,8 @@ import os
 import time
 
 from .common import (Session, JsonlTail, AttentionCounter, parse_ts, recent_files, utf8_text,
-                     strip_md, short_key, revision_token, join_text, WORKING, APPROVAL,
-                     YOUR_TURN, IDLE, ORDER)
+                     strip_md, short_key, revision_token, join_text, report_text, WORKING,
+                     APPROVAL, YOUR_TURN, IDLE, ORDER, NAME_BYTES, DETAIL_BYTES)
 
 HOOK_EVENTS = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "DedSecUplink", "claude_events.jsonl")
@@ -62,16 +62,6 @@ def _first_line(text):
     return out
 
 
-def _report(text, limit=220):
-    """Keep the useful body of the latest agent report for the detail view."""
-    parts = []
-    for line in (text or "").splitlines():
-        line = line.strip(" #*-")
-        if line:
-            parts.append(line)
-    return " ".join(parts)[:limit]
-
-
 def describe_tool(name, inp):
     inp = inp if isinstance(inp, dict) else {}
     if name == "Bash" or name == "PowerShell":
@@ -107,8 +97,11 @@ class ClaudeSession:
         self.pending = {}       # tool_use id -> (name, input, ts)
         self.activity = ""
         self.last_text = ""
-        self.text_parts = []
-        self.final_text = ""
+        self.text_parts = []        # every text block of the current turn
+        self.final_text = ""        # ... joined, for the finished turn (body)
+        self.last_message = ""      # latest assistant message of the current turn
+        self.final_message = ""     # last message of the finished turn (detail)
+        self._message_id = None
         self.todo = (0, 0, "")
 
     def feed(self, entries):
@@ -141,6 +134,9 @@ class ClaudeSession:
         self.turn_end = ts or self.last_ts
         self.pending.clear()
         self.final_text = join_text(self.text_parts) or self.final_text
+        # interim messages ("Converter missing, building the PDF another way...") stay in
+        # the body; the detail line is the last thing Claude said
+        self.final_message = self.last_message or self.final_message
         self.last_text = self.final_text
 
     def _user(self, o, ts):
@@ -164,6 +160,8 @@ class ClaudeSession:
         self.turn_open = True
         self.pending.clear()
         self.text_parts = []
+        self.last_message = ""
+        self._message_id = None
         self.activity = ""
         if text and not text.lstrip().startswith("<"):
             self.last_prompt = text
@@ -194,6 +192,14 @@ class ClaudeSession:
             elif b.get("type") == "text" and b.get("text", "").strip():
                 self.text_parts.append(b["text"])
                 self.last_text = join_text(self.text_parts)
+                # transcripts store one line per content block; blocks of one message share
+                # its id and belong together
+                message_id = msg.get("id") if isinstance(msg, dict) else None
+                if message_id and message_id == self._message_id:
+                    self.last_message = join_text([self.last_message, b["text"]])
+                else:
+                    self.last_message = b["text"].strip()
+                self._message_id = message_id
         if msg.get("stop_reason") == "end_turn":
             self._end(ts)
 
@@ -232,11 +238,15 @@ class ClaudeSession:
         return os.path.basename(self.cwd) or self.project
 
     def detail(self, st, now):
+        """The one-line state for the list: the question, the current step or the last
+        message (not the whole turn, which starts with interim notes)."""
         if st == APPROVAL:
             return self.asking() or self.permission_wait(now)
         if st == WORKING:
             return self.todo[2] or self.activity or "thinking"
-        return _report(strip_md(self.final_text or self.last_text)) or self.activity
+        message = self.final_message if not self.turn_open else self.last_message
+        return report_text(strip_md(message or self.final_text or self.last_text)) \
+            or self.activity
 
     def body(self, st):
         if st == APPROVAL:
@@ -263,7 +273,7 @@ class ClaudeWatcher:
         event, ts, message = ev
         moved_on = cs.last_ts > ts + 3   # Claude did things after the hook fired -> hook is stale
         if event == "Stop" and not moved_on and now - ts < YOUR_TURN_FOR:
-            return YOUR_TURN, cs.body(YOUR_TURN) or detail
+            return YOUR_TURN, cs.detail(YOUR_TURN, now) or detail
         if event == "Notification" and not moved_on:
             return APPROVAL, strip_md(message) or "needs your attention"
         if event == "UserPromptSubmit" and not moved_on:
@@ -297,9 +307,10 @@ class ClaudeWatcher:
             st, detail = self._hook_state(cs, st, detail, now)
             full_name = cs.name()
             body = detail if st == APPROVAL and detail else cs.body(st)
-            s = Session(key=short_key(cs.id), name=utf8_text(full_name, 24), state=st,
-                        detail=utf8_text(body, 220), last_ts=cs.last_ts,
-                        body=body, revision=revision_token(cs.turn_id or cs.id, body),
+            s = Session(key=short_key(cs.id), name=utf8_text(full_name, NAME_BYTES), state=st,
+                        detail=utf8_text(report_text(detail or body), DETAIL_BYTES),
+                        last_ts=cs.last_ts, body=body,
+                        revision=revision_token(cs.turn_id or cs.id, body),
                         full_name=full_name)
             s.done, s.total = cs.todo[0], cs.todo[1]
             if st not in (WORKING, APPROVAL) and s.done == s.total:
