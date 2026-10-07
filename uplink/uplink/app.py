@@ -109,7 +109,8 @@ class Feed:
             offset = -(time.altzone if time.localtime(now).tm_isdst > 0 else time.timezone) // 60
             lines.append(f"Z|{int(now)}|{offset}")
             self.next_clock = now + CLOCK_EVERY
-        if self.blackout is not None:
+        if self.blackout is not None and self.updater.flipper_supports(1, 5, 0):
+            # apps before 1.5.0 read any line starting with B as "the host is going away"
             lines.append(self.blackout.frame_line())
         if self.shell:
             self.shell.poll_timeout()

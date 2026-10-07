@@ -102,6 +102,10 @@ class Updater:
                 except Exception:
                     log.debug("update menu refresh failed", exc_info=True)
 
+    def flipper_supports(self, *version):
+        """True once the Flipper reported an app version at least `version` (lines it understands)."""
+        return bool(self.flipper_version) and parse_version(self.flipper_version) >= tuple(version)
+
     def set_flipper_version(self, version):
         if version != self.flipper_version:
             log.info("flipper app version %s", version)
