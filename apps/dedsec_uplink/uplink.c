@@ -10,11 +10,15 @@
  *     X|seq|code                               command finished with exit code
  *     W|cwd                                    shell working directory
  *     B                                        host is going away
+ *     Z|utc_unix|tz_minutes                    PC clock (RF timestamps)
+ *     RL|cursor  RR|id|offset  RA|id|size|crc  RF journal import (see rf_engine.h)
  *   Flipper -> PC (TX notify char):
  *     C|seq|command                            run this command
  *     K|seq                                    cancel the running command
  *     T|seq|text                               send text to a running command's stdin
+ *     R|pending|stored|free_kb|state|errors    RF journal status; RI/RE/RD/RK/RX answer RL/RR/RA
  * state: W working, A needs approval, I your turn, S idle, E error.
+ * OTA (N/UB/UD/UE, V/U/UA) is described in uplink_ota.h.
  */
 #include <furi.h>
 #include <furi_hal_bt.h>
@@ -32,9 +36,12 @@
 #include "uplink_ble.h"
 #include "uplink_settings.h"
 #include "dedsec_uplink_icons.h"
-#include "uplink_cyr_font.h"
+#include "uplink_fonts.h"
 #include "uplink_ota.h"
+#include "rf_engine.h"
 #include <loader/loader.h>
+#include <furi_hal_rtc.h>
+#include <datetime/datetime.h>
 
 #define TAG          "Uplink"
 #define MAX_ITEMS    10
@@ -45,11 +52,14 @@
 #define LINK_TICKS   (8 * 4)
 #define ALERT_TICKS  (5 * 4)
 #define CMD_LINES    40
-#define CMD_COLW     64
+#define CMD_COLW     128
 #define CMD_INPUT    200
 
 enum { ViewMain = 0, ViewKeyboard, ViewSettings };
-enum { EvRx = 1, EvTick };
+enum { EvRx = 1, EvTick, EvRf, EvRfTx };
+
+#define RF_STATUS_TICKS (10 * 4) // R| status line to the PC every 10 s
+#define RF_TX_BUF       2048
 
 typedef enum { KindCodex, KindClaude, KindCount } Kind;
 
@@ -120,7 +130,7 @@ typedef struct {
     UplinkSettings settings;
 
     // model (guarded by mutex)
-    ScreenId tabs[4];
+    ScreenId tabs[TAB_SLOTS];
     uint8_t tab_count;
     uint8_t tab_index;
     bool detail;
@@ -146,6 +156,21 @@ typedef struct {
     uint32_t restart_at;    // relaunch the freshly installed .fap at this tick
     uint32_t ota_req_tick;
 
+    // RF Hunter (the engine has its own thread; these are app-thread copies)
+    RfEngine* rf;
+    RfStatus rf_status; // snapshot for drawing, refreshed on EvRf and every tick
+    FuriStreamBuffer* rf_tx; // reply lines from the engine thread, sent by the app thread
+    char rf_line[256];
+    uint16_t rf_line_len;
+    uint32_t rf_status_tick; // last R| line sent to the PC
+    uint32_t rf_status_pending; // pending count in that line
+    // At most one EvRf and one EvRfTx wait in the dispatcher queue: posting blocks when the
+    // queue is full, and after view_dispatcher_run returns nobody drains it any more.
+    volatile bool rf_event_posted;
+    volatile bool rf_tx_posted;
+    volatile bool rf_closing; // set when the dispatcher has stopped (also stops EvRx posts)
+    volatile bool rx_posted;
+
     char line[LINE_MAX];
     uint16_t line_len;
 } App;
@@ -157,6 +182,9 @@ typedef struct {
 static void uplink_send(App* app, const char* line);
 static void send_version(App* app);
 static void ota_request(App* app);
+static void rf_request(App* app, const char* line);
+static void rf_clock(App* app, uint32_t utc);
+static void rf_send_status(App* app);
 static void build_settings(App* app);
 
 /* ------------------------------------------------------------------ theme */
@@ -306,27 +334,74 @@ static void clean_copy(char* dst, size_t size, const char* src) {
     utf8_trim(dst);
 }
 
+/* ---- text fonts: every size carries Latin + Cyrillic (u8g2 fonts embedded in the .fap).
+ * Names, details and console output use them; fixed English labels use FontSecondary. */
+typedef struct {
+    const uint8_t* font;
+    uint8_t row; // list row height
+    uint8_t line; // line step for wrapped text and the console
+} TextFont;
+
+static const TextFont text_fonts[] = {
+    [FontNormal] = {u8g2_font_uplink_6x12, 10, 9},
+    [FontLarge] = {u8g2_font_uplink_7x13, 13, 11},
+    [FontSmall] = {u8g2_font_uplink_5x7, 8, 8},
+    [FontMicro] = {u8g2_font_uplink_4x6, 7, 7},
+};
+
+static const TextFont* text_font(const App* app) {
+    uint8_t f = app->settings.font;
+    return &text_fonts[f < COUNT_OF(text_fonts) ? f : FontNormal];
+}
+
 static void font_text(Canvas* c, const App* app) {
-    /* Keep all four persisted choices meaningful. The bundled 6x12 font is
-     * used for Normal/Large so Cyrillic session names remain readable; the
-     * two SDK fonts provide genuinely denser Small and Micro modes. The list
-     * layout changes with every choice, so Large still shows fewer, taller
-     * rows while Normal keeps the same Cyrillic glyph set. */
-    switch(app->settings.font) {
-    case FontLarge:
-        canvas_set_custom_u8g2_font(c, u8g2_font_uplink_cyr);
-        break;
-    case FontSmall:
-        canvas_set_font(c, FontSecondary);
-        break;
-    case FontMicro:
-        canvas_set_font(c, FontKeyboard);
-        break;
-    case FontNormal:
-    default:
-        canvas_set_custom_u8g2_font(c, u8g2_font_uplink_cyr);
-        break;
+    canvas_set_custom_u8g2_font(c, text_font(app)->font);
+}
+
+/* small print for secondary info; FontSecondary has no Cyrillic, so Cyrillic text uses 4x6 */
+static void font_info(Canvas* c) {
+    canvas_set_custom_u8g2_font(c, u8g2_font_uplink_4x6);
+}
+
+/* one UTF-8 character at p: its code point and its length in bytes (always >= 1) */
+static size_t utf8_decode(const char* p, uint16_t* cp) {
+    const unsigned char* s = (const unsigned char*)p;
+    size_t n = 1;
+    while(n < utf8_len_at(p) && (s[n] & 0xC0) == 0x80)
+        n++;
+    if(n == 1) {
+        *cp = s[0] < 0x80 ? s[0] : '?';
+    } else if(n == 2) {
+        *cp = ((s[0] & 0x1F) << 6) | (s[1] & 0x3F);
+    } else if(n == 3) {
+        *cp = ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+    } else {
+        *cp = '?';
     }
+    return n;
+}
+
+/* How many bytes of p fit into w pixels with the current font. Prefers to break after a
+ * space so words stay whole; *next is where the following line starts. Measures glyph by
+ * glyph (one pass), so it is cheap enough to run on every frame. */
+static size_t wrap_fit(Canvas* c, const char* p, int w, const char** next) {
+    int width = 0;
+    size_t n = 0, last_space = 0;
+    while(p[n]) {
+        uint16_t cp;
+        size_t cl = utf8_decode(p + n, &cp);
+        int gw = canvas_glyph_width(c, cp);
+        if(n > 0 && width + gw > w) break;
+        width += gw;
+        n += cl;
+        if(cp == ' ') last_space = n;
+    }
+    if(p[n] && p[n] != ' ' && last_space > 0) n = last_space;
+    const char* q = p + n;
+    while(*q == ' ')
+        q++;
+    *next = q;
+    return n;
 }
 
 static void draw_str_fit(Canvas* c, int x, int y, const char* s, int max_w) {
@@ -348,7 +423,9 @@ static void draw_str_fit(Canvas* c, int x, int y, const char* s, int max_w) {
     canvas_draw_str_aligned(c, x, y, AlignLeft, AlignTop, buf);
 }
 
-static int draw_wrapped_scroll(
+/* Word-wraps text into w pixels and draws lines [skip, skip + lines) from y down.
+ * Returns the total number of lines, so a caller can pass lines = 0 to just count. */
+static int draw_wrapped(
     Canvas* c,
     int x,
     int y,
@@ -359,32 +436,21 @@ static int draw_wrapped_scroll(
     int skip) {
     char buf[128];
     const char* p = text;
-    int total = 0;
-    int drawn = 0;
+    while(*p == ' ')
+        p++;
+    int total = 0, drawn = 0;
     while(*p) {
-        while(*p == ' ')
-            p++;
-        if(!*p) break;
-        size_t best = 0, n = 0;
-        while(p[n]) {
-            size_t cl = utf8_len_at(p + n);
-            if(n + cl >= sizeof(buf)) break;
-            memcpy(buf, p, n + cl);
-            buf[n + cl] = 0;
-            if(canvas_string_width(c, buf) > w) break;
-            n += cl;
-            if(p[n] == ' ' || p[n] == 0) best = n;
-        }
-        if(n == 0) n = utf8_len_at(p); // a single glyph wider than the line: show it anyway
-        if(best == 0 || (total >= skip && drawn == lines - 1 && p[best])) best = n;
+        const char* next;
+        size_t n = wrap_fit(c, p, w, &next);
         if(total >= skip && drawn < lines) {
-            memcpy(buf, p, best);
-            buf[best] = 0;
+            if(n >= sizeof(buf)) n = sizeof(buf) - 1;
+            memcpy(buf, p, n);
+            buf[n] = 0;
             canvas_draw_str_aligned(c, x, y + drawn * step, AlignLeft, AlignTop, buf);
             drawn++;
         }
-        p += best;
         total++;
+        p = next;
     }
     return total;
 }
@@ -470,10 +536,10 @@ static uint8_t visible_ordinal(const App* app, Kind kind, uint8_t raw) {
 
 static void rebuild_tabs(App* app) {
     uint8_t n = 0;
-    bool used[ScreenKindCount + 1] = {false};
-    for(int i = 0; i < 4; i++) {
+    bool used[ScreenIdCount] = {false};
+    for(int i = 0; i < TAB_SLOTS; i++) {
         ScreenId s = app->settings.tabs[i];
-        if(s >= ScreenOff || used[s]) continue;
+        if(s >= ScreenIdCount || s == ScreenOff || used[s]) continue;
         used[s] = true;
         app->tabs[n++] = s;
     }
@@ -559,6 +625,10 @@ static Kind kind_of(const char* s) {
 }
 
 static void parse_line(App* app, char* line) {
+    if(line[0] == 'R' && line[1] && line[2] == '|') {
+        rf_request(app, line); // RL / RR / RA: the RF engine answers on its own thread
+        return;
+    }
     char* f[12];
     int n = split(line, f, 12);
     switch(f[0][0]) {
@@ -686,6 +756,9 @@ static void parse_line(App* app, char* line) {
     case 'B':
         app->host_closed = true;
         break;
+    case 'Z':
+        if(n >= 2) rf_clock(app, strtoul(f[1], NULL, 10));
+        break;
     default:
         break;
     }
@@ -702,6 +775,7 @@ static void drain_rx(App* app) {
             app->host_closed = false;
             uplink_notify(app, NotifyLink);
             send_version(app);
+            rf_send_status(app);
         }
         for(size_t i = 0; i < got; i++) {
             char ch = buf[i];
@@ -754,10 +828,126 @@ static void ota_request(App* app) {
     uplink_send(app, line);
 }
 
+/* ------------------------------------------------------------------ RF Hunter glue
+ * The engine (rf_engine.c) runs its own thread. Its reply lines come back through a stream
+ * buffer and are sent from this thread; its status is copied into app->rf_status. */
+static void rf_reply_callback(const char* line, void* context) {
+    App* app = context;
+    size_t n = strlen(line);
+    // a reply that does not fit is dropped: the PC asks again after its timeout
+    if(app->rf_closing || furi_stream_buffer_spaces_available(app->rf_tx) < n + 1) return;
+    furi_stream_buffer_send(app->rf_tx, line, n, 0);
+    furi_stream_buffer_send(app->rf_tx, "\n", 1, 0);
+    if(!app->rf_tx_posted) {
+        app->rf_tx_posted = true;
+        view_dispatcher_send_custom_event(app->views, EvRfTx);
+    }
+}
+
+static void rf_changed_callback(void* context) {
+    App* app = context;
+    if(app->rf_closing || app->rf_event_posted) return;
+    app->rf_event_posted = true;
+    view_dispatcher_send_custom_event(app->views, EvRf);
+}
+
+static void rf_apply_config(App* app) {
+    if(!app->rf) return;
+    const UplinkSettings* s = &app->settings;
+    RfConfig cfg = {
+        .band = s->rf_band,
+        .rssi_threshold_dbm = s->rf_rssi,
+        .dwell_ms = s->rf_dwell_ms,
+        .capture_ms = s->rf_capture_ms,
+        .silence_us = 8000,
+        .feedback = s->rf_feedback,
+        .keep_uploaded = s->rf_keep,
+        .tz_offset_minutes = s->rf_tz,
+    };
+    rf_engine_configure(app->rf, &cfg);
+}
+
+/* the engine exists while the RF tab is enabled, so the PC can import records at any time */
+static void rf_lifecycle(App* app) {
+    bool wanted = false;
+    for(uint8_t i = 0; i < app->tab_count; i++)
+        if(app->tabs[i] == ScreenRf) wanted = true;
+    if(wanted && !app->rf) {
+        app->rf = rf_engine_alloc(rf_reply_callback, rf_changed_callback, app);
+        rf_apply_config(app);
+        if(app->settings.rf_autostart) rf_engine_start(app->rf);
+    } else if(!wanted && app->rf) {
+        rf_engine_free(app->rf);
+        app->rf = NULL;
+        memset(&app->rf_status, 0, sizeof(app->rf_status));
+    }
+}
+
+static void rf_send_status(App* app) {
+    if(!app->rf || !app->link) return;
+    char line[64];
+    rf_engine_status_line(app->rf, line, sizeof(line));
+    uplink_send(app, line);
+    app->rf_status_tick = app->tick;
+    app->rf_status_pending = app->rf_status.pending;
+}
+
+static void rf_refresh_status(App* app) {
+    if(!app->rf) return;
+    rf_engine_get_status(app->rf, &app->rf_status);
+    if(app->rf_status.unseen && app->tabs[app->tab_index] == ScreenRf && !app->alert)
+        rf_engine_mark_seen(app->rf); // the user is looking at the RF tab
+    if(app->link && (app->rf_status.pending != app->rf_status_pending ||
+                     app->tick - app->rf_status_tick > RF_STATUS_TICKS))
+        rf_send_status(app);
+}
+
+static void rf_request(App* app, const char* line) {
+    if(!app->rf || !app->settings.rf_sync) {
+        uplink_send(app, "RX|off|RF sync is off on the Flipper");
+        return;
+    }
+    rf_engine_request(app->rf, line);
+}
+
+static void rf_drain_tx(App* app) {
+    uint8_t buf[64];
+    size_t got;
+    while((got = furi_stream_buffer_receive(app->rf_tx, buf, sizeof(buf), 0)) > 0) {
+        for(size_t i = 0; i < got; i++) {
+            char ch = buf[i];
+            if(ch == '\n') {
+                app->rf_line[app->rf_line_len] = 0;
+                if(app->rf_line_len) uplink_send(app, app->rf_line);
+                app->rf_line_len = 0;
+            } else if(app->rf_line_len < sizeof(app->rf_line) - 1) {
+                app->rf_line[app->rf_line_len++] = ch;
+            }
+        }
+    }
+}
+
+/* Z|utc: the PC's clock. Our RTC keeps local time; the difference turns RF timestamps into
+ * UTC and is saved, so records stay right when the PC is away. */
+static void rf_clock(App* app, uint32_t utc) {
+    if(utc < 1600000000u) return;
+    int64_t diff = (int64_t)furi_hal_rtc_get_timestamp() - (int64_t)utc;
+    int32_t minutes = (int32_t)((diff + (diff >= 0 ? 30 : -30)) / 60);
+    if(minutes < -14 * 60 || minutes > 14 * 60) return; // the RTC is not set: keep what we had
+    if(minutes == app->settings.rf_tz) return;
+    app->settings.rf_tz = (int16_t)minutes;
+    uplink_settings_save(&app->settings);
+    rf_apply_config(app);
+}
+
 static void uplink_rx_callback(const uint8_t* data, uint16_t size, void* context) {
     App* app = context;
     furi_stream_buffer_send(app->rx, data, size, 0);
-    view_dispatcher_send_custom_event(app->views, EvRx);
+    // one pending EvRx is enough (drain_rx empties the buffer); never block the BLE thread
+    if(!app->rx_posted && !app->rf_closing) {
+        app->rx_posted = true;
+        view_dispatcher_send_custom_event(app->views, EvRx);
+    }
 }
 
 static void bt_status_callback(BtStatus status, void* context) {
@@ -765,70 +955,168 @@ static void bt_status_callback(BtStatus status, void* context) {
     UNUSED(context);
 }
 
-/* ------------------------------------------------------------------ drawing */
+/* ------------------------------------------------------------------ drawing
+ * Every screen works in both orientations: horizontal 128x64 and vertical 64x128 (the view
+ * dispatcher rotates the canvas, so all layout below derives from canvas_width/height). */
+static bool narrow(Canvas* c) {
+    return canvas_width(c) < 100;
+}
+
+static bool tab_attention(App* app, ScreenId sid) {
+    if(sid == ScreenCodex || sid == ScreenClaude) return list_attention(app, screen_kind(sid));
+    if(sid == ScreenCmd) return app->cmd.unseen || app->cmd.running;
+    if(sid == ScreenRf) return app->rf_status.unseen || app->rf_status.storage_full;
+    return false;
+}
+
+/* three signal bars, 8x7 at (x, 1): all lit = data flowing, one = link is lagging */
+static void draw_link_bars(Canvas* c, App* app, int x) {
+    bool lag = app->tick - app->last_rx_tick > LAG_TICKS;
+    for(int i = 0; i < 3; i++) {
+        int h = 3 + i * 2;
+        if(i == 0 || !lag)
+            canvas_draw_box(c, x + i * 3, 8 - h, 2, h);
+        else
+            canvas_draw_dot(c, x + i * 3, 7);
+    }
+}
+
+static const char* const tab_label[ScreenIdCount] = {"SYS", "CDX", "CLD", "CMD", "", "RF"};
+
 static void draw_header(Canvas* c, App* app) {
+    int W = canvas_width(c);
     fg(c);
-    canvas_draw_box(c, 0, 0, 128, 10);
+    canvas_draw_box(c, 0, 0, W, 10);
     canvas_set_font(c, FontSecondary);
-    static const char* label[ScreenKindCount] = {"SYS", "CDX", "CLD", "CMD"};
-    int tabw = app->tab_count ? (102 / app->tab_count) : 25;
-    if(tabw > 28) tabw = 28;
+    if(narrow(c)) {
+        // current tab in a lit box, link bars, then one marker per tab (filled = current)
+        const char* lab = tab_label[current_screen(app)];
+        int lw = canvas_string_width(c, lab) + 4;
+        bg(c);
+        canvas_draw_box(c, 1, 1, lw, 8);
+        fg(c);
+        canvas_draw_str_aligned(c, 3, 1, AlignLeft, AlignTop, lab);
+        bg(c);
+        draw_link_bars(c, app, lw + 4);
+        for(int i = 0; i < app->tab_count; i++) {
+            int x = W - 2 - (app->tab_count - i) * 6 + 1;
+            bool attn = i != app->tab_index && tab_attention(app, app->tabs[i]);
+            if(i == app->tab_index || (attn && (app->tick & 2)))
+                canvas_draw_box(c, x, 3, 4, 4);
+            else
+                canvas_draw_frame(c, x, 3, 4, 4);
+        }
+        fg(c);
+        return;
+    }
+    // each tab is as wide as its label plus an even share of the free space
+    int setw = canvas_string_width(c, "SET");
+    int avail = W - setw - 15, labels = 0;
+    for(int i = 0; i < app->tab_count; i++)
+        labels += canvas_string_width(c, tab_label[app->tabs[i]]);
+    int pad = MIN(14, (avail - labels) / MAX(1, app->tab_count));
+    int x = 1;
     for(int i = 0; i < app->tab_count; i++) {
-        int x = 1 + i * tabw;
         ScreenId sid = app->tabs[i];
+        int tabw = canvas_string_width(c, tab_label[sid]) + pad;
         bool active = (i == app->tab_index);
-        bool attn = false;
-        if(sid == ScreenCodex || sid == ScreenClaude)
-            attn = list_attention(app, screen_kind(sid));
-        else if(sid == ScreenCmd)
-            attn = app->cmd.unseen || app->cmd.running;
+        bool attn = tab_attention(app, sid);
         bool lit = active || (attn && (app->tick & 2));
         if(lit) {
             bg(c);
-            canvas_draw_box(c, x, 1, tabw - 2, 8);
+            canvas_draw_box(c, x, 1, tabw - 1, 8);
         }
         canvas_set_color(c, lit ? g_fg : g_bg); // lit: dark text on light box; else light on dark bar
-        canvas_draw_str_aligned(c, x + (tabw - 2) / 2, 1, AlignCenter, AlignTop, label[sid]);
-        if(attn && !active) canvas_draw_str_aligned(c, x + tabw - 3, 1, AlignCenter, AlignTop, "!");
+        canvas_draw_str_aligned(c, x + tabw / 2, 1, AlignCenter, AlignTop, tab_label[sid]);
+        if(attn && !active && pad >= 12)
+            canvas_draw_str_aligned(c, x + tabw - 3, 1, AlignCenter, AlignTop, "!");
+        x += tabw;
     }
     bg(c);
-    // The rightmost header cell is a real settings entry point: Right from the last
-    // configured tab opens the same settings view as holding OK.
-    canvas_draw_str_aligned(c, 126, 1, AlignRight, AlignTop, "SET");
+    draw_link_bars(c, app, W - 2 - setw - 11);
+    // Right on the last tab opens the settings (as does holding OK)
+    canvas_draw_str_aligned(c, W - 2, 1, AlignRight, AlignTop, "SET");
     fg(c);
 }
 
-static void draw_meter(Canvas* c, int y, const char* label, uint8_t pct, const char* right) {
-    canvas_draw_str_aligned(c, 2, y + 1, AlignLeft, AlignTop, label);
-    canvas_draw_frame(c, 22, y, 78, 9);
-    int w = 76 * (pct > 100 ? 100 : pct) / 100;
-    if(w > 0) canvas_draw_box(c, 23, y + 1, w, 7);
-    for(int t = 1; t < 4; t++) {
-        canvas_set_color(c, ColorXOR);
-        canvas_draw_dot(c, 22 + t * 19, y + 4);
-    }
+static void draw_meter(Canvas* c, int x, int y, int w, uint8_t pct) {
+    canvas_draw_frame(c, x, y, w, 9);
+    int fill = (w - 2) * (pct > 100 ? 100 : pct) / 100;
+    if(fill > 0) canvas_draw_box(c, x + 1, y + 1, fill, 7);
+    canvas_set_color(c, ColorXOR);
+    for(int t = 1; t < 4; t++)
+        canvas_draw_dot(c, x + t * w / 4, y + 4);
     fg(c);
-    canvas_draw_str_aligned(c, 127, y + 1, AlignRight, AlignTop, right);
+}
+
+static void draw_cpu_graph(Canvas* c, const Sys* s, int x, int y, int w, int h, int step) {
+    canvas_draw_line(c, x, y + h, x + w - 1, y + h);
+    int n = MIN((int)s->hist_len, w / step);
+    for(int i = 0; i < n; i++) {
+        int px = x + (w / step - n + i) * step;
+        int v = s->cpu_hist[s->hist_len - n + i] * h / 100;
+        if(v > 0) canvas_draw_line(c, px, y + h - v, px, y + h);
+    }
+    for(int px = x; px < x + w; px += 4)
+        canvas_draw_dot(c, px, y);
 }
 
 static void draw_sys(Canvas* c, App* app) {
     Sys* s = &app->sys;
-    char a[16], b[16], line[64];
+    int W = canvas_width(c), H = canvas_height(c);
+    char a[16], b[16], line[48];
     canvas_set_font(c, FontSecondary);
     if(!s->valid) {
-        canvas_draw_str_aligned(c, 64, 32, AlignCenter, AlignTop, "waiting for telemetry...");
+        canvas_draw_str_aligned(c, W / 2, H / 2, AlignCenter, AlignTop, "waiting for data...");
         return;
     }
-    if(app->settings.indicators == IndicatorsBars) {
-        snprintf(line, sizeof(line), "%u%%", s->cpu);
-        draw_meter(c, 12, "CPU", s->cpu, line);
-        snprintf(line, sizeof(line), "%u%%", s->ram);
-        draw_meter(c, 22, "RAM", s->ram, line);
-        uint32_t net = s->up + s->dn, dsk = s->rd + s->wr;
-        fmt_rate(a, sizeof(a), net);
-        draw_meter(c, 32, "NET", (uint8_t)(net * 100 / s->net_max), a);
-        fmt_rate(b, sizeof(b), dsk);
-        draw_meter(c, 42, "DSK", (uint8_t)(dsk * 100 / s->dsk_max), b);
+    uint32_t net = s->up + s->dn, dsk = s->rd + s->wr;
+    const char* labels[4] = {"CPU", "RAM", "NET", "DSK"};
+    uint8_t pcts[4] = {
+        s->cpu, s->ram, (uint8_t)(net * 100 / s->net_max), (uint8_t)(dsk * 100 / s->dsk_max)};
+    char vals[4][12];
+    snprintf(vals[0], sizeof(vals[0]), "%u%%", s->cpu);
+    snprintf(vals[1], sizeof(vals[1]), "%u%%", s->ram);
+    fmt_rate(vals[2], sizeof(vals[2]), net);
+    fmt_rate(vals[3], sizeof(vals[3]), dsk);
+    bool bars = app->settings.indicators == IndicatorsBars;
+
+    if(narrow(c)) {
+        int y = 12;
+        if(bars) {
+            for(int i = 0; i < 4; i++, y += 18) {
+                canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, labels[i]);
+                canvas_draw_str_aligned(c, W - 1, y, AlignRight, AlignTop, vals[i]);
+                draw_meter(c, 1, y + 8, W - 2, pcts[i]);
+            }
+        } else {
+            uint32_t v[4] = {s->up, s->dn, s->rd, s->wr};
+            const char* sub[4] = {"up", "dn", "rd", "wr"};
+            canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, "CPU");
+            canvas_draw_str_aligned(c, W - 1, y, AlignRight, AlignTop, vals[0]);
+            y += 10;
+            canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, "RAM");
+            canvas_draw_str_aligned(c, W - 1, y, AlignRight, AlignTop, vals[1]);
+            y += 10;
+            for(int i = 0; i < 4; i++, y += 10) {
+                if(!(i & 1)) canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, labels[2 + i / 2]);
+                fmt_rate(a, sizeof(a), v[i]);
+                snprintf(line, sizeof(line), "%s %s", sub[i], a);
+                canvas_draw_str_aligned(c, W - 1, y, AlignRight, AlignTop, line);
+            }
+            y += 4;
+        }
+        draw_cpu_graph(c, s, 1, y + 2, W - 2, H - y - 5, 1);
+        return;
+    }
+
+    if(bars) {
+        for(int i = 0; i < 4; i++) {
+            int y = 12 + i * 10;
+            canvas_draw_str_aligned(c, 2, y + 1, AlignLeft, AlignTop, labels[i]);
+            draw_meter(c, 22, y, 78, pcts[i]);
+            canvas_draw_str_aligned(c, W - 1, y + 1, AlignRight, AlignTop, vals[i]);
+        }
     } else {
         snprintf(line, sizeof(line), "CPU %u%%   RAM %u%%", s->cpu, s->ram);
         canvas_draw_str_aligned(c, 2, 13, AlignLeft, AlignTop, line);
@@ -841,18 +1129,11 @@ static void draw_sys(Canvas* c, App* app) {
         snprintf(line, sizeof(line), "DSK rd %s  wr %s", a, b);
         canvas_draw_str_aligned(c, 2, 35, AlignLeft, AlignTop, line);
     }
-    const int gx = 2, gy = 52, gh = 11;
-    canvas_draw_line(c, gx, gy + gh, 125, gy + gh);
-    for(int i = 0; i < s->hist_len; i++) {
-        int x = gx + (HIST - s->hist_len + i) * 2;
-        int h = s->cpu_hist[i] * gh / 100;
-        if(h > 0) canvas_draw_line(c, x, gy + gh - h, x, gy + gh);
-    }
-    for(int x = gx; x < 126; x += 4)
-        canvas_draw_dot(c, x, gy);
+    draw_cpu_graph(c, s, 2, 52, 124, 11, 2);
 }
 
-static void draw_glyph(Canvas* c, int x, int y, char st, uint32_t tick) {
+/* 7x7 state glyph; `big` allows the 9x9 blinking box of "needs approval" */
+static void draw_glyph(Canvas* c, int x, int y, char st, uint32_t tick, bool big) {
     switch(st) {
     case 'W': {
         static const int8_t dx[4][4] = {{3, 0, 3, 6}, {0, 0, 6, 6}, {0, 3, 6, 3}, {0, 6, 6, 0}};
@@ -862,11 +1143,14 @@ static void draw_glyph(Canvas* c, int x, int y, char st, uint32_t tick) {
     }
     case 'A':
         if(tick & 2) {
-            canvas_draw_box(c, x - 1, y - 1, 9, 9);
+            if(big)
+                canvas_draw_box(c, x - 1, y - 1, 9, 9);
+            else
+                canvas_draw_box(c, x, y, 7, 7);
             bg(c);
         }
-        canvas_draw_line(c, x + 3, y, x + 3, y + 4);
-        canvas_draw_dot(c, x + 3, y + 6);
+        canvas_draw_line(c, x + 3, y + 1, x + 3, y + 3);
+        canvas_draw_dot(c, x + 3, y + 5);
         fg(c);
         break;
     case 'I':
@@ -884,44 +1168,60 @@ static void draw_glyph(Canvas* c, int x, int y, char st, uint32_t tick) {
     }
 }
 
+static void item_info(const Item* it, char* out, size_t size) {
+    if(it->total)
+        snprintf(out, size, "%u/%u", it->done, it->total);
+    else
+        fmt_age(out, size, it->age);
+}
+
 static void draw_list(Canvas* c, App* app, Kind k) {
     List* l = &app->lists[k];
-    uint8_t total_visible = visible_count(app, k);
-    if(l->cursor >= total_visible) l->cursor = total_visible ? total_visible - 1 : 0;
-    if(l->scroll > l->cursor) l->scroll = l->cursor;
-    bool large = app->settings.font == FontLarge;
-    bool small = app->settings.font == FontSmall;
-    bool micro = app->settings.font == FontMicro;
-    int rows = large ? 4 : (micro ? 7 : (small ? 6 : 5));
-    int rh = large ? 13 : (micro ? 7 : (small ? 8 : 10));
+    int W = canvas_width(c), H = canvas_height(c);
+    const TextFont* tf = text_font(app);
+    bool two_lines = narrow(c); // vertical: name, then age/progress and what it is doing
+    int rh = tf->row + (two_lines ? 7 : 0);
+    int rows = (H - 11) / rh;
+    uint8_t total = visible_count(app, k);
+    if(l->cursor >= total) l->cursor = total ? total - 1 : 0;
     canvas_set_font(c, FontSecondary);
-    if(!total_visible) {
-        canvas_draw_str_aligned(c, 64, 26, AlignCenter, AlignTop, "NO ACTIVE SESSIONS");
-        canvas_draw_str_aligned(
-            c, 64, 38, AlignCenter, AlignTop, k == KindCodex ? "codex is quiet" : "claude is quiet");
+    if(!total) {
+        canvas_draw_str_aligned(c, W / 2, H / 2 - 8, AlignCenter, AlignTop, "NO ACTIVE");
+        canvas_draw_str_aligned(c, W / 2, H / 2 + 2, AlignCenter, AlignTop, "SESSIONS");
         return;
     }
     if(l->cursor < l->scroll) l->scroll = l->cursor;
     if(l->cursor >= l->scroll + rows) l->scroll = l->cursor - rows + 1;
-    bool bar = total_visible > rows;
-    int right_edge = bar ? 123 : 126;
-    for(int r = 0; r < rows && l->scroll + r < total_visible; r++) {
+    if(l->scroll + rows > total) l->scroll = total > rows ? total - rows : 0;
+    bool bar = total > rows;
+    int right_edge = bar ? W - 5 : W - 2;
+    for(int r = 0; r < rows && l->scroll + r < total; r++) {
         int i = visible_raw_index(app, k, l->scroll + r);
         if(i < 0) break;
         Item* it = &l->items[i];
         int y = 11 + r * rh;
-        draw_glyph(c, 2, y + (large ? 3 : 1), it->state, app->tick);
-        char right[12];
-        if(it->total)
-            snprintf(right, sizeof(right), "%u/%u", it->done, it->total);
-        else
-            fmt_age(right, sizeof(right), it->age);
-        canvas_set_font(c, FontSecondary);
-        int rw = canvas_string_width(c, right);
-        canvas_draw_str_aligned(c, right_edge, y + 2, AlignRight, AlignTop, right);
-        font_text(c, app);
-        draw_str_fit(c, 12, y + (large ? 2 : 0), it->name, right_edge - rw - 15);
-        if(r == l->cursor) {
+        char info[12];
+        item_info(it, info, sizeof(info));
+        draw_glyph(c, 2, y + (tf->row - 7) / 2, it->state, app->tick, tf->row >= 10);
+        if(two_lines) {
+            font_text(c, app);
+            draw_str_fit(c, 12, y, it->name, right_edge - 12);
+            font_info(c);
+            int iw = canvas_string_width(c, info);
+            canvas_draw_str_aligned(c, right_edge, y + tf->row, AlignRight, AlignTop, info);
+            draw_str_fit(c, 12, y + tf->row, it->detail, right_edge - iw - 15);
+        } else {
+            if(tf->row >= 10)
+                canvas_set_font(c, FontSecondary);
+            else
+                font_text(c, app);
+            int iw = canvas_string_width(c, info);
+            canvas_draw_str_aligned(
+                c, right_edge, y + (tf->row >= 10 ? (tf->row - 8) / 2 : 0), AlignRight, AlignTop, info);
+            font_text(c, app);
+            draw_str_fit(c, 12, y, it->name, right_edge - iw - 15);
+        }
+        if(l->scroll + r == l->cursor) {
             canvas_set_color(c, ColorXOR);
             canvas_draw_box(c, 0, y, right_edge + 2, rh);
             fg(c);
@@ -929,230 +1229,446 @@ static void draw_list(Canvas* c, App* app, Kind k) {
     }
     if(bar) {
         int track = rh * rows;
-        int h = track * rows / total_visible;
-        int y = 11 + (track - h) * l->scroll / (total_visible - rows);
-        canvas_draw_line(c, 126, 11, 126, 11 + track);
-        canvas_draw_box(c, 125, y, 3, h);
+        int h = MAX(3, track * rows / total);
+        int y = 11 + (track - h) * l->scroll / (total - rows);
+        canvas_draw_line(c, W - 2, 11, W - 2, 11 + track - 1);
+        canvas_draw_box(c, W - 3, y, 3, h);
     }
 }
 
 static void draw_detail(Canvas* c, App* app, Kind k) {
     List* l = &app->lists[k];
-    uint8_t total_visible = visible_count(app, k);
-    if(l->cursor >= total_visible) {
-        app->detail = false;
-        return;
-    }
-    int raw = visible_raw_index(app, k, l->cursor);
+    int W = canvas_width(c), H = canvas_height(c);
+    const TextFont* tf = text_font(app);
+    int raw = l->cursor < visible_count(app, k) ? visible_raw_index(app, k, l->cursor) : -1;
     if(raw < 0) {
         app->detail = false;
         return;
     }
     Item* it = &l->items[raw];
+    int y = 11;
     font_text(c, app);
-    draw_str_fit(c, 2, 11, it->name, 124);
+    draw_str_fit(c, 2, y, it->name, W - 4);
+    y += tf->line + 2;
+
     canvas_set_font(c, FontSecondary);
     const char* st = state_text(it->state);
     int sw = canvas_string_width(c, st);
-    canvas_draw_box(c, 2, 23, sw + 6, 9);
+    canvas_draw_box(c, 2, y, sw + 6, 9);
     bg(c);
-    canvas_draw_str_aligned(c, 5, 24, AlignLeft, AlignTop, st);
+    canvas_draw_str_aligned(c, 5, y + 1, AlignLeft, AlignTop, st);
     fg(c);
     char age[16], buf[24];
     fmt_age(age, sizeof(age), it->age);
     snprintf(buf, sizeof(buf), "%s ago", age);
-    canvas_draw_str_aligned(c, 127, 24, AlignRight, AlignTop, buf);
-    int y = 34;
+    if(sw + 12 + canvas_string_width(c, buf) > W) y += 10; // no room on the same row
+    canvas_draw_str_aligned(c, W - 1, y + 1, AlignRight, AlignTop, buf);
+    y += 11;
     if(it->total) {
         snprintf(buf, sizeof(buf), "%u/%u", it->done, it->total);
-        canvas_draw_frame(c, 2, y, 100, 7);
-        int w = 98 * MIN(it->done, it->total) / it->total;
+        int tw = canvas_string_width(c, buf);
+        int bw = W - tw - 7;
+        canvas_draw_frame(c, 2, y, bw, 7);
+        int w = (bw - 2) * MIN(it->done, it->total) / it->total;
         if(w) canvas_draw_box(c, 3, y + 1, w, 5);
-        canvas_draw_str_aligned(c, 127, y, AlignRight, AlignTop, buf);
+        canvas_draw_str_aligned(c, W - 1, y - 1, AlignRight, AlignTop, buf);
         y += 9;
     }
     font_text(c, app);
-    int rows = (64 - y) / 9;
-    if(rows > 0) {
-        int total = draw_wrapped_scroll(c, 2, y, 124, it->detail, 0, 9, UINT8_MAX);
-        int max_scroll = total > rows ? total - rows : 0;
-        if(l->detail_scroll > max_scroll) l->detail_scroll = max_scroll;
-        draw_wrapped_scroll(c, 2, y, 124, it->detail, rows, 9, l->detail_scroll);
-        if(max_scroll) {
-            canvas_set_font(c, FontSecondary);
-            canvas_draw_str_aligned(c, 126, 55, AlignCenter, AlignTop,
-                                    l->detail_scroll < max_scroll ? "v" : "^");
+    int rows = (H - y) / tf->line;
+    if(rows <= 0) return;
+    int total = draw_wrapped(c, 2, y, W - 6, it->detail, 0, tf->line, 0);
+    int max_scroll = total > rows ? total - rows : 0;
+    if(l->detail_scroll > max_scroll) l->detail_scroll = max_scroll;
+    draw_wrapped(c, 2, y, W - 6, it->detail, rows, tf->line, l->detail_scroll);
+    if(max_scroll) {
+        // a thin scrollbar on the right edge of the text block
+        int track = H - y - 1;
+        int h = MAX(3, track * rows / total);
+        int py = y + (track - h) * l->detail_scroll / max_scroll;
+        canvas_draw_line(c, W - 2, y, W - 2, H - 2);
+        canvas_draw_box(c, W - 3, py, 3, h);
+    }
+}
+
+/* screen rows a console line takes once wrapped (at least 1) */
+static int console_rows(Canvas* c, const char* p, int w) {
+    int n = 0;
+    do {
+        const char* next = p;
+        if(*p) wrap_fit(c, p, w, &next);
+        p = next;
+        n++;
+    } while(*p);
+    return n;
+}
+
+/* Console lines are word-wrapped to the screen width. Like a terminal, output starts at the
+ * top and, once the screen is full, the newest line stays at the bottom; Up/Down scroll by
+ * stored lines. */
+static void draw_console(Canvas* c, App* app, int top, int bottom, int w) {
+    Cmd* cmd = &app->cmd;
+    int step = text_font(app)->line;
+    int capacity = (bottom - top) / step;
+    int newest = cmd->count - 1 - cmd->scroll;
+    int shown = 0;
+    font_text(c, app);
+    int used = 0;
+    for(int i = newest; i >= 0 && used < capacity; i--)
+        used += console_rows(c, cmd_line(cmd, i), w);
+    int y = used < capacity ? top + used * step : bottom;
+    for(int i = newest; i >= 0 && y - step >= top; i--) {
+        const char* p = cmd_line(cmd, i);
+        const char* seg[24];
+        uint8_t len[24];
+        int n = 0;
+        do {
+            const char* next = p;
+            seg[n] = p;
+            len[n] = *p ? (uint8_t)wrap_fit(c, p, w, &next) : 0;
+            p = next;
+            n++;
+        } while(*p && n < 24);
+        for(int s = n - 1; s >= 0 && y - step >= top; s--) {
+            char buf[CMD_COLW];
+            y -= step;
+            memcpy(buf, seg[s], len[s]);
+            buf[len[s]] = 0;
+            canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, buf);
         }
+        shown++;
+    }
+    if(cmd->count > shown) {
+        int track = bottom - top;
+        int h = MAX(3, track * shown / cmd->count);
+        int span = cmd->count - shown;
+        int pos = span - MIN(cmd->scroll, span); // 0 = oldest at the top
+        int py = top + (track - h) * pos / span;
+        canvas_draw_box(c, w + 2, py, 2, h);
     }
 }
 
 static void draw_cmd(Canvas* c, App* app) {
     Cmd* cmd = &app->cmd;
-    canvas_set_font(c, FontSecondary);
-    char head[96];
-    const char* tail = cmd->cwd;
-    size_t cl = strlen(tail);
-    if(cl > 18) tail += cl - 18;
+    int W = canvas_width(c), H = canvas_height(c);
+    const TextFont* tf = text_font(app);
+    char status[24] = "";
     if(cmd->running)
-        snprintf(head, sizeof(head), "%s> RUN  (Back=stop)", tail);
+        snprintf(status, sizeof(status), narrow(c) ? "RUN" : "RUN Back=stop");
     else if(cmd->have_exit)
-        snprintf(head, sizeof(head), "%s> exit %d", tail, cmd->exit_code);
-    else
-        snprintf(head, sizeof(head), "%s>", tail[0] ? tail : "cmd");
-    char hbuf[96];
-    clean_copy(hbuf, sizeof(hbuf), head);
-    font_text(c, app);
-    utf8_fit(c, hbuf, 126);
-    canvas_draw_str_aligned(c, 2, 10, AlignLeft, AlignTop, hbuf);
+        snprintf(status, sizeof(status), "exit %d", cmd->exit_code);
     canvas_set_font(c, FontSecondary);
-    canvas_draw_line(c, 0, 19, 128, 19);
+    int sw = status[0] ? canvas_string_width(c, status) + 4 : 0;
+    canvas_draw_str_aligned(c, W - 1, 12, AlignRight, AlignTop, status);
+    // working directory: keep its end, it is the informative part
+    char cwd[64];
+    clean_copy(cwd, sizeof(cwd), cmd->cwd[0] ? cmd->cwd : "cmd");
+    font_text(c, app);
+    const char* shown = cwd;
+    char head[72];
+    for(;;) {
+        snprintf(head, sizeof(head), "%s%s>", shown == cwd ? "" : "~", shown);
+        if(!shown[0] || canvas_string_width(c, head) <= W - 2 - sw) break;
+        shown += utf8_len_at(shown);
+    }
+    canvas_draw_str_aligned(c, 1, 11, AlignLeft, AlignTop, head);
+    int sep = 11 + tf->line + 1;
+    canvas_draw_line(c, 0, sep, W, sep);
 
     if(cmd->count == 0) {
-        canvas_draw_str_aligned(c, 64, 34, AlignCenter, AlignTop, "OK: type a command");
-        canvas_draw_str_aligned(c, 64, 46, AlignCenter, AlignTop, "cmd.exe in your pocket");
+        canvas_set_font(c, FontSecondary);
+        canvas_draw_str_aligned(c, W / 2, sep + 10, AlignCenter, AlignTop, "OK: type a command");
+        canvas_draw_str_aligned(
+            c, W / 2, sep + 22, AlignCenter, AlignTop, narrow(c) ? "on the PC" : "cmd.exe in your pocket");
         return;
     }
-    const int vis = 5, top = 21, step = 8;
-    int total = cmd->count;
-    int bottom = total - cmd->scroll;
-    if(bottom > total) bottom = total;
-    if(bottom < 1) bottom = 1;
-    int start = bottom - vis;
-    if(start < 0) start = 0;
-    bool sb = total > vis;
-    int right = sb ? 124 : 128;
-    font_text(c, app);
-    for(int r = 0; start + r < bottom; r++) {
-        char buf[CMD_COLW];
-        clean_copy(buf, sizeof(buf), cmd_line(cmd, start + r));
-        utf8_fit(c, buf, right - 2);
-        canvas_draw_str_aligned(c, 1, top + r * step, AlignLeft, AlignTop, buf);
-    }
+    draw_console(c, app, sep + 2, H, W - 5);
+}
+
+/* a framed panel with an inverted title bar; returns the y below the title */
+static int draw_panel(Canvas* c, int x, int y, int w, int h, const char* title) {
+    bg(c);
+    canvas_draw_box(c, x, y, w, h);
+    fg(c);
+    canvas_draw_frame(c, x, y, w, h);
+    canvas_draw_box(c, x + 2, y + 2, w - 4, 11);
     canvas_set_font(c, FontSecondary);
-    if(sb) {
-        int track = vis * step;
-        int h = track * vis / total;
-        int y = top + (track - h) * start / (total - vis);
-        canvas_draw_box(c, 126, y, 2, h);
-    }
+    bg(c);
+    canvas_draw_str_aligned(c, x + w / 2, y + 4, AlignCenter, AlignTop, title);
+    fg(c);
+    return y + 15;
 }
 
 static void draw_alert(Canvas* c, App* app) {
-    bg(c);
-    canvas_draw_box(c, 5, 13, 118, 40);
-    fg(c);
-    canvas_draw_frame(c, 5, 13, 118, 40);
-    canvas_draw_box(c, 7, 15, 114, 11);
-    canvas_set_font(c, FontSecondary);
+    int W = canvas_width(c), H = canvas_height(c);
+    bool n = narrow(c);
+    int pw = W - 8, ph = n ? 70 : 42;
+    int px = 4, py = n ? (H - ph) / 2 : 12;
     if(app->alert_update) {
         char line[40];
-        bg(c);
-        canvas_draw_str_aligned(c, 64, 17, AlignCenter, AlignTop, ">> UPDATE AVAILABLE <<");
-        fg(c);
-        snprintf(line, sizeof(line), "%s -> %s", UPLINK_VERSION, app->ota.tag);
-        canvas_draw_str_aligned(c, 64, 29, AlignCenter, AlignTop, line);
-        canvas_draw_str_aligned(c, 64, 40, AlignCenter, AlignTop, "OK: install   Back: later");
+        int y = draw_panel(c, px, py, pw, ph, n ? "UPDATE" : ">> UPDATE AVAILABLE <<");
+        snprintf(line, sizeof(line), n ? "%s ->" : "%s -> %s", UPLINK_VERSION, app->ota.tag);
+        canvas_draw_str_aligned(c, W / 2, y + 1, AlignCenter, AlignTop, line);
+        if(n) {
+            canvas_draw_str_aligned(c, W / 2, y + 11, AlignCenter, AlignTop, app->ota.tag);
+            canvas_draw_str_aligned(c, W / 2, y + 27, AlignCenter, AlignTop, "OK: install");
+            canvas_draw_str_aligned(c, W / 2, y + 37, AlignCenter, AlignTop, "Back: later");
+        } else {
+            canvas_draw_str_aligned(c, W / 2, y + 12, AlignCenter, AlignTop, "OK: install   Back: later");
+        }
         return;
     }
-    bg(c);
+    const char* title = app->alert_state == 'A' ? (n ? "APPROVAL" : "!! APPROVAL NEEDED !!") :
+                                                  (n ? "YOUR TURN" : ">> YOUR TURN <<");
+    int y = draw_panel(c, px, py, pw, ph, title);
     canvas_draw_str_aligned(
-        c, 64, 17, AlignCenter, AlignTop,
-        app->alert_state == 'A' ? "!! APPROVAL NEEDED !!" : ">> YOUR TURN <<");
-    fg(c);
-    canvas_draw_str_aligned(
-        c, 64, 28, AlignCenter, AlignTop, app->alert_kind == KindCodex ? "CODEX" : "CLAUDE");
+        c, W / 2, y + 1, AlignCenter, AlignTop, app->alert_kind == KindCodex ? "CODEX" : "CLAUDE");
     font_text(c, app);
     char name[64];
     clean_copy(name, sizeof(name), app->alert_name);
-    utf8_fit(c, name, 110);
-    canvas_draw_str_aligned(c, 64, 38, AlignCenter, AlignTop, name);
+    if(n) {
+        draw_wrapped(c, px + 3, y + 12, pw - 6, name, 3, text_font(app)->line, 0);
+    } else {
+        utf8_fit(c, name, pw - 8);
+        canvas_draw_str_aligned(c, W / 2, y + 12, AlignCenter, AlignTop, name);
+    }
 }
 
 static void draw_ota(Canvas* c, App* app) {
     Ota* o = &app->ota;
+    int W = canvas_width(c), H = canvas_height(c);
+    bool n = narrow(c);
+    int pw = W - 6, ph = n ? 56 : 44;
+    int px = 3, py = n ? (H - ph) / 2 : 11;
     char line[48];
-    bg(c);
-    canvas_draw_box(c, 4, 12, 120, 42);
-    fg(c);
-    canvas_draw_frame(c, 4, 12, 120, 42);
-    canvas_draw_box(c, 6, 14, 116, 11);
-    canvas_set_font(c, FontSecondary);
-    bg(c);
-    if(o->state == OtaDone) {
-        canvas_draw_str_aligned(c, 64, 16, AlignCenter, AlignTop, "UPDATED - RESTARTING");
-    } else if(o->state == OtaFailed) {
-        canvas_draw_str_aligned(c, 64, 16, AlignCenter, AlignTop, "UPDATE FAILED");
-    } else {
-        canvas_draw_str_aligned(c, 64, 16, AlignCenter, AlignTop, "UPDATING");
-    }
-    fg(c);
+    const char* title = o->state == OtaDone   ? (n ? "UPDATED" : "UPDATED - RESTARTING") :
+                        o->state == OtaFailed ? (n ? "FAILED" : "UPDATE FAILED") :
+                                                "UPDATING";
+    int y = draw_panel(c, px, py, pw, ph, title);
     if(o->state == OtaFailed) {
-        canvas_draw_str_aligned(c, 64, 28, AlignCenter, AlignTop, o->error[0] ? o->error : "error");
-        canvas_draw_str_aligned(c, 64, 40, AlignCenter, AlignTop, "any key: close");
+        canvas_draw_str_aligned(c, W / 2, y + 2, AlignCenter, AlignTop, o->error[0] ? o->error : "error");
+        canvas_draw_str_aligned(c, W / 2, y + 14, AlignCenter, AlignTop, n ? "any key" : "any key: close");
         return;
     }
-    snprintf(line, sizeof(line), "%s -> %s", UPLINK_VERSION, o->tag);
-    canvas_draw_str_aligned(c, 64, 27, AlignCenter, AlignTop, line);
+    snprintf(line, sizeof(line), n ? "-> %s" : "%s -> %s", n ? o->tag : UPLINK_VERSION, o->tag);
+    canvas_draw_str_aligned(c, W / 2, y + 1, AlignCenter, AlignTop, line);
     uint8_t pct = (o->state == OtaRequested) ? 0 : ota_percent(o);
-    canvas_draw_frame(c, 10, 39, 108, 9);
-    int w = 106 * pct / 100;
-    if(w) canvas_draw_box(c, 11, 40, w, 7);
-    if(o->state == OtaRequested) {
-        snprintf(line, sizeof(line), "waiting for PC...");
-    } else {
+    int by = y + (n ? 24 : 13);
+    canvas_draw_frame(c, px + 5, by, pw - 10, 9);
+    int w = (pw - 12) * pct / 100;
+    if(w) canvas_draw_box(c, px + 6, by + 1, w, 7);
+    if(o->state == OtaRequested)
+        snprintf(line, sizeof(line), n ? "wait PC" : "waiting for PC...");
+    else
         snprintf(line, sizeof(line), "%u%%", pct);
-    }
     canvas_set_color(c, ColorXOR); // readable over both the filled and the empty part
-    canvas_draw_str_aligned(c, 64, 40, AlignCenter, AlignTop, line);
+    canvas_draw_str_aligned(c, W / 2, by + 1, AlignCenter, AlignTop, line);
     fg(c);
 }
 
 static void draw_offline(Canvas* c, App* app) {
-    canvas_draw_box(c, 0, 0, 128, 12);
+    int W = canvas_width(c), H = canvas_height(c);
+    bool n = narrow(c);
+    canvas_draw_box(c, 0, 0, W, 12);
     bg(c);
     canvas_set_font(c, FontPrimary);
-    canvas_draw_str_aligned(c, 64, 2, AlignCenter, AlignTop, "DEDSEC // UPLINK");
+    canvas_draw_str_aligned(c, W / 2, 2, AlignCenter, AlignTop, n ? "UPLINK" : "DEDSEC // UPLINK");
     fg(c);
-    canvas_draw_icon(c, 2, 16, &I_hood_26x30);
     canvas_set_font(c, FontSecondary);
-    char name[32];
-    snprintf(name, sizeof(name), "%s %s", UPLINK_NAME_PREFIX, furi_hal_version_get_name_ptr());
+    const char* state = app->host_closed ? "HOST WENT DARK" : "WAITING FOR HOST";
+    if(n) {
+        canvas_draw_icon(c, (W - 26) / 2, 15, &I_hood_26x30);
+        int y = 49;
+        canvas_draw_str_aligned(c, W / 2, y, AlignCenter, AlignTop, app->host_closed ? "HOST WENT" : "WAITING");
+        canvas_draw_str_aligned(c, W / 2, y + 9, AlignCenter, AlignTop, app->host_closed ? "DARK" : "FOR HOST");
+        canvas_draw_str_aligned(c, W / 2, y + 23, AlignCenter, AlignTop, "BLE name:");
+        canvas_draw_str_aligned(c, W / 2, y + 32, AlignCenter, AlignTop, UPLINK_NAME_PREFIX);
+        canvas_draw_str_aligned(c, W / 2, y + 41, AlignCenter, AlignTop, furi_hal_version_get_name_ptr());
+        canvas_draw_str_aligned(c, W / 2, y + 55, AlignCenter, AlignTop, "run uplink");
+        canvas_draw_str_aligned(c, W / 2, y + 64, AlignCenter, AlignTop, "on the PC");
+    } else {
+        char name[32];
+        snprintf(name, sizeof(name), "%s %s", UPLINK_NAME_PREFIX, furi_hal_version_get_name_ptr());
+        canvas_draw_icon(c, 2, 16, &I_hood_26x30);
+        canvas_draw_str_aligned(c, 32, 17, AlignLeft, AlignTop, state);
+        canvas_draw_str_aligned(c, 32, 27, AlignLeft, AlignTop, "BLE name:");
+        canvas_draw_str_aligned(c, 32, 36, AlignLeft, AlignTop, name);
+        canvas_draw_str_aligned(c, 32, 46, AlignLeft, AlignTop, "run uplink on PC");
+    }
+    int span = W - 16;
+    int pos = (app->tick * 3) % (span * 2);
+    int x = pos < span ? pos : span * 2 - 1 - pos;
+    canvas_draw_frame(c, 2, H - 6, W - 4, 5);
+    canvas_draw_box(c, 3 + x, H - 5, 10, 3);
+}
+
+/* ------------------------------------------------------------------ RF tab */
+static const char* const rf_mode_names[RfModeCount] = {"SCOUT", "CAPTURE", "FOLLOW", "NFC"};
+
+static void fmt_mhz(char* out, size_t size, uint32_t hz) {
+    snprintf(
+        out, size, "%lu.%02lu", (unsigned long)(hz / 1000000), (unsigned long)(hz / 10000 % 100));
+}
+
+static void fmt_kb(char* out, size_t size, uint32_t kb) {
+    if(kb >= 1024 * 1024)
+        snprintf(
+            out,
+            size,
+            "%lu.%luG",
+            (unsigned long)(kb / 1048576),
+            (unsigned long)(kb % 1048576 * 10 / 1048576));
+    else if(kb >= 1024)
+        snprintf(out, size, "%luM", (unsigned long)(kb / 1024));
+    else
+        snprintf(out, size, "%luK", (unsigned long)kb);
+}
+
+/* local wall-clock time of a UTC instant (the offset is what the PC told us) */
+static void fmt_clock(char* out, size_t size, uint32_t utc, int16_t tz_minutes) {
+    DateTime dt;
+    int64_t local = (int64_t)utc + (int64_t)tz_minutes * 60;
+    datetime_timestamp_to_datetime((uint32_t)(local > 0 ? local : 0), &dt);
+    snprintf(out, size, "%02u:%02u:%02u", dt.hour, dt.minute, dt.second);
+}
+
+static void draw_rf(Canvas* c, App* app) {
+    int W = canvas_width(c), H = canvas_height(c);
+    bool n = narrow(c);
+    const RfStatus* s = &app->rf_status;
+    char a[16], b[16], line[72];
+    canvas_set_font(c, FontSecondary);
+    if(!app->rf) {
+        canvas_draw_str_aligned(c, W / 2, H / 2, AlignCenter, AlignTop, "RF engine unavailable");
+        return;
+    }
+    // mode in a lit box; receiver state on the right with a blinking dot while it listens
+    const char* mode = rf_mode_names[s->mode < RfModeCount ? s->mode : 0];
+    int mw = canvas_string_width(c, mode) + 6;
+    canvas_draw_box(c, 1, 12, mw, 9);
+    bg(c);
+    canvas_draw_str_aligned(c, 4, 13, AlignLeft, AlignTop, mode);
+    fg(c);
+    if(!s->running)
+        snprintf(line, sizeof(line), "OFF");
+    else if(s->mode == RfModeNfc)
+        snprintf(line, sizeof(line), s->nfc_field ? "FIELD!" : "LISTEN");
+    else {
+        fmt_mhz(a, sizeof(a), s->frequency_hz);
+        snprintf(line, sizeof(line), "RX %s", a);
+    }
+    int sy = n ? 23 : 13;
+    canvas_draw_str_aligned(c, W - 1, sy, AlignRight, AlignTop, line);
+    if(s->running && (app->tick & 2)) {
+        int lw = canvas_string_width(c, line);
+        canvas_draw_disc(c, W - lw - 6, sy + 3, 2);
+    }
+
+    char ev[16], fam[16], pend[16], sd[16];
+    snprintf(ev, sizeof(ev), "%lu", (unsigned long)s->events);
+    snprintf(fam, sizeof(fam), "%lu", (unsigned long)s->families);
+    snprintf(pend, sizeof(pend), "%lu", (unsigned long)s->pending);
+    fmt_kb(sd, sizeof(sd), s->free_kb);
+    char last[64] = "no events yet";
+    if(s->last_unix) {
+        fmt_clock(a, sizeof(a), s->last_unix, app->settings.rf_tz);
+        fmt_mhz(b, sizeof(b), s->last_frequency_hz);
+        if(s->mode == RfModeFollow && s->follow_valid)
+            snprintf(last, sizeof(last), "%s %s %u%%", a, b, s->last_similarity);
+        else if(s->last_frequency_hz)
+            snprintf(last, sizeof(last), "%s %s %ddB", a, b, s->last_rssi_dbm);
+        else
+            snprintf(last, sizeof(last), "%s NFC", a);
+    }
+    const char* problem = NULL;
+    if(s->storage_full)
+        problem = "SD FULL: IMPORT ON PC";
+    else if(s->errors) {
+        snprintf(b, sizeof(b), "%lu", (unsigned long)s->errors);
+        problem = "WRITE ERRORS";
+    }
+
+    if(n) {
+        static const char* const labels[4] = {"EVENTS", "FAMILIES", "PENDING", "SD FREE"};
+        const char* values[4] = {ev, fam, pend, sd};
+        int y = 35;
+        for(int i = 0; i < 4; i++, y += 9) {
+            canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, labels[i]);
+            canvas_draw_str_aligned(c, W - 1, y, AlignRight, AlignTop, values[i]);
+        }
+        canvas_draw_line(c, 0, y + 2, W, y + 2);
+        y += 5;
+        canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, "LAST EVENT");
+        y += 9;
+        if(s->last_unix) {
+            canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, a);
+            canvas_draw_str_aligned(c, 1, y + 9, AlignLeft, AlignTop, last + strlen(a) + 1);
+        } else
+            canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, last);
+        if(problem) {
+            // the problem replaces the mode hint, below the last-event block
+            canvas_draw_box(c, 0, H - 20, W, 10);
+            bg(c);
+            canvas_draw_str_aligned(
+                c, W / 2, H - 19, AlignCenter, AlignTop, s->storage_full ? "SD FULL" : problem);
+            fg(c);
+        } else {
+            canvas_draw_str_aligned(c, 1, H - 18, AlignLeft, AlignTop, "UP/DN: mode");
+        }
+        canvas_draw_str_aligned(c, 1, H - 9, AlignLeft, AlignTop, s->running ? "OK: stop" : "OK: start");
+        return;
+    }
+
+    canvas_draw_str_aligned(c, 2, 24, AlignLeft, AlignTop, "EVENTS");
+    canvas_draw_str_aligned(c, 61, 24, AlignRight, AlignTop, ev);
+    canvas_draw_str_aligned(c, 67, 24, AlignLeft, AlignTop, "FAMILIES");
+    canvas_draw_str_aligned(c, W - 1, 24, AlignRight, AlignTop, fam);
+    canvas_draw_str_aligned(c, 2, 33, AlignLeft, AlignTop, "PENDING");
+    canvas_draw_str_aligned(c, 61, 33, AlignRight, AlignTop, pend);
+    canvas_draw_str_aligned(c, 67, 33, AlignLeft, AlignTop, "SD");
+    canvas_draw_str_aligned(c, W - 1, 33, AlignRight, AlignTop, sd);
+    canvas_draw_line(c, 0, 43, W, 43);
+    snprintf(line, sizeof(line), "LAST %s", last);
     canvas_draw_str_aligned(
-        c, 32, 17, AlignLeft, AlignTop, app->host_closed ? "HOST WENT DARK" : "WAITING FOR HOST");
-    canvas_draw_str_aligned(c, 32, 27, AlignLeft, AlignTop, "BLE name:");
-    canvas_draw_str_aligned(c, 32, 36, AlignLeft, AlignTop, name);
-    canvas_draw_str_aligned(c, 32, 46, AlignLeft, AlignTop, "run uplink on PC");
-    int pos = (app->tick * 3) % 220;
-    int x = pos < 110 ? pos : 219 - pos;
-    canvas_draw_frame(c, 2, 58, 124, 5);
-    canvas_draw_box(c, 3 + x, 59, 12, 3);
+        c, 2, 45, AlignLeft, AlignTop, canvas_string_width(c, line) <= W - 3 ? line : last);
+    if(problem) {
+        canvas_draw_box(c, 0, 54, W, 10);
+        bg(c);
+        if(s->errors && !s->storage_full)
+            snprintf(line, sizeof(line), "%s: %s", problem, b);
+        else
+            snprintf(line, sizeof(line), "%s", problem);
+        canvas_draw_str_aligned(c, W / 2, 55, AlignCenter, AlignTop, line);
+        fg(c);
+    } else {
+        canvas_draw_str_aligned(
+            c, 2, 55, AlignLeft, AlignTop, s->running ? "OK: stop   UP/DN: mode" : "OK: start   UP/DN: mode");
+    }
 }
 
 static void main_draw(Canvas* c, void* model) {
     MainModel* m = model;
     App* app = m->app;
     furi_mutex_acquire(app->mutex, FuriWaitForever);
-    // The UI uses one high-contrast palette; theme switching was removed from settings.
-    g_fg = ColorBlack;
-    g_bg = ColorWhite;
-    /* ViewDispatcher applies the ViewOrientation to the canvas before this
-     * callback.  Applying canvas orientation again here rotates the already
-     * rotated canvas a second time, which made the vertical mode appear
-     * blank/misaligned on hardware. */
     canvas_clear(c);
     fg(c);
     ScreenId screen = current_screen(app);
-    bool offline = (!app->link || app->host_closed) && screen != ScreenCmd;
+    // CMD and RF stay usable without the PC (RF is meant to run in a pocket)
+    bool offline = (!app->link || app->host_closed) && screen != ScreenCmd && screen != ScreenRf;
     if(offline) {
         draw_offline(c, app);
     } else {
         draw_header(c, app);
         if(screen == ScreenSys)
             draw_sys(c, app);
+        else if(screen == ScreenRf)
+            draw_rf(c, app);
         else if(screen == ScreenCmd) {
-            if(!app->link)
-                canvas_draw_str_aligned(c, 64, 34, AlignCenter, AlignTop, "link down");
-            else
+            if(!app->link) {
+                canvas_set_font(c, FontSecondary);
+                canvas_draw_str_aligned(
+                    c, canvas_width(c) / 2, canvas_height(c) / 2, AlignCenter, AlignTop, "link down");
+            } else
                 draw_cmd(c, app);
         } else if(app->detail)
             draw_detail(c, app, screen_kind(screen));
@@ -1175,7 +1691,9 @@ static void go_view(App* app, uint32_t id) {
 static void open_keyboard(App* app) {
     // reset clears stale cursor/selection state but keeps our external buffer (last command)
     text_input_reset(app->keyboard);
-    text_input_set_header_text(app->keyboard, "Command (OK=save)");
+    // while a command runs, the text goes to its input (e.g. a y/n prompt) instead
+    text_input_set_header_text(
+        app->keyboard, app->cmd.running ? "Input for the running command" : "Command (OK=save)");
     text_input_set_result_callback(
         app->keyboard, keyboard_done, app, app->cmd.input, sizeof(app->cmd.input), false);
     go_view(app, ViewKeyboard);
@@ -1271,7 +1789,11 @@ static bool main_input(InputEvent* in, void* context) {
         app->tab_index++;
         break;
     case InputKeyUp:
-        if(screen == ScreenCmd) {
+        if(screen == ScreenRf && app->rf) {
+            rf_engine_set_mode(
+                app->rf, (RfMode)((app->rf_status.mode + RfModeCount - 1) % RfModeCount));
+            rf_refresh_status(app);
+        } else if(screen == ScreenCmd) {
             if(app->cmd.scroll < app->cmd.count - 1) app->cmd.scroll++;
         } else if((screen == ScreenCodex || screen == ScreenClaude) && !app->detail) {
             List* l = &app->lists[screen_kind(screen)];
@@ -1282,7 +1804,10 @@ static bool main_input(InputEvent* in, void* context) {
         }
         break;
     case InputKeyDown:
-        if(screen == ScreenCmd) {
+        if(screen == ScreenRf && app->rf) {
+            rf_engine_set_mode(app->rf, (RfMode)((app->rf_status.mode + 1) % RfModeCount));
+            rf_refresh_status(app);
+        } else if(screen == ScreenCmd) {
             if(app->cmd.scroll > 0) app->cmd.scroll--;
         } else if((screen == ScreenCodex || screen == ScreenClaude) && !app->detail) {
             List* l = &app->lists[screen_kind(screen)];
@@ -1294,7 +1819,13 @@ static bool main_input(InputEvent* in, void* context) {
         }
         break;
     case InputKeyOk:
-        if(screen == ScreenCmd) {
+        if(screen == ScreenRf && app->rf) {
+            if(app->rf_status.running)
+                rf_engine_stop(app->rf);
+            else
+                rf_engine_start(app->rf);
+            rf_refresh_status(app);
+        } else if(screen == ScreenCmd) {
             app->cmd.unseen = false;
             furi_mutex_release(app->mutex);
             open_keyboard(app);
@@ -1384,8 +1915,17 @@ static const char* const on_off[] = {"OFF", "ON"};
 static const char* const ind_vals[] = {"Bars", "Text"};
 static const char* const font_vals[] = {"Normal", "Large", "Small", "Micro"};
 static const char* const orientation_vals[] = {"Horizontal", "Vertical"};
-static const char* const tab_vals[] = {"SYS", "CDX", "CLD", "CMD", "Off"};
 static const char* const update_vals[] = {"Notify", "Auto"};
+// tab choices in the order the user sees them; stored as ScreenId
+static const char* const tab_vals[] = {"SYS", "CDX", "CLD", "CMD", "RF", "Off"};
+static const uint8_t tab_screens[] = {ScreenSys, ScreenCodex, ScreenClaude, ScreenCmd, ScreenRf, ScreenOff};
+static const char* const rf_band_vals[] = {"All", "433", "315", "868"};
+static const uint16_t rf_dwell_vals[] = {100, 250, 500, 1000, 2000};
+static const uint16_t rf_capture_vals[] = {250, 500, 1000, 2000};
+static const char* const rf_keep_vals[] = {"Delete", "Keep"};
+#define RF_RSSI_MIN   (-100)
+#define RF_RSSI_STEP  5
+#define RF_RSSI_COUNT 13 // -100 ... -40 dBm
 
 enum {
     SetVibro,
@@ -1399,16 +1939,36 @@ enum {
     SetTab1,
     SetTab2,
     SetTab3,
+    SetTab4,
+    SetRfBand,
+    SetRfRssi,
+    SetRfDwell,
+    SetRfCapture,
+    SetRfFeedback,
+    SetRfKeep,
+    SetRfAutostart,
+    SetRfSync,
     SetAutoUpdate,
     SetVersion, // read-only; OK installs a pending update
 };
 
-static void setting_changed(VariableItem* item) {
-    App* app = variable_item_get_context(item);
-    uint8_t idx = variable_item_get_current_value_index(item);
-    uint8_t sel = variable_item_list_get_selected_item_index(app->settings_view);
-    const char* text;
-    switch(sel) {
+static uint8_t tab_choice(uint8_t screen) {
+    for(uint8_t i = 0; i < COUNT_OF(tab_screens); i++)
+        if(tab_screens[i] == screen) return i;
+    return COUNT_OF(tab_screens) - 1; // Off
+}
+
+static uint8_t nearest_index(const uint16_t* vals, uint8_t count, uint16_t v) {
+    uint8_t best = 0;
+    for(uint8_t i = 1; i < count; i++)
+        if(abs((int)vals[i] - (int)v) < abs((int)vals[best] - (int)v)) best = i;
+    return best;
+}
+
+/* the text shown for value `idx` of settings row `row` */
+static void setting_text(uint8_t row, uint8_t idx, char* out, size_t size) {
+    const char* text = NULL;
+    switch(row) {
     case SetIndicators:
         text = ind_vals[idx];
         break;
@@ -1422,61 +1982,117 @@ static void setting_changed(VariableItem* item) {
     case SetTab1:
     case SetTab2:
     case SetTab3:
+    case SetTab4:
         text = tab_vals[idx];
+        break;
+    case SetRfBand:
+        text = rf_band_vals[idx];
+        break;
+    case SetRfRssi:
+        snprintf(out, size, "%d dBm", RF_RSSI_MIN + idx * RF_RSSI_STEP);
+        return;
+    case SetRfDwell:
+        snprintf(out, size, "%u ms", rf_dwell_vals[idx]);
+        return;
+    case SetRfCapture:
+        snprintf(out, size, "%u ms", rf_capture_vals[idx]);
+        return;
+    case SetRfKeep:
+        text = rf_keep_vals[idx];
         break;
     case SetAutoUpdate:
         text = update_vals[idx];
         break;
-    case SetVersion:
-        return;
     default:
         text = on_off[idx];
         break;
     }
+    snprintf(out, size, "%s", text);
+}
+
+static void setting_changed(VariableItem* item) {
+    App* app = variable_item_get_context(item);
+    uint8_t idx = variable_item_get_current_value_index(item);
+    uint8_t sel = variable_item_list_get_selected_item_index(app->settings_view);
+    if(sel == SetVersion) return;
+    char text[24];
+    setting_text(sel, idx, text, sizeof(text));
     variable_item_set_current_value_text(item, text);
     furi_mutex_acquire(app->mutex, FuriWaitForever);
+    UplinkSettings* s = &app->settings;
+    bool rf_config = false;
     switch(sel) {
     case SetVibro:
-        app->settings.vibro = idx;
+        s->vibro = idx;
         break;
     case SetCmdVibro:
-        app->settings.cmd_vibro = idx;
+        s->cmd_vibro = idx;
         break;
     case SetLed:
-        app->settings.led = idx;
+        s->led = idx;
         break;
     case SetBacklight:
-        app->settings.backlight = idx;
+        s->backlight = idx;
         break;
     case SetIndicators:
-        app->settings.indicators = idx;
+        s->indicators = idx;
         break;
     case SetFont:
-        app->settings.font = idx;
+        s->font = idx;
         break;
     case SetOrientation:
-        app->settings.orientation = idx;
+        // only the main view turns: the stock keyboard and this settings list are drawn
+        // for 128x64 and stay horizontal (applied when the main view is shown again)
+        s->orientation = idx;
         view_set_orientation(
             app->main_view, idx ? ViewOrientationVertical : ViewOrientationHorizontal);
-        view_set_orientation(
-            text_input_get_view(app->keyboard), idx ? ViewOrientationVertical : ViewOrientationHorizontal);
-        view_set_orientation(
-            variable_item_list_get_view(app->settings_view),
-            idx ? ViewOrientationVertical : ViewOrientationHorizontal);
         break;
     case SetTab0:
     case SetTab1:
     case SetTab2:
     case SetTab3:
-        app->settings.tabs[sel - SetTab0] = idx;
+    case SetTab4:
+        s->tabs[sel - SetTab0] = tab_screens[idx];
         rebuild_tabs(app);
+        rf_lifecycle(app); // the RF engine lives while the RF tab is enabled
+        break;
+    case SetRfBand:
+        s->rf_band = idx;
+        rf_config = true;
+        break;
+    case SetRfRssi:
+        s->rf_rssi = RF_RSSI_MIN + idx * RF_RSSI_STEP;
+        rf_config = true;
+        break;
+    case SetRfDwell:
+        s->rf_dwell_ms = rf_dwell_vals[idx];
+        rf_config = true;
+        break;
+    case SetRfCapture:
+        s->rf_capture_ms = rf_capture_vals[idx];
+        rf_config = true;
+        break;
+    case SetRfFeedback:
+        s->rf_feedback = idx;
+        rf_config = true;
+        break;
+    case SetRfKeep:
+        s->rf_keep = idx;
+        rf_config = true;
+        break;
+    case SetRfAutostart:
+        s->rf_autostart = idx;
+        break;
+    case SetRfSync:
+        s->rf_sync = idx;
         break;
     case SetAutoUpdate:
-        app->settings.auto_update = idx;
+        s->auto_update = idx;
         break;
     default:
         break;
     }
+    if(rf_config) rf_apply_config(app);
     furi_mutex_release(app->mutex);
 }
 
@@ -1494,33 +2110,50 @@ static void settings_enter(void* context, uint32_t index) {
     }
 }
 
-static void add_toggle(
-    App* app,
-    const char* label,
-    const char* const* vals,
-    int count,
-    uint8_t val) {
+static void add_row(App* app, const char* label, uint8_t row, uint8_t count, uint8_t val) {
     VariableItem* it =
         variable_item_list_add(app->settings_view, label, count, setting_changed, app);
     if(val >= count) val = 0;
+    char text[24];
+    setting_text(row, val, text, sizeof(text));
     variable_item_set_current_value_index(it, val);
-    variable_item_set_current_value_text(it, vals[val]);
+    variable_item_set_current_value_text(it, text);
 }
 
 static void build_settings(App* app) {
+    const UplinkSettings* s = &app->settings;
     variable_item_list_reset(app->settings_view);
-    add_toggle(app, "Vibration", on_off, 2, app->settings.vibro);
-    add_toggle(app, "Vibrate on cmd reply", on_off, 2, app->settings.cmd_vibro);
-    add_toggle(app, "LED alerts", on_off, 2, app->settings.led);
-    add_toggle(app, "Wake screen on alert", on_off, 2, app->settings.backlight);
-    add_toggle(app, "Indicators", ind_vals, 2, app->settings.indicators);
-    add_toggle(app, "Font", font_vals, 4, app->settings.font);
-    add_toggle(app, "Orientation", orientation_vals, 2, app->settings.orientation);
-    add_toggle(app, "Tab 1", tab_vals, 5, app->settings.tabs[0]);
-    add_toggle(app, "Tab 2", tab_vals, 5, app->settings.tabs[1]);
-    add_toggle(app, "Tab 3", tab_vals, 5, app->settings.tabs[2]);
-    add_toggle(app, "Tab 4", tab_vals, 5, app->settings.tabs[3]);
-    add_toggle(app, "Updates", update_vals, 2, app->settings.auto_update);
+    // rows must be added in the order of the Set* enum
+    add_row(app, "Vibration", SetVibro, 2, s->vibro);
+    add_row(app, "Vibrate on cmd reply", SetCmdVibro, 2, s->cmd_vibro);
+    add_row(app, "LED alerts", SetLed, 2, s->led);
+    add_row(app, "Wake screen on alert", SetBacklight, 2, s->backlight);
+    add_row(app, "Indicators", SetIndicators, 2, s->indicators);
+    add_row(app, "Font", SetFont, 4, s->font);
+    add_row(app, "Orientation", SetOrientation, 2, s->orientation);
+    static const char* const tab_names[TAB_SLOTS] = {"Tab 1", "Tab 2", "Tab 3", "Tab 4", "Tab 5"};
+    for(uint8_t i = 0; i < TAB_SLOTS; i++)
+        add_row(app, tab_names[i], SetTab0 + i, COUNT_OF(tab_vals), tab_choice(s->tabs[i]));
+    add_row(app, "RF band", SetRfBand, COUNT_OF(rf_band_vals), s->rf_band);
+    int rssi = (s->rf_rssi - RF_RSSI_MIN + RF_RSSI_STEP / 2) / RF_RSSI_STEP;
+    add_row(app, "RF trigger level", SetRfRssi, RF_RSSI_COUNT, (uint8_t)CLAMP(rssi, RF_RSSI_COUNT - 1, 0));
+    add_row(
+        app,
+        "RF hop time",
+        SetRfDwell,
+        COUNT_OF(rf_dwell_vals),
+        nearest_index(rf_dwell_vals, COUNT_OF(rf_dwell_vals), s->rf_dwell_ms));
+    add_row(
+        app,
+        "RF capture window",
+        SetRfCapture,
+        COUNT_OF(rf_capture_vals),
+        nearest_index(rf_capture_vals, COUNT_OF(rf_capture_vals), s->rf_capture_ms));
+    add_row(app, "RF vibrate on signal", SetRfFeedback, 2, s->rf_feedback);
+    add_row(app, "RF after import", SetRfKeep, COUNT_OF(rf_keep_vals), s->rf_keep);
+    add_row(app, "RF on at app start", SetRfAutostart, 2, s->rf_autostart);
+    add_row(app, "RF import by PC", SetRfSync, 2, s->rf_sync);
+    add_row(app, "Updates", SetAutoUpdate, 2, s->auto_update);
     // Version row: shows what is installed and what can be installed
     static char version_text[40];
     if(app->ota.available) {
@@ -1542,6 +2175,7 @@ static bool custom_event(void* context, uint32_t event) {
     App* app = context;
     bool restart = false;
     if(event == EvRx) {
+        app->rx_posted = false;
         drain_rx(app);
     } else if(event == EvTick) {
         furi_mutex_acquire(app->mutex, FuriWaitForever);
@@ -1559,7 +2193,16 @@ static bool custom_event(void* context, uint32_t event) {
             restart = true;
         }
         if(app->link && app->tick - app->last_rx_tick > LINK_TICKS) app->link = false;
+        rf_refresh_status(app);
         furi_mutex_release(app->mutex);
+    } else if(event == EvRf) {
+        app->rf_event_posted = false; // clear first: a change after this posts a new event
+        furi_mutex_acquire(app->mutex, FuriWaitForever);
+        rf_refresh_status(app);
+        furi_mutex_release(app->mutex);
+    } else if(event == EvRfTx) {
+        app->rf_tx_posted = false;
+        rf_drain_tx(app);
     }
     if(restart) {
         // the new .fap is on the SD card: exit and let the loader start it
@@ -1614,16 +2257,10 @@ int32_t uplink_app(void* p) {
     app->keyboard = text_input_alloc();
     text_input_set_result_callback(
         app->keyboard, keyboard_done, app, app->cmd.input, sizeof(app->cmd.input), false);
-    view_set_orientation(
-        text_input_get_view(app->keyboard),
-        app->settings.orientation ? ViewOrientationVertical : ViewOrientationHorizontal);
     view_dispatcher_add_view(app->views, ViewKeyboard, text_input_get_view(app->keyboard));
 
     app->settings_view = variable_item_list_alloc();
     build_settings(app);
-    view_set_orientation(
-        variable_item_list_get_view(app->settings_view),
-        app->settings.orientation ? ViewOrientationVertical : ViewOrientationHorizontal);
     view_dispatcher_add_view(
         app->views, ViewSettings, variable_item_list_get_view(app->settings_view));
 
@@ -1640,6 +2277,10 @@ int32_t uplink_app(void* p) {
         furi_hal_bt_start_advertising();
     }
 
+    // RF Hunter: its callbacks post to app->views, so it starts after the dispatcher exists
+    app->rf_tx = furi_stream_buffer_alloc(RF_TX_BUF, 1);
+    rf_lifecycle(app);
+
     app->timer = furi_timer_alloc(tick_callback, FuriTimerTypePeriodic, app);
     furi_timer_start(app->timer, furi_ms_to_ticks(250));
 
@@ -1648,6 +2289,12 @@ int32_t uplink_app(void* p) {
 
     furi_timer_stop(app->timer);
     furi_timer_free(app->timer);
+    app->rf_closing = true; // the dispatcher no longer runs: the engine must not post to it
+    if(app->rf) {
+        rf_engine_free(app->rf); // stops the receiver and releases the radio
+        app->rf = NULL;
+    }
+    furi_stream_buffer_free(app->rf_tx);
 
     bt_set_status_changed_callback(app->bt, NULL, NULL);
     bt_disconnect(app->bt);
