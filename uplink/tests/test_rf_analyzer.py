@@ -449,3 +449,28 @@ def test_analyzer_window_smoke(tmp_path):
         root.update()
     finally:
         root.destroy()
+
+
+def test_decoded_protocols_show_in_verdict_and_details():
+    from uplink import rf_decode
+    from uplink.rf_analyzer import decode_rows, verdict_label
+    keeloq = {"protocol": rf_decode.KEELOQ, "name": "KeeLoq", "bits": 66, "key": 0x1234, "info": "sn 0ABCDEF btn 2",
+              "frames": 2, "identical": 1, "te_us": 400, "rolling": True, "confidence": 90}
+    assert verdict_label(keeloq) == "KeeLoq 66b"
+    rows = dict(decode_rows(keeloq))
+    assert rows["WHAT"] == "KeeLoq 66-bit rolling code" and rows["CODE"] == "sn 0ABCDEF btn 2"
+    assert rows["KEY"] == "0x0000000000001234" and rows["FRAMES"] == "2 in this capture, all identical"
+    unknown = {"protocol": rf_decode.OOK, "name": "OOK", "bits": 25, "key": 0, "info": "te 420us 25sym x4 same",
+               "frames": 4, "identical": 3, "te_us": 420, "rolling": False, "confidence": 20}
+    assert verdict_label(unknown) == "fixed code x4"
+    assert decode_rows(unknown) == [("WHAT", "unknown OOK, te 420us 25sym x4 same")]
+    assert verdict_label({"protocol": rf_decode.NONE, "frames": 0}) == "carrier"
+    assert verdict_label(keeloq, "noise") == "noise"
+    # the project decodes records that carry no decode, and keeps the Flipper's when they do
+    project = AnalyzerProject()
+    event = _event(1, "2026-10-06T10:00:00Z")
+    first = project.decode(event)
+    assert first["name"] in ("OOK", "carrier") and project.decode(event) is first
+    event.rf_protocol, event.rf_bits, event.rf_key, event.rf_info = "Princeton", 24, "00000000001a2b3c", "sn 1A2B3 btn C"
+    event.event_id = "rf-other"
+    assert project.decode(event)["name"] == "Princeton" and project.decode(event)["key"] == 0x1A2B3C

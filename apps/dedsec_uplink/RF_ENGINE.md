@@ -11,6 +11,7 @@ transmits: no Sub-GHz TX, no NFC poller, listener or field-on call.
 | `rf_record.c/.h` | Record JSON (schema 1) and the coarse local signal shape |
 | `rf_store.c/.h` | SD journal, crash recovery, CRC-32 |
 | `rf_proto.c/.h` | `RL`/`RR`/`RA` request handler |
+| `rf_decode.c/.h` | protocol recognition of a burst (pure, ported line by line to `uplink/uplink/rf_decode.py`) |
 
 ## Threads
 
@@ -71,12 +72,32 @@ profile and ignores `band`.
   in-burst timings, or the time above threshold for a carrier without OOK edges. RSSI
   min/avg/max come from the samples taken during the burst. `modulation` is `"OOK"`
   (receiver demodulator).
+- **Decode:** before a burst is saved, `rf_decode()` runs over its timings: the common remote
+  protocols (Princeton/EV1527, CAME/HT12E, Nice FLO, Nice FloR-S, KeeLoq, Starline, Linear, Hormann,
+  GateTX, FAAC SLH, Holtek, Nexus-TH sensors) are tried as sequential decoders, the one with the most
+  frames wins; otherwise the burst is described generically (base pulse, symbols per frame, repeats
+  and whether they are identical) or as a `carrier` (fewer than 8 edges). The record carries
+  `rf_protocol`, `rf_bits`, `rf_key` (16 hex digits, first received bit most significant),
+  `rf_info` (the human line: serial and button, the key, a sensor reading), `rf_frames`,
+  `rf_identical`, `rf_te_us`, `rf_rolling`, `rf_confidence` and `first_level` (the level of the first
+  timing, so the PC can decode too). The status carries `last_label` ("KeeLoq 66b") and `last_info`.
+  Timing constants follow the protocols' published frames; the decoders are this project's own code.
 - **Families:** a coarse shape key (frequency + log2 pulse-width histogram bands holding at
   least 15 % of the timings + dominant band) is the `fingerprint_id`; `families` counts distinct
   keys (last 64 remembered).
-- **Follow:** every recorded non-Follow event becomes the profile (frequency + histogram). In
-  Follow mode, bursts on another frequency or with similarity below 0.70
-  (0.8 × histogram overlap + 0.2 × timing-count ratio) are ignored. A match is recorded with
+- **Follow:** every recorded non-Follow event becomes the profile (frequency + histogram + decode).
+  In Follow mode a burst on another frequency is ignored; when both the profile and the burst decoded
+  to a named protocol the match is the transmitter identity (`rf_decode_identity`: the KeeLoq or
+  Starline serial, a fixed remote's key, a sensor's id and channel) and nothing else; when only one of
+  them decoded they do not match; otherwise the shape similarity must reach 0.70
+  (0.8 × histogram overlap + 0.2 × timing-count ratio).
+- **Geiger counter (Follow):** every 5 ms RSSI sample updates `live_rssi_dbm`, a peak hold
+  (`peak_rssi_dbm`, 1 s then 1 dB per 100 ms down) and `floor_dbm`, and sets a click rate of
+  0.6 + 40 × x² clicks/s where x is the excess over the noise floor beyond 3 dB, clamped at 45 dB.
+  With `config.geiger` the worker acquires the speaker (`furi_hal_speaker_acquire`, released on any
+  stop, mode change or exit), draws a random number per tick and plays one 5 ms tone (~2.6 kHz,
+  volume 0.8) with probability rate × 5 ms: Poisson clicks, from a slow background tick to a crackle.
+  `geiger_rate` and `geiger_sound` are published for the screen. A match is recorded with
   `follow_profile_id` and `follow_similarity` and gives the double pulse. Without a profile,
   Follow records like Capture and the first event becomes the profile.
 - **NFC:** a field event starts at field-on and ends after 1 s without a field (merges a
@@ -160,6 +181,9 @@ production C files:
   power cuts during record writes, marker rewrites and keep-moves, write/sync/remove failures,
   quarantine, low space, the 512-copy cap.
 - Records (`rf_record.c`) from edge-case inputs: `json.loads`, UTC/epoch agreement, timing cap.
+- The decoder (`rf_decode.c`, `uplink/tests/test_rf_decode.py`): synthesised bursts of every protocol,
+  with 7 % timing jitter and both level polarities, decode to the right name, bits and fields in the
+  compiled C and in the Python port, and the two agree field by field.
 - Protocol (`rf_proto.c`): the full `RL`/`RR`/`RA` sync loop with pipelined reads, malformed
   lines, mismatching ACKs and repeated ACKs before and after a restart.
 - The whole engine (`rf_engine.c` + `rf_capture.c`) in a deterministic fake world: scripted
@@ -167,7 +191,9 @@ production C files:
   on every call order the firmware would `furi_check()` or deadlock on (tuning during RX,
   RX without preset, stop without RX, sleep during RX, CC1101 use while NFC holds SPI bus R,
   HAL calls outside the worker). Scenarios: Scout hop timing, burst segmentation and
-  per-event pulse counts, threshold, noise, NFC merge and busy retry, Follow match/ignore,
+  per-event pulse counts, threshold, noise, NFC merge and busy retry, Follow match/ignore, the
+  Geiger counter (a quiet channel ticks slowly, a strong carrier crackles, muting releases the speaker,
+  leaving Follow releases it; the fake speaker aborts on a start without acquire or a release mid-tone),
   storage full, back-to-back capture windows (no pre-trigger leak), the gap rule, rapid
   mode/run/config changes and recording at exit. Mutating the tune order, the preset, the
   sleep, the pre-trigger reset, the gap rule or adding a HAL call to a setter makes it fail.

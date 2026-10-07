@@ -8,6 +8,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "rf_decode.h"
+
 #define RF_SHAPE_BINS 12U
 
 typedef struct {
@@ -35,8 +37,9 @@ typedef struct {
     float rssi_max_dbm;
     uint32_t pulse_count; /* timings observed in this event */
     uint32_t last_duration_us;
-    const uint32_t* timings; /* packed rf_capture timings, level bit ignored */
+    const uint32_t* timings; /* packed rf_capture timings; the level of the first is written */
     uint32_t timing_count;
+    const RfDecode* decode; /* what the burst is (rf_decode), NULL = not decoded */
 } RfSubGhzRecord;
 
 typedef struct {

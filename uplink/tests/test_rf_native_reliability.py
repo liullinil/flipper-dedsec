@@ -32,7 +32,11 @@ REQUIRED_FIELDS = {
 }
 SUBGHZ_FIELDS = {
     "follow_profile_id", "follow_similarity", "rssi_min_dbm", "rssi_avg_dbm", "rssi_max_dbm",
-    "pulse_count", "last_duration_us", "pulse_timings_us",
+    "pulse_count", "last_duration_us", "pulse_timings_us", "first_level",
+}
+DECODE_FIELDS = {  # written by the engine (rf_decode); the record harness writes records undecoded
+    "rf_protocol", "rf_bits", "rf_key", "rf_info", "rf_frames", "rf_identical", "rf_te_us", "rf_rolling",
+    "rf_confidence",
 }
 NFC_FIELDS = {
     "nfc_technology", "nfc_protocol", "nfc_identifier", "nfc_field_duration_ms",
@@ -90,7 +94,7 @@ def _build(tmp_path_factory, name, fixture_files, source_files):
 @pytest.fixture(scope="module")
 def harness(tmp_path_factory):
     return _build(tmp_path_factory, "rf_harness", ["rf_harness.c", "storage_fake.c"],
-                  ["rf_store.c", "rf_record.c", "rf_proto.c"])
+                  ["rf_store.c", "rf_record.c", "rf_proto.c", "rf_decode.c"])
 
 
 @pytest.fixture(scope="module")
@@ -99,7 +103,8 @@ def engine_harness(tmp_path_factory):
     # function, so this only builds while the engine stays passive.
     return _build(tmp_path_factory, "rf_engine_harness",
                   ["engine_harness.c", "engine_fake.c", "storage_fake.c"],
-                  ["rf_engine.c", "rf_capture.c", "rf_store.c", "rf_record.c", "rf_proto.c"])
+                  ["rf_engine.c", "rf_capture.c", "rf_store.c", "rf_record.c", "rf_proto.c",
+                   "rf_decode.c"])
 
 
 def test_native_rf_journal_recovers_from_power_cuts_and_faults(harness):
@@ -124,6 +129,10 @@ def _check_record(text, written):
         assert data["modulation"] == "OOK"
         assert len(data["pulse_timings_us"]) == written
         assert data["pulse_count"] >= written
+        assert data["first_level"] in (-1, 0, 1)
+        if "rf_protocol" in data:
+            assert DECODE_FIELDS <= data.keys()
+            assert data["rf_protocol"] in ("OOK", "carrier") and 0 <= data["rf_confidence"] <= 100
         assert 0.0 <= data["follow_similarity"] <= 1.0
         assert data["rssi_min_dbm"] <= data["rssi_avg_dbm"] <= data["rssi_max_dbm"]
     else:
@@ -302,8 +311,8 @@ def test_native_rf_engine_scenarios_keep_the_hal_contract(engine_harness):
             data = _check_record(text, len(json.loads(text).get("pulse_timings_us", [])))
             records.setdefault(line.split()[1], []).append(data)
     assert {name: len(found) for name, found in records.items()} == {
-        "bursts": 2, "noise": 1, "noisy_floor": 1, "nfc": 2, "nfc_busy": 1, "follow": 3, "storage_full": 1,
-        "gaps": 5, "churn": 1}
+        "bursts": 2, "noise": 1, "noisy_floor": 1, "nfc": 2, "nfc_busy": 1, "follow": 3, "geiger": 6,
+        "storage_full": 1, "gaps": 5, "churn": 1}
     for found in records.values():
         ids = [data["event_id"] for data in found]
         assert len(set(ids)) == len(ids)

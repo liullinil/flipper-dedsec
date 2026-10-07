@@ -21,6 +21,7 @@ Target: Flipper Zero on Unleashed `unlshd-093c` (API 88.9), Windows 10/11 with B
 
 - **SYS** — CPU, RAM, network, disk. *Bars* mode autoscales network and disk to a rolling maximum
   (there is no fixed ceiling); *Text* mode shows exact up/down and read/write rates. CPU history graph.
+  OK here is **Blackout**: the PC's own DedSec lock screen (see below).
 - **CDX** — Codex sessions (`codex --profile router` in a terminal and the Codex desktop app). Sub-agents
   appear as `- name nickname` rows under their root; the root shows `done/total` sub-agents.
 - **CLD** — Claude Code sessions (CLI and the Code tab of Claude Desktop); progress from the todo list.
@@ -43,7 +44,7 @@ The header shows the tabs (a blinking `!` marks a tab that needs you), three sig
 |---|---|
 | ◀ ▶ | switch tabs; ▶ on the last tab opens the settings |
 | ▲ ▼ | select a session · scroll the details · scroll the console |
-| OK | open / close session details; on CMD: type a command, or input for the running one; on RF: start / stop |
+| OK | open / close session details; on CMD: type a command, or input for the running one; on RF: start / stop; on SYS: Blackout the PC (OK again to confirm, or restore it) |
 | ▲ ▼ on RF | change the RF mode |
 | OK (hold) | settings |
 | Back | back / exit; on CMD while a command runs: cancel it (Ctrl+C) |
@@ -51,6 +52,25 @@ The header shows the tabs (a blinking `!` marks a tab that needs you), three sig
 When a session starts waiting for you the Flipper vibrates, blinks the LED and shows
 `!! APPROVAL NEEDED !!` (a question or approval) or `>> YOUR TURN <<` (the agent finished its turn).
 OK on the banner opens that session.
+
+## Blackout
+
+![Blackout](../docs/uplink_blackout.png)
+
+OK on the SYS tab asks `BLACKOUT THE PC?`; OK again and the companion minimises every window, mutes the
+sound and covers every monitor with a DedSec lock screen: a glitching wordmark, code rain, the profiler
+reticle or a scanned skyline (picked at random each time), the clock, a ticker of taglines, a **PIN**
+field and a **POWER OFF** button (click it twice). The PIN unlocks it; so does OK on the Flipper's SYS tab,
+which now shows `>> BLACKOUT <<` — the Flipper is the key. On unlock the windows come back where they were
+and the sound is unmuted (if it was on). The Windows key and Alt+Tab / Alt+F4 are swallowed while the
+screen is up; Ctrl+Alt+Del still works, this is a curtain, not a Windows credential provider.
+
+**Auto Blackout** (tray panel, off by default): the PC blacks out by itself when the Flipper's link is
+lost for 45 s, which is what happens when you walk away with the Flipper in your pocket. It arms ten
+minutes after the companion starts (the panel shows `ARMS IN n MIN`), so after a reboot there is time
+to turn it off; closing the Uplink app on the Flipper on purpose, or pausing the uplink, never triggers
+it. The first use asks for a PIN (4-12 digits, `SET BLACKOUT PIN` in the panel changes it later); it is
+stored as a salted PBKDF2 hash in `config.json`. `BLACKOUT NOW` in the panel locks straight away.
 
 ## Vertical mode and font sizes
 
@@ -87,6 +107,7 @@ Saved to `SD/apps_data/dedsec_uplink/.uplink.settings`.
 | RF hop time | 100 … 2000 ms on each frequency in Scout |
 | RF capture window | 250 … 2000 ms, the longest single capture |
 | RF vibrate on signal | on / off: a short pulse on a signal (at most once a second), and a short cyan LED blink every 4 s while there are captures you have not looked at (opening the RF tab stops it) |
+| RF Geiger clicks | on / off: the speaker clicks of the Follow screen's Geiger counter (the meter stays either way) |
 | RF after import | Delete / Keep — what happens to a record on the SD card once the PC has it |
 | RF on at app start | on / off |
 | RF import by PC | on / off |
@@ -133,13 +154,24 @@ A passive RF logger in the **RF** tab. The Flipper only listens: it never transm
 |---|---|
 | **Scout** | hops over 315 / 433.92 / 868.35 MHz (or the chosen band) and records every burst above the trigger level |
 | **Capture** | stays on one frequency (the last event's) and records every burst |
-| **Follow** | stays on the last event's frequency, compares each burst with it and vibrates twice on a match (shows the match %) |
+| **Follow** | stays on the last event's frequency, matches each burst against it (same decoded transmitter, or the same pulse shape) and vibrates twice on a match; the screen becomes a **Geiger counter**: the live RSSI big, the peak and the noise floor, a -100..-30 dBm bar, and speaker clicks that quicken from a slow background tick to a crackle as you get closer to the source (*RF Geiger clicks* turns the sound off; the meter stays) |
 | **NFC** | the NFC chip's external-field detector: logs when a reader's 13.56 MHz field appears and for how long (no polling, no UID) |
 
 Each event is one JSON record on the SD card (`apps_data/dedsec_uplink/rf/events/`) with the exact time,
 frequency, RSSI min/avg/max, duration and pulse timings. The tab counts events and distinct signal
 families, shows what still waits for the PC, free space and the last event. It works without the PC: start
 it and put the Flipper in a pocket.
+
+**What was that?** Every capture is decoded on the Flipper before it is saved, from the pulse timings
+alone, and the tab says so: `12:41 KeeLoq 66b -63dB` with `sn 0ABCDEF btn 2` under it, `Princeton 24b` with
+`sn 1A2B3 btn C`, `Nexus-TH` with `+23.4C 45% ch1`. Recognised: Princeton / PT2262 / EV1527 (cheap remotes,
+doorbells, alarm pagers), CAME and Holtek HT12E, Nice FLO, Nice FloR-S, KeeLoq (DoorHan, AN-Motors, car
+alarms and garage doors: the serial and the button are in the clear, the hopping code changes every press),
+Starline, Linear, Hormann HSM, GateTX, FAAC SLH, Holtek 40-bit and Nexus / Rubicson weather sensors
+(temperature, humidity, channel). Anything else is described as what it is: `OOK 25sym` with
+`te 420us 25sym x4 same` (base pulse, symbols per frame, how often the frame repeated and whether every
+copy was identical, i.e. a fixed code), or `carrier` when there was no on/off keying at all (FSK key
+fobs, TPMS, LoRa). Nothing is replayed: this is reading, not talking.
 
 Only real transmissions become events. The Flipper learns the noise floor of each frequency and triggers at
 least 8 dB above it (next to a PC the 315 MHz floor can sit at −77 dBm, right at the default trigger level),
@@ -157,10 +189,13 @@ imported twice.
 - **ACTIVITY**: time across, one lane per band (315 / 433 / 868, NFC), one dot per capture — bigger is
   longer, the colour is the strength, a hollow dot is noise; a click selects it;
 - **CAPTURES**: every capture in local time with frequency, strength, length, recorded edges, its group
-  (captures that look alike: #1 is the most frequent) and a verdict — *signal*, *noise* or *NFC field*;
-  search, band chips and *hide noise* narrow the list;
-- for the selected capture: the details with a plain explanation of the verdict, the **recorded pulses**
-  drawn as a pulse train, the captures it **looks like**, and a note.
+  (captures that look alike: #1 is the most frequent) and a verdict — the decoded protocol (`KeeLoq 66b`,
+  `Princeton 24b`, `Nexus-TH`), *fixed code x4* / *signal* for unknown bursts, *carrier*, *noise* or
+  *NFC field*; search, band chips and *hide noise* narrow the list;
+- for the selected capture: the details — what it is (`KeeLoq 66-bit rolling code`, `sn 0ABCDEF btn 2`,
+  the key, how many frames the capture holds and whether they were identical, the base pulse) with a plain
+  explanation of what such a transmitter is, the **recorded pulses** drawn as a pulse train, the captures it
+  **looks like**, and a note. Records made by older app versions are decoded by the companion itself.
 
 Two buttons:
 
@@ -192,8 +227,9 @@ A hooded-skull icon appears in the tray (Windows may hide it under the `^` arrow
 The ring shows the link: green connected, yellow searching, grey paused, red error.
 
 A click on the icon (left or right) opens the DedSec panel: link and session status, RF records waiting on
-the Flipper, versions, update progress, and *RF Hunter analyzer*, *Pause uplink*, *Quit*. `> JOIN US_`
-opens this repository.
+the Flipper, versions, update progress, and *RF Hunter analyzer*, *Blackout now*, *Auto Blackout* (off /
+arms in n min / armed), *Set / change Blackout PIN*, *Pause uplink*, *Quit*. `> JOIN US_` opens this
+repository.
 
 ![Tray panel](../docs/companion_tray.png)
 
@@ -205,7 +241,8 @@ There is nothing to set up:
   downloads its new version, swaps itself and restarts; a Flipper app older than the release gets the new
   `.fap` over Bluetooth while it is connected (a failed attempt is retried after 10 minutes).
 - The remote shell is on and uses `cmd`; `%LOCALAPPDATA%\DedSecUplink\config.json` can switch it to
-  `"shell": "powershell"` or turn it off with `"cmd_enabled": false`.
+  `"shell": "powershell"` or turn it off with `"cmd_enabled": false`. The same file keeps the Blackout
+  settings (`blackout_auto`, the hashed `blackout_pin`).
 
 Command line (`.exe` or `.pyw`): `--console` (log to the console), `--dump` (print one data frame, no BLE),
 `--install-autostart` / `--uninstall-autostart`, `--install-claude-hooks` / `--remove-claude-hooks`.
@@ -269,6 +306,7 @@ N|tag|size                               a newer release exists
 UB|tag|size|crc32   UD|offset|base64   UE|tag     update transfer
 Z|utc|tz_minutes                         PC clock (the Flipper derives its RTC offset for RF times)
 RL|cursor   RR|id|offset   RA|id|size|crc32   RF import: list, read 120 bytes, acknowledge
+BO|active|auto                           Blackout: the lock screen is up (1/0); auto 0 off, 1 arming, 2 armed
 B                                        the PC is going away
 ```
 
@@ -280,6 +318,8 @@ V|version                                app version (on connect and every 30 s)
 U|tag   UA|written                       request an update / acknowledge bytes written
 R|pending|stored|free_kb|state|errors    RF journal status
 RI|next|id|size|crc32   RE   RD|id|offset|base64   RK|id   RX|code|text   RF import replies
+BO|1   BO|0                              Blackout the PC / restore it (SYS tab)
+BB                                       the app is closing on purpose (never an auto Blackout)
 ```
 
 `state`: `W` working, `A` needs an answer or approval, `I` your turn, `S` idle.

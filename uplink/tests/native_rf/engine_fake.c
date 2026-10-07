@@ -5,6 +5,7 @@
 #include <furi_hal_nfc.h>
 #include <furi_hal_power.h>
 #include <furi_hal_rtc.h>
+#include <furi_hal_speaker.h>
 #include <furi_hal_subghz.h>
 #include <notification/notification_messages.h>
 #include <subghz/devices/cc1101_configs.h>
@@ -50,6 +51,9 @@ static WorldEvent steps[MAX_STEPS];
 static uint32_t step_count;
 static uint32_t end_ms;
 static bool in_worker, in_script;
+static bool speaker_mine, speaker_on;
+static uint32_t speaker_clicks, speaker_acquires;
+static uint32_t random_state = 12345;
 static uint32_t queue_drops;
 
 static RadioState radio;
@@ -69,6 +73,9 @@ static uint32_t feedback_counts[4];
 static uint32_t red_blinks;
 
 void world_reset(void) {
+    speaker_mine = speaker_on = false;
+    speaker_clicks = speaker_acquires = 0;
+    random_state = 12345;
     now_ms = 0;
     tx_count = field_count = step_count = 0;
     noise.start_ms = noise.end_ms = 0;
@@ -400,6 +407,51 @@ void notification_message(NotificationApp* app, const NotificationSequence* sequ
     }
     if(red) red_blinks++;
     if(vibro < 4) feedback_counts[vibro]++;
+}
+
+/* ------------------------------------------------------------------ speaker (Geiger clicks) */
+
+bool furi_hal_speaker_acquire(uint32_t timeout) {
+    (void)timeout;
+    if(!in_worker || in_script) WORLD_FAIL("speaker acquire outside the engine thread");
+    if(speaker_mine) WORLD_FAIL("speaker acquired twice");
+    speaker_mine = true;
+    speaker_acquires++;
+    return true;
+}
+
+void furi_hal_speaker_release(void) {
+    if(!in_worker || in_script) WORLD_FAIL("speaker release outside the engine thread");
+    if(!speaker_mine) WORLD_FAIL("speaker released without acquire");
+    if(speaker_on) WORLD_FAIL("speaker released while a tone plays");
+    speaker_mine = false;
+}
+
+bool furi_hal_speaker_is_mine(void) { return speaker_mine; }
+
+void furi_hal_speaker_start(float frequency, float volume) {
+    if(!in_worker || in_script) WORLD_FAIL("speaker start outside the engine thread");
+    if(!speaker_mine) WORLD_FAIL("speaker start without acquire");
+    if(frequency < 100.0f || frequency > 20000.0f || volume <= 0.0f || volume > 1.0f)
+        WORLD_FAIL("speaker tone out of range");
+    speaker_on = true;
+    speaker_clicks++;
+}
+
+void furi_hal_speaker_stop(void) {
+    if(!in_worker || in_script) WORLD_FAIL("speaker stop outside the engine thread");
+    if(!speaker_mine) WORLD_FAIL("speaker stop without acquire");
+    speaker_on = false;
+}
+
+uint32_t world_clicks(void) { return speaker_clicks; }
+uint32_t world_speaker_acquires(void) { return speaker_acquires; }
+bool world_speaker_released(void) { return !speaker_mine && !speaker_on; }
+
+/* deterministic "random" for the click draws */
+uint32_t furi_hal_random_get(void) {
+    random_state = random_state * 1664525U + 1013904223U;
+    return random_state >> 8;
 }
 
 /* ------------------------------------------------------------------ HAL */

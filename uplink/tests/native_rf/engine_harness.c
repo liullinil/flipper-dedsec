@@ -88,6 +88,7 @@ static void finish(void) {
     engine = NULL;
     CHECK(world_radio_asleep());
     CHECK(world_nfc_released());
+    CHECK(world_speaker_released());
     CHECK(fake_open_handles() == 0);
     record_count = 0;
     File* dir = storage_file_alloc(&fake_storage);
@@ -343,6 +344,74 @@ static void scenario_nfc_busy(void) {
     CHECK(record_count == 1);
 }
 
+/* ------------------------------------------------------------------ 5b: Geiger counter */
+
+static uint32_t clicks_quiet, clicks_loud, acquires_loud;
+
+static void geiger_quiet(void) {
+    RfStatus s = status();
+    CHECK(s.mode == RfModeFollow && s.running && s.geiger_sound);
+    CHECK(s.geiger_rate <= 2 && s.live_rssi_dbm < -80 && s.floor_dbm < -80);
+    clicks_quiet = world_clicks();
+}
+
+static void geiger_loud(void) {
+    RfStatus s = status();
+    CHECK(s.geiger_sound && s.geiger_rate >= 25);
+    CHECK(s.live_rssi_dbm == -45 && s.peak_rssi_dbm == -45);
+    clicks_loud = world_clicks();
+    acquires_loud = world_speaker_acquires();
+}
+
+static uint32_t clicks_at_mute;
+
+static void geiger_mute(void) {
+    RfConfig config = config_for(RfBand433);
+    config.geiger = false;
+    rf_engine_configure(engine, &config);
+    clicks_at_mute = world_clicks();
+}
+
+static void geiger_muted(void) {
+    RfStatus s = status();
+    CHECK(!s.geiger_sound && s.geiger_rate >= 25); /* the meter keeps going, the speaker is free */
+    CHECK(world_speaker_released());
+    CHECK(world_clicks() <= clicks_at_mute + 1); /* at most the tick that applied the change */
+    CHECK(acquires_loud == 1);
+}
+
+static void geiger_unmute_scout(void) {
+    RfConfig config = config_for(RfBand433);
+    rf_engine_configure(engine, &config);
+    rf_engine_set_mode(engine, RfModeScout);
+}
+
+static void geiger_scout(void) {
+    RfStatus s = status();
+    CHECK(s.mode == RfModeScout && !s.geiger_sound && s.geiger_rate == 0);
+    CHECK(world_speaker_released());
+}
+
+static void scenario_geiger(void) {
+    begin("geiger", RfBand433, RfModeFollow, true);
+    RfConfig config = config_for(RfBand433);
+    config.geiger = true;
+    rf_engine_configure(engine, &config);
+    /* a carrier that stays on: the Geiger counter crackles while the capture window runs */
+    world_add_tx(1000, 6000, F433, -45.0f, 100000, 1);
+    world_at(900, geiger_quiet);
+    world_at(3000, geiger_loud);
+    world_at(3001, geiger_mute);
+    world_at(3600, geiger_muted);
+    world_at(3601, geiger_unmute_scout);
+    world_at(4200, geiger_scout);
+    world_end_at(6500);
+    finish();
+    /* a quiet channel ticks slowly (0.6/s background over 0.9 s), a strong carrier fast */
+    CHECK(clicks_quiet <= 3);
+    CHECK(clicks_loud - clicks_quiet >= 30);
+}
+
 /* ------------------------------------------------------------------ 6: Follow */
 
 static void follow_on(void) { rf_engine_set_mode(engine, RfModeFollow); }
@@ -491,6 +560,7 @@ int main(void) {
     scenario_nfc();
     scenario_nfc_busy();
     scenario_follow();
+    scenario_geiger();
     scenario_storage_full();
     scenario_gaps();
     scenario_churn();

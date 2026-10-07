@@ -28,6 +28,7 @@ void uplink_settings_default(UplinkSettings* s) {
     s->rf_dwell_ms = 250;
     s->rf_capture_ms = 1000;
     s->rf_feedback = 1;
+    s->rf_geiger = 1;
     s->rf_sync = 1;
 }
 void uplink_settings_load(UplinkSettings* s) {
@@ -239,6 +240,12 @@ static void render_all(App* base, int orientation, int font) {
     {
         app->tab_index = 0;
         render(app, "sys_bars");
+        app->blackout_ask = app->tick + 10;
+        render(app, "sys_blackout_ask");
+        app->blackout_ask = 0;
+        app->blackout = 1;
+        render(app, "sys_blackout");
+        app->blackout = 0;
         app->settings.indicators = IndicatorsText;
         render(app, "sys_text");
         app->settings.indicators = IndicatorsBars;
@@ -292,6 +299,30 @@ static void render_all(App* base, int orientation, int font) {
         g_rf_status.last_similarity = 87;
         app->rf_status = g_rf_status;
         render(app, "rf_follow");
+        // the Geiger counter of Follow mode, following a decoded remote
+        snprintf(g_rf_status.last_label, sizeof(g_rf_status.last_label), "KeeLoq 66b");
+        snprintf(g_rf_status.last_info, sizeof(g_rf_status.last_info), "sn 0ABCDEF btn 2");
+        snprintf(g_rf_status.follow_label, sizeof(g_rf_status.follow_label), "KeeLoq 66b");
+        g_rf_status.last_rolling = true;
+        g_rf_status.live_rssi_dbm = -63;
+        g_rf_status.peak_rssi_dbm = -51;
+        g_rf_status.floor_dbm = -92;
+        g_rf_status.geiger_rate = 9;
+        g_rf_status.geiger_sound = true;
+        app->rf_status = g_rf_status;
+        render(app, "rf_geiger");
+        // Scout again, with the last event decoded
+        g_rf_status.mode = RfModeScout;
+        g_rf_status.follow_valid = false;
+        g_rf_status.last_similarity = 0;
+        g_rf_status.geiger_sound = false;
+        snprintf(g_rf_status.last_label, sizeof(g_rf_status.last_label), "Princeton 24b");
+        snprintf(g_rf_status.last_info, sizeof(g_rf_status.last_info), "sn 1A2B3 btn C");
+        g_rf_status.last_rolling = false;
+        app->rf_status = g_rf_status;
+        render(app, "rf_decoded");
+        g_rf_status.last_label[0] = 0;
+        g_rf_status.last_info[0] = 0;
         g_rf_status.mode = RfModeNfc;
         g_rf_status.frequency_hz = 0;
         g_rf_status.nfc_field = true;

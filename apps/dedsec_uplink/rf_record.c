@@ -72,6 +72,27 @@ size_t rf_record_subghz(
     float similarity = record->follow_similarity;
     if(!(similarity >= 0.0f)) similarity = 0.0f;
     if(similarity > 1.0f) similarity = 1.0f;
+    /* the decode: protocol name, bits, key, the human line, repeats (rf_decode.h) */
+    char decoded[256] = "";
+    if(record->decode && record->decode->name[0]) {
+        const RfDecode* d = record->decode;
+        snprintf(
+            decoded,
+            sizeof(decoded),
+            "\"rf_protocol\":\"%s\",\"rf_bits\":%u,\"rf_key\":\"%08lx%08lx\",\"rf_info\":\"%s\","
+            "\"rf_frames\":%u,\"rf_identical\":%u,\"rf_te_us\":%lu,\"rf_rolling\":%s,"
+            "\"rf_confidence\":%u,",
+            d->name,
+            d->bits,
+            (unsigned long)(d->key >> 32),
+            (unsigned long)(d->key & 0xFFFFFFFFUL),
+            d->info,
+            d->frames,
+            d->identical,
+            (unsigned long)d->te_us,
+            d->rolling ? "true" : "false",
+            d->confidence);
+    }
     int head = snprintf(
         out,
         capacity,
@@ -83,7 +104,7 @@ size_t rf_record_subghz(
         "\"fingerprint_id\":\"local-%08lx\",\"family_id\":null,\"classification\":\"unknown\","
         "\"classification_confidence\":0.0,\"follow_profile_id\":\"%s\",\"follow_similarity\":%.3f,"
         "\"rssi_min_dbm\":%.1f,\"rssi_avg_dbm\":%.1f,\"rssi_max_dbm\":%.1f,\"pulse_count\":%lu,"
-        "\"last_duration_us\":%lu,\"pulse_timings_us\":[",
+        "\"last_duration_us\":%lu,%s\"first_level\":%d,\"pulse_timings_us\":[",
         c->event_id,
         c->device_id,
         c->session_id,
@@ -104,7 +125,9 @@ size_t rf_record_subghz(
         (double)record->rssi_avg_dbm,
         (double)record->rssi_max_dbm,
         (unsigned long)record->pulse_count,
-        (unsigned long)record->last_duration_us);
+        (unsigned long)record->last_duration_us,
+        decoded,
+        record->timings && record->timing_count ? (rf_timing_level(record->timings[0]) ? 1 : 0) : -1);
     const size_t suffix_length = sizeof(rf_record_suffix) - 1U;
     if(head <= 0 || (size_t)head + suffix_length >= capacity) return 0;
     size_t used = (size_t)head;

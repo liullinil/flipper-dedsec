@@ -31,6 +31,7 @@
 #include <furi_hal_power.h>
 #include <furi_hal_random.h>
 #include <furi_hal_rtc.h>
+#include <furi_hal_speaker.h>
 #include <furi_hal_subghz.h>
 #include <datetime/datetime.h>
 #include <notification/notification_messages.h>
@@ -72,6 +73,15 @@
 #define RF_STORE_IDLE_MS     3000U
 #define RF_FAMILY_SLOTS      64U
 #define RF_FOLLOW_MATCH      0.70f
+/* Geiger counter (Follow): clicks per second from the live RSSI above the noise floor. */
+#define RF_GEIGER_BACKGROUND 0.6f /* clicks/s on a quiet channel */
+#define RF_GEIGER_MAX_RATE   40.0f /* clicks/s at RF_GEIGER_SPAN_DB above the floor */
+#define RF_GEIGER_START_DB   3.0f /* excess over the floor where the rate starts rising */
+#define RF_GEIGER_SPAN_DB    45.0f
+#define RF_GEIGER_CLICK_HZ   2600.0f
+#define RF_GEIGER_VOLUME     0.8f
+#define RF_PEAK_HOLD_MS      1000U
+#define RF_PEAK_DECAY_MS     100U
 #define RF_NFC_FINGERPRINT   0x4e464300UL
 #define RF_NFC_FREQUENCY_HZ  13560000UL
 #define RF_FREQ_315          0U
@@ -167,6 +177,17 @@ struct RfEngine {
     uint32_t follow_frequency;
     uint32_t follow_fingerprint;
     RfShape follow_shape;
+    uint8_t follow_protocol; /* RfProtoId of the profile (RfProtoOok: shape only) */
+    uint64_t follow_identity; /* rf_decode_identity of the profile, 0 = none */
+    char follow_label[20];
+
+    /* Geiger counter and live readings */
+    float peak_rssi;
+    uint32_t peak_tick;
+    uint32_t peak_decay_tick;
+    float geiger_rate;
+    bool speaker_held;
+    bool click_on;
 
     uint32_t families[RF_FAMILY_SLOTS];
     uint8_t family_used;
@@ -187,6 +208,9 @@ struct RfEngine {
     int16_t last_rssi_dbm;
     uint32_t last_duration;
     uint8_t last_similarity;
+    char last_label[20];
+    char last_info[RF_DECODE_INFO_MAX];
+    bool last_rolling;
 
     uint32_t feedback_tick;
     uint32_t error_tick;
@@ -270,6 +294,7 @@ static void rf_config_defaults(RfConfig* config) {
     config->capture_ms = 1000;
     config->silence_us = 8000;
     config->feedback = true;
+    config->geiger = true;
     config->keep_uploaded = false;
     config->tz_offset_minutes = 0;
 }
@@ -535,12 +560,26 @@ static void rf_capture_close(RfEngine* engine) {
     RfShape shape;
     rf_shape_compute(&shape, engine->timings, engine->timing_count);
     uint32_t fingerprint = rf_shape_fingerprint(&shape, frequency);
+    RfDecode decode;
+    rf_decode(engine->timings, engine->timing_count, &decode);
+    uint64_t identity = rf_decode_identity(&decode);
+    bool named = decode.protocol != RfProtoNone && decode.protocol != RfProtoOok;
     bool following = engine->mode == RfModeFollow && engine->follow_valid;
     float similarity = 0.0f;
     if(following) {
-        similarity = frequency == engine->follow_frequency ?
-                         rf_shape_similarity(&shape, &engine->follow_shape) :
-                         0.0f;
+        if(frequency != engine->follow_frequency) {
+            similarity = 0.0f;
+        } else if(named && engine->follow_identity) {
+            /* both sides decoded: the same transmitter or not, no shape guessing */
+            similarity = (decode.protocol == engine->follow_protocol &&
+                          identity == engine->follow_identity) ?
+                             1.0f :
+                             0.0f;
+        } else if(named != (engine->follow_protocol != RfProtoOok)) {
+            similarity = 0.0f; /* one side is a known protocol, the other is not */
+        } else {
+            similarity = rf_shape_similarity(&shape, &engine->follow_shape);
+        }
         if(similarity < RF_FOLLOW_MATCH) {
             /* Unrelated activity: Follow ignores it. */
             rf_capture_reset(engine);
@@ -589,6 +628,7 @@ static void rf_capture_close(RfEngine* engine) {
         .last_duration_us = engine->last_timing_us,
         .timings = engine->timings,
         .timing_count = engine->timing_count,
+        .decode = &decode,
     };
     size_t length = rf_record_subghz(engine->record, RF_RECORD_SIZE, &record, NULL);
     RfStoreResult result =
@@ -604,14 +644,20 @@ static void rf_capture_close(RfEngine* engine) {
         engine->last_similarity =
             following ? (uint8_t)(similarity * 100.0f + 0.5f) :
                         (engine->mode == RfModeFollow ? 100U : 0U);
+        rf_decode_label(&decode, engine->last_label, sizeof(engine->last_label));
+        memcpy(engine->last_info, decode.info, sizeof(engine->last_info));
+        engine->last_rolling = decode.rolling;
         if(following) {
             rf_feedback(engine, true);
         } else {
-            /* The last observed family becomes the Follow profile. */
+            /* The last observed transmitter becomes the Follow profile. */
             engine->follow_valid = true;
             engine->follow_frequency = frequency;
             engine->follow_fingerprint = fingerprint;
             engine->follow_shape = shape;
+            engine->follow_protocol = named ? decode.protocol : RfProtoOok;
+            engine->follow_identity = named ? identity : 0;
+            memcpy(engine->follow_label, engine->last_label, sizeof(engine->follow_label));
         }
     }
     rf_capture_reset(engine);
@@ -655,6 +701,67 @@ static void rf_on_rssi(RfEngine* engine, float rssi, uint32_t now) {
     if(rssi >= engine->trigger) engine->strong_tick = now;
 }
 
+/* ------------------------------------------------------------------ Geiger counter
+ * Follow mode: the live RSSI above the noise floor sets a click rate like a Geiger counter
+ * near a source, from a slow background tick to a crackle.  Clicks come at random (Poisson)
+ * so a steady signal crackles instead of buzzing; each click is one 5 ms tone burst. */
+static void rf_speaker_release(RfEngine* engine) {
+    if(engine->click_on) {
+        furi_hal_speaker_stop();
+        engine->click_on = false;
+    }
+    if(engine->speaker_held) {
+        furi_hal_speaker_release();
+        engine->speaker_held = false;
+    }
+    engine->geiger_rate = 0.0f;
+}
+
+static void rf_geiger_service(RfEngine* engine, float rssi, uint32_t now) {
+    if(rssi >= engine->peak_rssi) {
+        engine->peak_rssi = rssi;
+        engine->peak_tick = now;
+        engine->peak_decay_tick = now;
+    } else if(
+        now - engine->peak_tick >= RF_PEAK_HOLD_MS &&
+        now - engine->peak_decay_tick >= RF_PEAK_DECAY_MS) {
+        engine->peak_decay_tick = now;
+        engine->peak_rssi -= 1.0f;
+        if(engine->peak_rssi < rssi) engine->peak_rssi = rssi;
+    }
+    if(engine->mode != RfModeFollow) {
+        if(engine->speaker_held) rf_speaker_release(engine);
+        engine->geiger_rate = 0.0f;
+        return;
+    }
+    uint8_t fi = engine->freq_index;
+    float floor = engine->floor_samples[fi] ? engine->floor[fi] : rssi;
+    float x = (rssi - floor - RF_GEIGER_START_DB) / RF_GEIGER_SPAN_DB;
+    if(x < 0.0f) x = 0.0f;
+    if(x > 1.0f) x = 1.0f;
+    float rate = RF_GEIGER_BACKGROUND + RF_GEIGER_MAX_RATE * x * x;
+    engine->geiger_rate = rate;
+    if(!engine->config.geiger) {
+        if(engine->speaker_held) rf_speaker_release(engine);
+        engine->geiger_rate = rate;
+        return;
+    }
+    if(!engine->speaker_held) {
+        engine->speaker_held = furi_hal_speaker_acquire(5);
+        if(!engine->speaker_held) return;
+    }
+    if(engine->click_on) {
+        furi_hal_speaker_stop(); /* a click lasts one RX tick */
+        engine->click_on = false;
+    }
+    uint32_t draw = furi_hal_random_get() % 100000U;
+    if((float)draw < rate * ((float)RF_RX_TICK_MS / 1000.0f) * 100000.0f) {
+        float hz = RF_GEIGER_CLICK_HZ + (float)(furi_hal_random_get() % 600U) - 300.0f;
+        furi_hal_speaker_start(hz, RF_GEIGER_VOLUME);
+        engine->click_on = true;
+    }
+}
+
 static void rf_rx_drain(RfEngine* engine) {
     uint32_t timing;
     for(uint32_t budget = RF_CAPTURE_RING_SIZE; budget && rf_capture_pop(engine->ring, &timing);
@@ -693,9 +800,12 @@ static void rf_radio_tune(RfEngine* engine, uint8_t index) {
     uint32_t now = furi_get_tick();
     engine->hop_tick = now;
     engine->rssi_tick = now;
+    engine->peak_rssi = -200.0f;
+    engine->peak_tick = now;
 }
 
 static void rf_radio_off(RfEngine* engine) {
+    rf_speaker_release(engine);
     if(engine->rx_on) {
         rf_rx_drain(engine);
         rf_capture_close(engine);
@@ -715,7 +825,9 @@ static void rf_rx_service(RfEngine* engine, uint32_t now) {
     rf_rx_drain(engine);
     if(now - engine->rssi_tick >= RF_RX_TICK_MS) {
         engine->rssi_tick = now;
-        rf_on_rssi(engine, furi_hal_subghz_get_rssi(), now);
+        float rssi = furi_hal_subghz_get_rssi();
+        rf_on_rssi(engine, rssi, now);
+        rf_geiger_service(engine, rssi, now);
     }
     if(engine->capturing) {
         if(!engine->signal && rf_capture_is_signal(engine)) {
@@ -887,6 +999,7 @@ static void rf_apply_control(RfEngine* engine) {
             rf_capture_close(engine);
         }
         engine->mode = mode;
+        if(mode != RfModeFollow) rf_speaker_release(engine);
     }
     engine->config = config;
     engine->running = running;
@@ -916,6 +1029,18 @@ static void rf_publish(RfEngine* engine, uint32_t now, bool force) {
     status.follow_valid = engine->follow_valid;
     status.last_similarity = engine->last_similarity;
     status.nfc_field = engine->nfc_field;
+    memcpy(status.last_label, engine->last_label, sizeof(status.last_label));
+    memcpy(status.last_info, engine->last_info, sizeof(status.last_info));
+    status.last_rolling = engine->last_rolling;
+    memcpy(status.follow_label, engine->follow_label, sizeof(status.follow_label));
+    if(engine->rx_on) {
+        status.live_rssi_dbm = rf_round_dbm(engine->last_rssi);
+        status.peak_rssi_dbm = rf_round_dbm(engine->peak_rssi > -150.0f ? engine->peak_rssi : engine->last_rssi);
+        uint8_t fi = engine->freq_index;
+        status.floor_dbm = engine->floor_samples[fi] ? rf_round_dbm(engine->floor[fi]) : 0;
+    }
+    status.geiger_rate = (uint8_t)(engine->geiger_rate + 0.5f);
+    status.geiger_sound = engine->speaker_held;
     uint32_t stored = rf_store_stored(engine->store);
 
     furi_mutex_acquire(engine->mutex, FuriWaitForever);

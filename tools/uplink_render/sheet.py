@@ -54,8 +54,11 @@ def main():
         [f"{screen}_h_{size}" for screen in ("sys_bars", "cdx_list", "rf_scout")
          for size in ("micro", "small", "normal", "large")],
         os.path.join(DOCS, "uplink_fonts.png"), 4)
-    sheet(["rf_scout_h_normal", "rf_follow_h_normal", "rf_nfc_h_normal", "rf_full_h_normal"],
-          os.path.join(DOCS, "uplink_rf.png"), 2)
+    sheet(["rf_scout_h_normal", "rf_decoded_h_normal", "rf_follow_h_normal",
+           "rf_geiger_h_normal", "rf_nfc_h_normal", "rf_full_h_normal"],
+          os.path.join(DOCS, "uplink_rf.png"), 3)
+    sheet(["sys_blackout_ask_h_normal", "sys_blackout_h_normal", "rf_geiger_v_normal"],
+          os.path.join(DOCS, "uplink_blackout.png"), 3)
 
 
 if __name__ == "__main__":

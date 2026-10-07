@@ -26,6 +26,7 @@ typedef struct {
     uint16_t capture_ms;        // longest capture window
     uint16_t silence_us;        // gap that closes a burst
     bool feedback;              // short vibro + LED blink on events (rate limited)
+    bool geiger;                // Follow: speaker clicks that quicken as the live RSSI rises
     bool keep_uploaded;         // after an ACK move the record to uploaded/ instead of deleting it
     int16_t tz_offset_minutes;  // RTC local time minus UTC (sent by the PC, see Z| below)
 } RfConfig;
@@ -48,6 +49,15 @@ typedef struct {
     bool follow_valid;          // Follow has a profile (from the last event)
     uint8_t last_similarity;    // Follow match of the last event, 0..100
     bool nfc_field;             // NFC field present right now
+    char last_label[20];        // what the last event was: "KeeLoq 66b", "OOK 25sym", "carrier"
+    char last_info[32];         // "sn 0ABCDEF btn 2", "+23.4C 45% ch1" (rf_decode.h)
+    bool last_rolling;
+    char follow_label[20];      // the Follow profile's label
+    int16_t live_rssi_dbm;      // Sub-GHz RX: the latest RSSI sample (the Geiger meter)
+    int16_t peak_rssi_dbm;      // peak hold
+    int16_t floor_dbm;          // noise floor of the current frequency
+    uint8_t geiger_rate;        // clicks per second right now
+    bool geiger_sound;          // the speaker is ours and clicking
 } RfStatus;
 
 typedef struct RfEngine RfEngine;
@@ -127,7 +137,10 @@ Records: one UTF-8 JSON object per event, unchanged from the former standalone a
 (`schema_version, event_id, device_uuid, session_id, sequence_number, captured_at_utc,
 captured_at_unix, timezone_offset_minutes, rtc_local_unix, monotonic_ms, source_type, mode,
 frequency_hz, modulation, …, rssi_min_dbm/avg/max, pulse_count, last_duration_us,
-pulse_timings_us[], upload_state` and the NFC fields). Event ids: `[A-Za-z0-9][A-Za-z0-9_.-]*`,
+pulse_timings_us[], upload_state` and the NFC fields), plus from app 1.5.0 the decode:
+`rf_protocol, rf_bits, rf_key, rf_info, rf_frames, rf_identical, rf_te_us, rf_rolling, rf_confidence`
+and `first_level` (see [RF_ENGINE.md](../apps/dedsec_uplink/RF_ENGINE.md)); the companion computes the
+same for records without them (`uplink/uplink/rf_decode.py`). Event ids: `[A-Za-z0-9][A-Za-z0-9_.-]*`,
 at most 48 characters.
 
 ## 3. Companion: `uplink/uplink/rf_sync.py`

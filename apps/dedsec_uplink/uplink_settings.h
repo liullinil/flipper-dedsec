@@ -56,6 +56,7 @@ typedef struct {
     uint16_t rf_dwell_ms; // Scout: time on each frequency
     uint16_t rf_capture_ms; // longest capture window
     uint8_t rf_feedback; // vibrate + blink on events
+    uint8_t rf_geiger; // Follow: Geiger counter clicks from the speaker
     uint8_t rf_keep; // keep records on the SD card after the PC imported them
     uint8_t rf_autostart; // start the receiver when the app starts
     uint8_t rf_sync; // let the PC import records over BLE

@@ -36,6 +36,7 @@ from .rf_fingerprint import FeatureCache, StructuralGrouper, compare_events
 from .rf_hunter import (EventStore, RfEvent, app_data_dir, default_store_root, folder_signature,
                         resolve_store_root)
 from . import dedsec_ui as ui
+from . import rf_decode
 
 log = logging.getLogger("uplink.rf_analyzer")
 
@@ -276,6 +277,20 @@ class AnalyzerProject:
         self._built_ids = frozenset(map(id, events))
         self.rebuild_count += 1
         return families
+
+    def decode(self, event: RfEvent) -> dict:
+        """What the burst is (the Flipper's decode, or ours for older records), cached by id."""
+        cache = self.__dict__.setdefault("_decodes", {})
+        found = cache.get(event.event_id)
+        if found is None:
+            try:
+                found = rf_decode.from_record(event)
+            except Exception:
+                log.debug("decode failed for %s", event.event_id, exc_info=True)
+                found = {"protocol": rf_decode.OOK, "name": "OOK", "info": "", "bits": 0, "key": 0,
+                         "frames": 0, "identical": 0, "te_us": 0, "rolling": False, "confidence": 0}
+            cache[event.event_id] = found
+        return found
 
     def family_key(self, event: RfEvent) -> str:
         return self.grouper.family_of.get(StructuralGrouper.key(event)) or "unassigned"
@@ -646,6 +661,43 @@ def signal_verdict(event: RfEvent) -> tuple:
                          "no longer saves these.")
     return "signal", (f"{edges} edges over {length}: an on/off keyed transmission. Remotes, key fobs, "
                       "doorbells and weather sensors look like this.")
+
+
+def verdict_label(decode: dict, kind: str = "signal") -> str:
+    """The table's VERDICT cell: the protocol when known, else the plain verdict."""
+    if kind != "signal" or not decode:
+        return VERDICT_TEXT.get(kind, kind)
+    pid = decode.get("protocol")
+    if pid == rf_decode.NONE:
+        return "carrier"
+    if pid == rf_decode.OOK:
+        frames = decode.get("frames", 0)
+        if frames >= 2 and decode.get("identical", 0) + 1 >= frames:
+            return "fixed code x%d" % frames
+        return "signal x%d" % frames if frames >= 2 else "signal"
+    return rf_decode.label(decode)
+
+
+def decode_rows(decode: dict) -> list:
+    """(label, value) rows of a decode for the capture details."""
+    pid = decode.get("protocol")
+    if pid == rf_decode.NONE:
+        return [("WHAT", "carrier, no OOK data")]
+    if pid == rf_decode.OOK:
+        return [("WHAT", "unknown OOK, " + decode.get("info", ""))]
+    rows = [("WHAT", "%s %d-bit %s" % (decode.get("name", ""), decode.get("bits", 0),
+                                       "rolling code" if decode.get("rolling") else "fixed code"))]
+    if decode.get("info"):
+        rows.append(("CODE", decode["info"]))
+    bits = min(64, decode.get("bits", 0))
+    rows.append(("KEY", "0x%0*X" % (max(1, (bits + 3) // 4), decode.get("key", 0))))
+    frames = decode.get("frames", 0)
+    if frames:
+        same = frames >= 2 and decode.get("identical", 0) + 1 >= frames
+        rows.append(("FRAMES", "%d in this capture%s" % (frames, ", all identical" if same else "")))
+    if decode.get("te_us"):
+        rows.append(("PULSE", "%d us" % decode["te_us"]))
+    return rows
 
 
 def lane_of(event: RfEvent) -> str:
@@ -1190,7 +1242,7 @@ class AnalyzerWindow:
                                    else event.nfc_field_duration_ms * 1000),
                 "" if event.source_type == "nfc" else str(edges),
                 "" if kind == "noise" else self._groups.get(self.project.family_key(event), ""),
-                VERDICT_TEXT[kind]))
+                verdict_label(self.project.decode(event), kind) if kind == "signal" else VERDICT_TEXT[kind]))
 
     # ------------------------------------------------------------------ selection
     def _event(self, event_id):
@@ -1369,12 +1421,20 @@ class AnalyzerWindow:
                     ("LENGTH", format_duration_us(event.duration_us)),
                     ("EDGES", f"{len(event.pulse_timings_us)} recorded"),
                     ("GROUP", "—" if kind == "noise" else f"{group} · seen {seen}×")]
+        decode = project.decode(event) if kind == "signal" else None
+        if decode:
+            rows += decode_rows(decode)
         segments = [(title, "title")]
         segments += self._pairs(rows)
-        segments += [("\n" + VERDICT_TEXT[kind].upper() + "\n", {"signal": "good", "noise": "warn",
-                                                                  "nfc": "head"}[kind]),
-                     (verdict + "\n", None),
-                     (f"\n{event.event_id}", "muted")]
+        if decode:
+            head, text = rf_decode.describe(decode, event.frequency_hz)
+            known = decode["protocol"] not in (rf_decode.OOK, rf_decode.NONE)
+            segments += [("\n" + head + "\n", "good" if known else "head"), (text + "\n", None)]
+        else:
+            segments += [("\n" + VERDICT_TEXT[kind].upper() + "\n", {"signal": "good", "noise": "warn",
+                                                                      "nfc": "head"}[kind]),
+                         (verdict + "\n", None)]
+        segments += [(f"\n{event.event_id}", "muted")]
         self._write(self.details, segments)
         self._draw_pulses()
         if kind != "noise":

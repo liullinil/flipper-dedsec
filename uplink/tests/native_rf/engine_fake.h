@@ -45,3 +45,6 @@ uint32_t world_red_blinks(void);
 bool world_radio_asleep(void);
 bool world_nfc_released(void);
 uint32_t world_queue_drops(void);
+uint32_t world_clicks(void); /* Geiger speaker tone starts */
+uint32_t world_speaker_acquires(void);
+bool world_speaker_released(void);

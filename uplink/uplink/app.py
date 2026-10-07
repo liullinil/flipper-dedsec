@@ -13,6 +13,7 @@ import webbrowser
 from collections import deque
 
 from . import config, hooks
+from .blackout import AUTO_ARMED, AUTO_ARMING, Blackout
 from .claude import ClaudeWatcher
 from .codex import CodexWatcher
 from .common import ascii_text
@@ -59,6 +60,7 @@ class Feed:
         self.updater = Updater()
         self.updater.check_async(force=True)
         self.rf_sync = RfSync(RF_STORE, send_clock=False)   # frame() sends Z| itself
+        self.blackout = None                                 # set by run_tray (needs the UI thread)
         self.next_clock = 0.0
         self.worker = threading.Thread(target=self._command_worker, name="cmd-worker", daemon=True)
         self.worker.start()
@@ -107,6 +109,8 @@ class Feed:
             offset = -(time.altzone if time.localtime(now).tm_isdst > 0 else time.timezone) // 60
             lines.append(f"Z|{int(now)}|{offset}")
             self.next_clock = now + CLOCK_EVERY
+        if self.blackout is not None:
+            lines.append(self.blackout.frame_line())
         if self.shell:
             self.shell.poll_timeout()
         return lines
@@ -133,6 +137,8 @@ class Feed:
         if up:
             self.next_clock = 0.0   # send the clock with the first frame
         self.rf_sync.on_link(up)
+        if self.blackout is not None:
+            self.blackout.on_link(status)
 
     # ------------------------------------------------------------------ remote cmd
     def _emit(self, line):
@@ -174,6 +180,13 @@ class Feed:
                 self.rf_sync.handle_line(parts)
             except Exception:
                 log.exception("bad RF line %r", line[:80])
+            return
+        if tag in ("BO", "BB"):
+            if self.blackout is not None:
+                try:
+                    self.blackout.handle_line(parts)
+                except Exception:
+                    log.exception("bad blackout line %r", line[:80])
             return
         if tag == "C" and len(parts) >= 3:
             seq = parts[1]
@@ -285,6 +298,13 @@ def run_tray(feed, cfg):
     ui = UiThread()                    # one Tk thread for the tray panel and the RF analyzer
     analyzer = {"window": None}
 
+    def lock_screen(blackout):
+        from .blackout_screen import LockScreen
+        return LockScreen(ui.root, blackout)
+
+    blackout = Blackout(ui, cfg, config.save, screen_factory=lock_screen)
+    feed.blackout = blackout
+
     def status_text(_item=None):
         c = feed.counts()
         tail = f" {state['name']}" if state["status"] == "connected" else ""
@@ -305,6 +325,7 @@ def run_tray(feed, cfg):
 
     def quit_app(*_args):
         stopping.set()
+        blackout.shutdown()            # never leave the desktop hidden
         link.stop()
         feed.shutdown()
         ui.stop()                      # closes the windows on their own thread
@@ -329,6 +350,44 @@ def run_tray(feed, cfg):
 
     def open_github(*_args):
         webbrowser.open(GITHUB_URL)
+
+    # ---- Blackout: the lock screen from the tray, the auto toggle and the PIN
+    def ask_pin(then=None):
+        """Open the PIN dialog on the UI thread; ``then(ok)`` afterwards."""
+        def show():
+            from .blackout_screen import PinDialog
+            PinDialog(ui.root, blackout, on_done=then)
+        ui.call(show)
+
+    def blackout_now(*_args):
+        if blackout.pin_set():
+            blackout.lock("tray")
+        else:
+            ask_pin(lambda ok: blackout.lock("tray") if ok else None)
+
+    def toggle_auto(*_args):
+        if blackout.auto_enabled:
+            blackout.set_auto(False)
+        elif blackout.pin_set():
+            blackout.set_auto(True)
+        else:
+            ask_pin(lambda ok: blackout.set_auto(True) if ok else None)
+        icon.update_menu()
+
+    def auto_label(*_args):
+        state = blackout.auto_state()
+        if state == AUTO_ARMED:
+            return "AUTO BLACKOUT: ARMED"
+        if state == AUTO_ARMING:
+            return f"AUTO BLACKOUT: ARMS IN {max(1, -(-blackout.arming_left() // 60))} MIN"
+        return "AUTO BLACKOUT: OFF"
+
+    def blackout_tick():
+        while not stopping.wait(1.0):
+            try:
+                blackout.tick()
+            except Exception:
+                log.exception("blackout tick failed")
 
     # ---- automatic updates: the companion replaces itself; the Flipper app is pushed by Feed
     def companion_downloaded(temp_path, error):
@@ -360,6 +419,9 @@ def run_tray(feed, cfg):
         menu=pystray.Menu(
             pystray.MenuItem(status_text, None, enabled=False),
             pystray.MenuItem("RF HUNTER ANALYZER…", open_analyzer, default=True),
+            pystray.MenuItem("BLACKOUT NOW", blackout_now),
+            pystray.MenuItem(auto_label, toggle_auto, checked=lambda _i: blackout.auto_enabled),
+            pystray.MenuItem("BLACKOUT PIN…", lambda *_a: ask_pin()),
             pystray.MenuItem("PAUSE UPLINK", toggle_pause, checked=lambda _i: link.paused),
             pystray.MenuItem("QUIT", quit_app),
         ))
@@ -380,12 +442,19 @@ def run_tray(feed, cfg):
         if companion["busy"]:
             tag = (updater.latest_companion or {}).get("tag", "")
             lines.append((f"COMPANION UPDATE {tag}: downloading…", "#f28a32"))
+        if blackout.active:
+            lines.append(("BLACKOUT ACTIVE: the lock screen is up", "#ff2bd6"))
         return {"status": state["status"], "name": state["name"], "lines": lines,
                 "ota": updater.progress()}
 
     def panel_items():
         return [
             {"label": "RF HUNTER ANALYZER", "action": open_analyzer, "style": "accent"},
+            {"label": "BLACKOUT NOW", "action": blackout_now, "style": "accent"},
+            {"label": auto_label(), "action": toggle_auto},
+            {"label": "CHANGE BLACKOUT PIN" if blackout.pin_set() else "SET BLACKOUT PIN",
+             "action": lambda: ask_pin()},
+            None,
             {"label": "RESUME UPLINK" if link.paused else "PAUSE UPLINK", "action": toggle_pause},
             {"label": "QUIT", "action": quit_app, "style": "danger"},
         ]
@@ -399,6 +468,8 @@ def run_tray(feed, cfg):
         feed.updater.on_change = ic.update_menu
         link.start()
         threading.Thread(target=auto_updates, name="auto-update", daemon=True).start()
+        threading.Thread(target=blackout_tick, name="blackout", daemon=True).start()
+        blackout.on_change = ic.update_menu
 
     icon.run(setup=setup)
 

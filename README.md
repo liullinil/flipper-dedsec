@@ -22,8 +22,9 @@ A Flipper Zero project in a Watch Dogs / DedSec style for **Unleashed firmware**
 | **CDX** | Codex sessions (`codex --profile …` and the desktop app): working / needs you / your turn, sub-agents, what each is doing |
 | **CLD** | Claude Code sessions (CLI and the Code tab of Claude Desktop), progress from the todo list |
 | **CMD** | A remote shell: type on the Flipper, it runs in a persistent shell on the PC, output and exit code come back |
-| **RF** | RF Hunter: passive Sub-GHz scan / capture / follow and NFC-field detection, journal on the SD card |
+| **RF** | RF Hunter: passive Sub-GHz scan / capture / follow and NFC-field detection, journal on the SD card; every capture is decoded on the spot (KeeLoq, Princeton/EV1527, CAME, Nice, Starline, weather sensors...) and Follow is a Geiger counter |
 
+- **Blackout**: OK on the SYS tab (or a lost link, if you turn that on) minimises everything, mutes the PC and covers every monitor with a DedSec lock screen; the PIN or the Flipper opens it again.
 - **Vibrates** when a session needs you (question / approval, or the agent finished its turn) and when the console replies.
 - **Four font sizes** (Micro, Small, Normal, Large) for every tab; Cyrillic in session names, details and console output.
 - **Vertical mode** for holding the Flipper upright.
@@ -32,6 +33,8 @@ A Flipper Zero project in a Watch Dogs / DedSec style for **Unleashed firmware**
 - Companion: a DedSec tray panel, no settings to manage — it starts with Windows, keeps its Claude Code hooks on and updates itself and the Flipper app automatically; the RF analyzer, which can also put a PC's RF records on the Flipper to take them to another PC.
 
 ![RF Hunter tab](docs/uplink_rf.png)
+
+![Blackout and the Geiger counter](docs/uplink_blackout.png)
 
 ![Vertical mode](docs/uplink_vertical.png)
 

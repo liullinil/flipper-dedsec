@@ -14,6 +14,8 @@ RUN_NAME = "DedSecUplink"
 DEFAULTS = {
     "cmd_enabled": True,     # allow the Flipper to run shell commands on this PC
     "shell": "cmd",          # "cmd" or "powershell"
+    "blackout_auto": False,  # Blackout the PC by itself when the Flipper's link is lost
+    "blackout_pin": None,    # {"salt": hex, "hash": hex} of the PIN that unlocks the Blackout screen
 }
 
 

@@ -16,5 +16,6 @@ ufbt launch   # install to /ext/apps/Bluetooth and start
 | `uplink_settings.c/.h` | settings file (`apps_data/dedsec_uplink/.uplink.settings`) |
 | `uplink_fonts.h` | Latin + Cyrillic u8g2 fonts for the four text sizes |
 | `rf_*.c/.h` | RF Hunter engine — see [RF_ENGINE.md](RF_ENGINE.md) |
+| `rf_decode.c/.h` | what a capture is: KeeLoq, Princeton/EV1527, CAME, Nice, Starline, Linear, Hormann, GateTX, FAAC, Holtek, Nexus-TH, or a generic OOK / carrier description (ported to `uplink/uplink/rf_decode.py`) |
 
 Screens can be checked on a PC without a Flipper: [tools/uplink_render](../../tools/uplink_render).

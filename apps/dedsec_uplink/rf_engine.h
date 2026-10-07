@@ -15,6 +15,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "rf_decode.h"
+
 typedef enum { RfModeScout, RfModeCapture, RfModeFollow, RfModeNfc, RfModeCount } RfMode;
 typedef enum { RfBandAll, RfBand433, RfBand315, RfBand868, RfBandCount } RfBand;
 
@@ -25,6 +27,7 @@ typedef struct {
     uint16_t capture_ms; // longest capture window
     uint16_t silence_us; // gap that closes a burst
     bool feedback; // short vibro + LED blink on events (rate limited)
+    bool geiger; // Follow: speaker clicks that quicken as the live RSSI rises
     bool keep_uploaded; // after an ACK move the record to uploaded/ instead of deleting it
     int16_t tz_offset_minutes; // RTC local time minus UTC (sent by the PC, see Z| below)
 } RfConfig;
@@ -49,6 +52,16 @@ typedef struct {
     bool follow_valid; // Follow has a profile (from the last event)
     uint8_t last_similarity; // Follow match of the last event, 0..100
     bool nfc_field; // NFC field present right now
+    char last_label[20]; // what the last event was: "KeeLoq 66b", "OOK 25sym", "carrier"
+    char last_info[RF_DECODE_INFO_MAX]; // "sn 0ABCDEF btn 2", "+23.4C 45% ch1", ...
+    bool last_rolling; // the last event's code changes with every press
+    char follow_label[20]; // the Follow profile's label (what is being followed)
+    // live receiver readings (Sub-GHz RX only): the Geiger meter of the Follow screen
+    int16_t live_rssi_dbm; // the latest RSSI sample
+    int16_t peak_rssi_dbm; // peak hold (1 s), then 1 dB per 100 ms down
+    int16_t floor_dbm; // noise floor of the current frequency
+    uint8_t geiger_rate; // clicks per second the Geiger counter is making right now
+    bool geiger_sound; // the speaker is ours and clicking
 } RfStatus;
 
 typedef struct RfEngine RfEngine;

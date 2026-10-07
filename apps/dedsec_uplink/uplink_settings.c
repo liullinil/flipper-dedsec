@@ -28,6 +28,7 @@ void uplink_settings_default(UplinkSettings* s) {
     s->rf_dwell_ms = 250;
     s->rf_capture_ms = 1000;
     s->rf_feedback = 1;
+    s->rf_geiger = 1;
     s->rf_keep = 0;
     s->rf_autostart = 0;
     s->rf_sync = 1;
@@ -83,6 +84,7 @@ void uplink_settings_load(UplinkSettings* s) {
         RDI("RfDwell", rf_dwell_ms, 50, 10000);
         RDI("RfCapture", rf_capture_ms, 200, 2000);
         RD("RfFeedback", rf_feedback, 1);
+        RD("RfGeiger", rf_geiger, 1);
         RD("RfKeep", rf_keep, 1);
         RD("RfAutostart", rf_autostart, 1);
         RD("RfSync", rf_sync, 1);
@@ -136,6 +138,7 @@ void uplink_settings_save(const UplinkSettings* s) {
         WRI("RfDwell", s->rf_dwell_ms);
         WRI("RfCapture", s->rf_capture_ms);
         WR("RfFeedback", s->rf_feedback);
+        WR("RfGeiger", s->rf_geiger);
         WR("RfKeep", s->rf_keep);
         WR("RfAutostart", s->rf_autostart);
         WR("RfSync", s->rf_sync);

@@ -8,7 +8,7 @@ App(
     fap_category="Bluetooth",
     fap_icon="uplink_10px.png",
     fap_icon_assets="images",
-    fap_version="1.4",
+    fap_version="1.5",
     fap_author="DedSec",
     fap_description="PC load, Codex and Claude sessions over BLE from the uplink PC companion",
 )

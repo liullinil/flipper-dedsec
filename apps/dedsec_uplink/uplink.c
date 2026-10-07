@@ -10,12 +10,16 @@
  *     X|seq|code                               command finished with exit code
  *     W|cwd                                    shell working directory
  *     B                                        host is going away
+ *     BO|active|auto                           Blackout: the PC's lock screen is up (1) or not,
+ *                                              auto-blackout on link loss 0 off / 1 arming / 2 armed
  *     Z|utc_unix|tz_minutes                    PC clock (RF timestamps)
  *     RL|cursor  RR|id|offset  RA|id|size|crc  RF journal import (see rf_engine.h)
  *   Flipper -> PC (TX notify char):
  *     C|seq|command                            run this command
  *     K|seq                                    cancel the running command
  *     T|seq|text                               send text to a running command's stdin
+ *     BO|1 / BO|0                              Blackout the PC / restore it (SYS tab, OK)
+ *     BB                                       the app is closing on purpose (no auto-blackout)
  *     R|pending|stored|free_kb|state|errors    RF journal status; RI/RE/RD/RK/RX answer RL/RR/RA
  * state: W working, A needs approval, I your turn, S idle, E error.
  * OTA (N/UB/UD/UE, V/U/UA) is described in uplink_ota.h.
@@ -61,6 +65,8 @@ enum { EvRx = 1, EvTick, EvRf, EvRfTx };
 #define RF_STATUS_TICKS (10 * 4) // R| status line to the PC every 10 s
 #define RF_REMIND_TICKS (4 * 4) // LED reminder of RF events nobody has looked at, every 4 s
 #define RF_TX_BUF       2048
+#define BLACKOUT_ASK_TICKS  (3 * 4) // "BLACKOUT PC?" waits this long for a second OK
+#define BLACKOUT_SENT_TICKS (10 * 4) // "sent, waiting for the PC" shown this long at most
 
 typedef enum { KindCodex, KindClaude, KindCount } Kind;
 
@@ -156,6 +162,12 @@ typedef struct {
     uint32_t ver_tick;      // last time we told the PC our version
     uint32_t restart_at;    // relaunch the freshly installed .fap at this tick
     uint32_t ota_req_tick;
+
+    // Blackout: the PC companion's own lock screen, driven from the SYS tab
+    uint8_t blackout; // the PC says its lock screen is up
+    uint8_t blackout_auto; // the PC: 0 off, 1 arming (first minutes after start), 2 armed
+    uint32_t blackout_ask; // OK pressed once on SYS: a second OK until this tick confirms
+    uint32_t blackout_sent; // BO|1 or BO|0 sent at this tick, waiting for the PC (0 = none)
 
     // RF Hunter (the engine has its own thread; these are app-thread copies)
     RfEngine* rf;
@@ -791,7 +803,15 @@ static void parse_line(App* app, char* line) {
         }
         break;
     case 'B':
-        app->host_closed = true;
+        if(f[0][1] == 'O') {
+            if(n >= 3) {
+                app->blackout = atoi(f[1]) != 0;
+                app->blackout_auto = (uint8_t)atoi(f[2]);
+                app->blackout_sent = 0;
+            }
+        } else {
+            app->host_closed = true;
+        }
         break;
     case 'Z':
         if(n >= 2) rf_clock(app, strtoul(f[1], NULL, 10));
@@ -898,6 +918,7 @@ static void rf_apply_config(App* app) {
         .capture_ms = s->rf_capture_ms,
         .silence_us = 8000,
         .feedback = s->rf_feedback,
+        .geiger = s->rf_geiger,
         .keep_uploaded = s->rf_keep,
         .tz_offset_minutes = s->rf_tz,
     };
@@ -1605,6 +1626,57 @@ static void draw_offline(Canvas* c, App* app) {
     canvas_draw_box(c, 3 + x, H - 5, 10, 3);
 }
 
+/* Blackout over the SYS tab: the question, the wait for the PC, or the dark state. The
+ * panel grows with the text size like the alert banner. */
+static void draw_blackout(Canvas* c, App* app) {
+    int W = canvas_width(c), H = canvas_height(c);
+    bool n = narrow(c);
+    const TextFont* tf = text_font(app);
+    const char* title;
+    // every text in a few lengths: the longest that fits the panel is drawn
+    const char* l1[3];
+    const char* l2[3];
+    const char* l3[3] = {"", "", ""};
+    if(app->blackout) {
+        title = n ? "BLACKOUT" : ">> BLACKOUT <<";
+        if(app->blackout_sent) {
+            l1[0] = l1[1] = l1[2] = "restoring...";
+            l2[0] = l2[1] = l2[2] = "";
+        } else {
+            l1[0] = "the PC is dark", l1[1] = "PC is dark", l1[2] = "dark";
+            l2[0] = "OK: restore", l2[1] = "OK: wake", l2[2] = "OK";
+        }
+    } else if(app->blackout_sent) {
+        title = "BLACKOUT";
+        l1[0] = l1[1] = l1[2] = "sent...";
+        l2[0] = "waiting for the PC", l2[1] = "waiting for PC", l2[2] = "wait";
+    } else if(app->blackout_ask) {
+        title = n ? "BLACKOUT?" : "BLACKOUT THE PC?";
+        if(n) {
+            l1[0] = "lock, mute,", l1[1] = "lock+mute", l1[2] = "lock";
+            l3[0] = "hide all", l3[1] = "hide", l3[2] = "hide";
+        } else {
+            l1[0] = "lock screen, mute, hide all", l1[1] = "lock, mute, hide all", l1[2] = "lock+mute+hide";
+        }
+        l2[0] = "OK: yes   Back: no", l2[1] = "OK: yes  Back: no", l2[2] = "OK: yes";
+    } else {
+        return;
+    }
+    int lines = 1 + (l2[0][0] ? 1 : 0) + (l3[0][0] ? 1 : 0);
+    int px = n ? 2 : 6, pw = W - 2 * px;
+    int ph = 15 + lines * (tf->line + 1) + 4;
+    int py = n ? (H - ph) / 2 : 12 + (H - 12 - ph) / 2;
+    int y = draw_panel(c, px, py, pw, ph, title);
+    font_text(c, app);
+    canvas_draw_str_aligned(c, W / 2, y + 1, AlignCenter, AlignTop, first_fit(c, pw - 4, l1, 3));
+    y += tf->line + 1;
+    if(l3[0][0]) {
+        canvas_draw_str_aligned(c, W / 2, y + 1, AlignCenter, AlignTop, first_fit(c, pw - 4, l3, 3));
+        y += tf->line + 1;
+    }
+    if(l2[0][0]) canvas_draw_str_aligned(c, W / 2, y + 1, AlignCenter, AlignTop, first_fit(c, pw - 4, l2, 3));
+}
+
 /* ------------------------------------------------------------------ RF tab */
 static const char* const rf_mode_names[RfModeCount] = {"SCOUT", "CAPTURE", "FOLLOW", "NFC"};
 
@@ -1633,6 +1705,112 @@ static void fmt_clock(char* out, size_t size, uint32_t utc, int16_t tz_minutes) 
     int64_t local = (int64_t)utc + (int64_t)tz_minutes * 60;
     datetime_timestamp_to_datetime((uint32_t)(local > 0 ? local : 0), &dt);
     snprintf(out, size, "%02u:%02u:%02u", dt.hour, dt.minute, dt.second);
+}
+
+/* dBm -> x within a bar w wide, -100 at the left, -30 at the right */
+static int rssi_px(int16_t dbm, int w) {
+    int v = dbm < -100 ? -100 : (dbm > -30 ? -30 : dbm);
+    return (v + 100) * (w - 1) / 70;
+}
+
+/* a 9x10 speaker, with sound waves while it clicks */
+static void draw_speaker(Canvas* c, int x, int y, bool loud) {
+    canvas_draw_box(c, x, y + 3, 2, 4);
+    canvas_draw_line(c, x + 2, y + 3, x + 5, y);
+    canvas_draw_line(c, x + 2, y + 6, x + 5, y + 9);
+    canvas_draw_line(c, x + 5, y, x + 5, y + 9);
+    if(loud) {
+        canvas_draw_dot(c, x + 7, y + 2);
+        canvas_draw_dot(c, x + 8, y + 4);
+        canvas_draw_dot(c, x + 8, y + 5);
+        canvas_draw_dot(c, x + 7, y + 7);
+    }
+}
+
+/* -100..-30 dBm bar: the live level fills it, the peak is a notch, the noise floor a dotted
+ * mark under it */
+static void draw_rssi_bar(Canvas* c, const RfStatus* s, int x, int y, int w) {
+    canvas_draw_frame(c, x, y, w, 7);
+    int fill = rssi_px(s->live_rssi_dbm, w - 2);
+    if(fill > 0) canvas_draw_box(c, x + 1, y + 1, fill, 5);
+    int px = x + 1 + rssi_px(s->peak_rssi_dbm, w - 2);
+    canvas_set_color(c, ColorXOR);
+    canvas_draw_line(c, px, y - 2, px, y + 8);
+    fg(c);
+    if(s->floor_dbm) {
+        int fx = x + 1 + rssi_px(s->floor_dbm, w - 2);
+        canvas_draw_dot(c, fx, y + 8);
+        canvas_draw_dot(c, fx - 1, y + 9);
+        canvas_draw_dot(c, fx + 1, y + 9);
+    }
+}
+
+/* Follow: the Geiger counter.  The live RSSI big, the peak and the noise floor, the bar, the
+ * speaker while it clicks, and what is being followed (the first signal becomes the profile). */
+static void draw_rf_geiger(Canvas* c, App* app, int y) {
+    int W = canvas_width(c), H = canvas_height(c);
+    bool n = narrow(c);
+    const RfStatus* s = &app->rf_status;
+    const TextFont* tf = text_font(app);
+    int line = tf->line;
+    char num[8], peak[16], noise[16], followed[80], problem[32] = "";
+    snprintf(num, sizeof(num), "%d", s->live_rssi_dbm);
+    snprintf(peak, sizeof(peak), "PEAK %d", s->peak_rssi_dbm);
+    snprintf(noise, sizeof(noise), "NOISE %d", s->floor_dbm);
+    if(s->follow_valid) {
+        // "KeeLoq 0ABCDEF btn 2": the protocol name and the identity, the bits and "sn" dropped
+        char name[20];
+        snprintf(name, sizeof(name), "%s", s->follow_label);
+        char* sp = strrchr(name, ' ');
+        if(sp && sp[1] >= '0' && sp[1] <= '9') *sp = 0;
+        const char* info = s->last_info;
+        if(strncmp(info, "sn ", 3) == 0) info += 3;
+        snprintf(followed, sizeof(followed), "%s %s", name, info);
+    } else {
+        snprintf(followed, sizeof(followed), "first signal = profile");
+    }
+    if(s->storage_full)
+        snprintf(problem, sizeof(problem), "SD FULL: IMPORT ON PC");
+    else if(s->errors)
+        snprintf(problem, sizeof(problem), "WRITE ERRORS: %lu", (unsigned long)s->errors);
+    // the big number sits on a baseline 17 px below y (FontBigNumbers digits are 16 px tall)
+    canvas_set_font(c, FontBigNumbers);
+    int nw = canvas_string_width(c, num);
+    canvas_draw_str_aligned(c, n ? 1 : 2, y + 17, AlignLeft, AlignBottom, num);
+    font_text(c, app);
+    int rw = MAX(text_width(c, peak), text_width(c, noise));
+    int rx = W - 2 - rw;
+    int ux = (n ? 1 : 2) + nw + 3; // where the unit goes
+    if(n || ux + text_width(c, "dBm") + 2 <= rx)
+        canvas_draw_str_aligned(c, ux, y + 17, AlignLeft, AlignBottom, "dBm");
+    if(n) {
+        int yy = y + 20;
+        canvas_draw_str_aligned(c, 1, yy, AlignLeft, AlignTop, peak);
+        if(s->geiger_sound && text_width(c, peak) + 12 <= W) draw_speaker(c, W - 10, yy, true);
+        yy += line;
+        canvas_draw_str_aligned(c, 1, yy, AlignLeft, AlignTop, noise);
+        yy += line + 3;
+        draw_rssi_bar(c, s, 1, yy, W - 2);
+        yy += 12;
+        if(problem[0]) {
+            draw_str_fit(c, 1, yy, problem, W - 2);
+        } else {
+            draw_str_fit(c, 1, yy, s->follow_valid ? s->follow_label : "first signal", W - 2);
+            yy += line;
+            if(yy + line <= H - line)
+                draw_str_fit(c, 1, yy, s->follow_valid ? s->last_info : "= profile", W - 2);
+        }
+        canvas_draw_str_aligned(c, 1, H - line, AlignLeft, AlignTop, "OK: stop");
+        return;
+    }
+    canvas_draw_str_aligned(c, rx, y, AlignLeft, AlignTop, peak);
+    canvas_draw_str_aligned(c, rx, y + line, AlignLeft, AlignTop, noise);
+    int sx = ux + text_width(c, "dBm") + 6;
+    if(s->geiger_sound && sx + 10 < rx) draw_speaker(c, sx, y + 4, true);
+    int fy = H - line;
+    int by = MIN(y + 21, fy - 11);
+    draw_rssi_bar(c, s, 2, by, W - 4);
+    draw_str_fit(c, 2, fy, problem[0] ? problem : followed, W - 3);
 }
 
 static void draw_rf(Canvas* c, App* app) {
@@ -1668,6 +1846,10 @@ static void draw_rf(Canvas* c, App* app) {
     if(s->running && (app->tick & 2))
         canvas_draw_disc(c, W - text_width(c, state) - 5, sy + cap / 2, 2);
     int y = n ? sy + line + 1 : 12 + bh + 2;
+    if(s->mode == RfModeFollow && s->running) {
+        draw_rf_geiger(c, app, y);
+        return;
+    }
 
     // counters: two columns (one when narrow), long labels where they fit next to the value
     static const char* const full[4] = {"EVENTS", "FAMILIES", "PENDING", "SD FREE"};
@@ -1727,8 +1909,14 @@ static void draw_rf(Canvas* c, App* app) {
         int foot = problem[0] ? bar : line;
         bool both = y + line + foot <= H;
         if(both || !problem[0]) {
-            char l1[48], l2[40], l3[32], l4[24];
-            if(s->last_unix) {
+            char l1[64], l2[56], l3[48], l4[32];
+            if(s->last_unix && s->last_label[0]) {
+                // "LAST 12:41 KeeLoq 66b -63dB": what it was, then how strong
+                snprintf(l1, sizeof(l1), "LAST %s %s%s%s", hm, s->last_label, sp, tail);
+                snprintf(l2, sizeof(l2), "%s %s%s%s", hm, s->last_label, sp, tail);
+                snprintf(l3, sizeof(l3), "%s %s", hm, s->last_label);
+                snprintf(l4, sizeof(l4), "%s", s->last_label);
+            } else if(s->last_unix) {
                 snprintf(l1, sizeof(l1), "LAST %s %s%s%s", when, where, sp, tail);
                 snprintf(l2, sizeof(l2), "%s %s%s%s", when, where, sp, tail);
                 snprintf(l3, sizeof(l3), "%s %s%s%s", hm, where, sp, tail);
@@ -1749,6 +1937,11 @@ static void draw_rf(Canvas* c, App* app) {
                 canvas_draw_str_aligned(
                     c, W / 2, H - bar + 2, AlignCenter, AlignTop, first_fit(c, W - 4, problems, 2));
                 fg(c);
+            } else if(s->last_unix && s->last_info[0]) {
+                // the decode of the last event ("sn 0ABCDEF btn 2") takes the hint line
+                char info[48];
+                snprintf(info, sizeof(info), "%s%s", s->last_info, s->last_rolling ? " ~" : "");
+                draw_str_fit(c, 2, H - line, info, W - 3);
             } else {
                 char h1[32], h2[32];
                 snprintf(h1, sizeof(h1), "%s   UP/DN: mode", ok);
@@ -1762,11 +1955,22 @@ static void draw_rf(Canvas* c, App* app) {
 
     // narrow: "LAST EVENT", time, frequency + level, then two hint rows or the problem bar;
     // when it does not fit, the label goes first, then the hints
-    const char* rows[4];
+    const char* rows[6];
     int count = 0;
     char wt[24], wt2[24];
     rows[count++] = text_width(c, "LAST EVENT") <= W - 2 ? "LAST EVENT" : "LAST";
-    if(s->last_unix) {
+    char label_short[20];
+    if(s->last_unix && s->last_label[0]) {
+        rows[count++] = when;
+        snprintf(label_short, sizeof(label_short), "%s", s->last_label);
+        char* sp = strrchr(label_short, ' ');
+        if(sp && text_width(c, s->last_label) > W - 2) *sp = 0;
+        rows[count++] = label_short;
+        snprintf(wt, sizeof(wt), "%s%s%s", where, sp, tail);
+        snprintf(wt2, sizeof(wt2), "%s%s%s", where, sp, tail_short);
+        rows[count++] = text_width(c, wt) <= W - 2 ? wt : wt2;
+        if(s->last_info[0]) rows[count++] = s->last_info;
+    } else if(s->last_unix) {
         rows[count++] = when;
         snprintf(wt, sizeof(wt), "%s%s%s", where, sp, tail);
         snprintf(wt2, sizeof(wt2), "%s%s%s", where, sp, tail_short);
@@ -1792,7 +1996,7 @@ static void draw_rf(Canvas* c, App* app) {
             break;
     }
     for(int i = first; i < count && y + line <= H - foot; i++, y += line)
-        canvas_draw_str_aligned(c, 1, y, AlignLeft, AlignTop, rows[i]);
+        draw_str_fit(c, 1, y, rows[i], W - 2);
     if(problem[0]) {
         canvas_draw_box(c, 0, H - bar, W, bar);
         bg(c);
@@ -1821,9 +2025,10 @@ static void main_draw(Canvas* c, void* model) {
         draw_offline(c, app);
     } else {
         draw_header(c, app);
-        if(screen == ScreenSys)
+        if(screen == ScreenSys) {
             draw_sys(c, app);
-        else if(screen == ScreenRf)
+            draw_blackout(c, app);
+        } else if(screen == ScreenRf)
             draw_rf(c, app);
         else if(screen == ScreenCmd) {
             if(!app->link)
@@ -1979,7 +2184,18 @@ static bool main_input(InputEvent* in, void* context) {
         }
         break;
     case InputKeyOk:
-        if(screen == ScreenRf && app->rf) {
+        if(screen == ScreenSys && app->link) {
+            if(app->blackout) {
+                uplink_send(app, "BO|0"); // the Flipper is the key: restore without a PIN
+                app->blackout_sent = app->tick;
+            } else if(app->blackout_ask) {
+                uplink_send(app, "BO|1");
+                app->blackout_ask = 0;
+                app->blackout_sent = app->tick;
+            } else {
+                app->blackout_ask = app->tick + BLACKOUT_ASK_TICKS;
+            }
+        } else if(screen == ScreenRf && app->rf) {
             if(app->rf_status.running)
                 rf_engine_stop(app->rf);
             else
@@ -2006,7 +2222,9 @@ static bool main_input(InputEvent* in, void* context) {
         }
         break;
     case InputKeyBack:
-        if(app->detail) {
+        if(app->blackout_ask) {
+            app->blackout_ask = 0;
+        } else if(app->detail) {
             if(screen == ScreenCodex || screen == ScreenClaude) {
                 List* l = &app->lists[screen_kind(screen)];
                 int raw = visible_raw_index(app, screen_kind(screen), l->cursor);
@@ -2105,6 +2323,7 @@ enum {
     SetRfDwell,
     SetRfCapture,
     SetRfFeedback,
+    SetRfGeiger,
     SetRfKeep,
     SetRfAutostart,
     SetRfSync,
@@ -2238,6 +2457,10 @@ static void setting_changed(VariableItem* item) {
         s->rf_feedback = idx;
         rf_config = true;
         break;
+    case SetRfGeiger:
+        s->rf_geiger = idx;
+        rf_config = true;
+        break;
     case SetRfKeep:
         s->rf_keep = idx;
         rf_config = true;
@@ -2309,6 +2532,7 @@ static void build_settings(App* app) {
         COUNT_OF(rf_capture_vals),
         nearest_index(rf_capture_vals, COUNT_OF(rf_capture_vals), s->rf_capture_ms));
     add_row(app, "RF vibrate on signal", SetRfFeedback, 2, s->rf_feedback);
+    add_row(app, "RF Geiger clicks", SetRfGeiger, 2, s->rf_geiger);
     add_row(app, "RF after import", SetRfKeep, COUNT_OF(rf_keep_vals), s->rf_keep);
     add_row(app, "RF on at app start", SetRfAutostart, 2, s->rf_autostart);
     add_row(app, "RF import by PC", SetRfSync, 2, s->rf_sync);
@@ -2351,6 +2575,9 @@ static bool custom_event(void* context, uint32_t event) {
             restart = true;
         }
         if(app->link && app->tick - app->last_rx_tick > LINK_TICKS) app->link = false;
+        if(app->blackout_ask && app->tick > app->blackout_ask) app->blackout_ask = 0;
+        if(app->blackout_sent && app->tick - app->blackout_sent > BLACKOUT_SENT_TICKS)
+            app->blackout_sent = 0;
         rf_refresh_status(app);
         rf_remind(app);
         furi_mutex_release(app->mutex);
@@ -2456,6 +2683,10 @@ int32_t uplink_app(void* p) {
     furi_stream_buffer_free(app->rf_tx);
 
     bt_set_status_changed_callback(app->bt, NULL, NULL);
+    if(app->link) {
+        uplink_send(app, "BB"); // leaving on purpose: the PC must not blackout for this
+        furi_delay_ms(150);
+    }
     bt_disconnect(app->bt);
     furi_delay_ms(200);
     bt_keys_storage_set_default_path(app->bt);

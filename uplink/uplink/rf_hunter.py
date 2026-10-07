@@ -94,10 +94,12 @@ _TEXT_FIELDS = (
     ("nfc_protocol", ""), ("nfc_identifier", ""), ("modulation", "unknown"), ("firmware_version", ""),
     ("fingerprint_id", ""), ("classification", "unknown"), ("profile_id", ""),
     ("follow_profile_id", ""), ("capture_blob", ""), ("upload_state", "pending"), ("event_id", ""),
+    ("rf_protocol", ""), ("rf_key", ""), ("rf_info", ""),
 )
 _INT_FIELDS = (("sequence_number", 0), ("monotonic_ms", 0), ("nfc_field_duration_ms", 0),
                ("nfc_field_count", 0), ("frequency_hz", 0), ("bandwidth_hz", 0), ("battery_pct", 0),
-               ("duration_us", 0), ("repeat_count", 1))
+               ("duration_us", 0), ("repeat_count", 1), ("first_level", -1), ("rf_bits", 0),
+               ("rf_frames", 0), ("rf_identical", 0), ("rf_te_us", 0), ("rf_confidence", 0))
 _FLOAT_FIELDS = ("nfc_confidence", "rssi_min_dbm", "rssi_avg_dbm", "rssi_max_dbm",
                  "classification_confidence")
 
@@ -159,6 +161,19 @@ class RfEvent:
     captured_at_unix: Optional[float] = None
     rtc_local_unix: Optional[int] = None
     pulse_timings_us: tuple = field(default_factory=tuple)
+    # What the burst is, decoded by the Flipper app (1.5.0 on) before it saved the record;
+    # rf_decode.from_record() computes the same for older records.  first_level is the
+    # level of the first timing (1 = carrier on), -1 when the record does not say.
+    first_level: int = -1
+    rf_protocol: str = ""
+    rf_bits: int = 0
+    rf_key: str = ""
+    rf_info: str = ""
+    rf_frames: int = 0
+    rf_identical: int = 0
+    rf_te_us: int = 0
+    rf_rolling: bool = False
+    rf_confidence: int = 0
     event_id: str = ""
     schema_version: int = 1
 
@@ -174,6 +189,7 @@ class RfEvent:
             setattr(self, name, default if value is None else _as_int(value, name))
         for name in _FLOAT_FIELDS:
             setattr(self, name, _as_float(getattr(self, name), name))
+        self.rf_rolling = bool(self.rf_rolling)
         if self.family_id is not None:
             self.family_id = str(self.family_id)
         if not self.event_id:
