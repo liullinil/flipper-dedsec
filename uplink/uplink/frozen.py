@@ -64,14 +64,22 @@ def update_script(temp_path, target, pids, log_path):
     A one-file exe runs as two processes (bootloader parent + Python child) and the parent keeps
     the exe open, so the helper waits for both, retries the swap until the file is free, starts the
     new version, checks that it stays up (else starts it once more through Explorer, which runs it
-    with Explorer's own environment), notes each step in update.log and removes itself."""
+    with Explorer's own environment), notes each step in update.log and removes itself.  A note
+    that cannot be written never stops it, and a failure anywhere still tries to start the target
+    through Explorer: the companion must come back no matter what."""
     name = os.path.splitext(os.path.basename(target))[0]
     workdir = os.path.dirname(target) or "."
     return "\r\n".join([
         "$ErrorActionPreference = 'Stop'",
         "$log = %s" % _quote(log_path),
+        # a note that cannot be written (the log open elsewhere, a locked folder) must never stop
+        # the swap or the restart: on 2026-10-07 a tail -F on update.log did exactly that
         "function Note($text) {",
-        "  Add-Content -LiteralPath $log -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' update: ' + $text)",
+        "  try {",
+        "    Add-Content -LiteralPath $log -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' update: ' + $text)",
+        "  } catch {",
+        "    try { Add-Content -LiteralPath ($log + '.notes') -Value $text } catch {}",
+        "  }",
         "}",
         "try {",
         "  foreach ($id in @(%s)) {" % ", ".join(str(int(pid)) for pid in pids),
@@ -96,8 +104,9 @@ def update_script(temp_path, target, pids, log_path):
         "  }",
         "} catch {",
         "  Note ('failed: ' + $_)",
+        "  try { Start-Process -FilePath 'explorer.exe' -ArgumentList ('\"' + %s + '\"') } catch {}" % _quote(target),
         "}",
-        "Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force",
+        "try { Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force } catch {}",
     ])
 
 

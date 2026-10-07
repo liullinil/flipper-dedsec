@@ -58,7 +58,14 @@ def test_update_script_waits_swaps_restarts_and_checks():
     assert ("Start-Process -FilePath 'D:\\o''neil\\DedSecUplink.exe' -WorkingDirectory 'D:\\o''neil'"
             " -PassThru") in script
     assert "if ($new.HasExited)" in script and "'explorer.exe'" in script
-    assert script.splitlines()[-1] == "Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force"
+    assert script.splitlines()[-1] == "try { Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force } catch {}"
+    # a note that cannot be written (the log held open elsewhere) must not stop the swap: the
+    # Note function swallows its own failure, and the outer catch still starts the target
+    crlf = chr(13) + chr(10)
+    note = script[script.index("function Note"):script.index("try {" + crlf + "  foreach")]
+    assert "try {" in note and "} catch {" in note
+    tail = script[script.index("} catch {" + crlf + "  Note ('failed: '"):]
+    assert "Start-Process -FilePath 'explorer.exe'" in tail
 
 
 def test_apply_update_starts_the_helper_with_a_clean_environment(monkeypatch, tmp_path):
