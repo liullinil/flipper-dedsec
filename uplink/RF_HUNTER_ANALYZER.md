@@ -104,7 +104,7 @@ window.alive      # False after close
 
 `AnalyzerWindow(parent, store_root, sync=None, *, extra_roots=(), on_close=None, project=None)` builds
 a `tk.Toplevel` on an existing Tk root; all calls must come from that root's thread (the companion's
-single UI thread, shared with the settings window). It uses its own `RF.*` ttk style names and does
+single UI thread, shared with the tray panel). It uses its own `RF.*` ttk style names and does
 not change the theme of the shared interpreter.
 
 * Reloads a folder when its journal changes (stat-only check every 3 s, immediately after `RfSync`

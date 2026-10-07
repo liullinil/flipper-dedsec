@@ -125,7 +125,7 @@ class RfSync:
 ## 4. Companion: analyzer window (`uplink/uplink/rf_analyzer.py`)
 
 `AnalyzerWindow(parent, store_root, sync=None)` builds a `tk.Toplevel` on an existing Tk root that the
-companion runs in its single UI thread (the settings window lives in the same thread). It reloads the
+companion runs in its single UI thread (the tray panel lives in the same thread). It reloads the
 store when the folder changes (poll every few seconds), shows `sync.status()` and offers "Sync now"
 (`sync.sync_now()`); it never opens its own BLE connection. `main(argv)` keeps the CLI (export,
 standalone viewer).

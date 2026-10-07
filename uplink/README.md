@@ -13,7 +13,7 @@ an investigation window.
 | Part | Where | Does |
 |---|---|---|
 | Flipper app | [`apps/dedsec_uplink`](../apps/dedsec_uplink) → `SD/apps/Bluetooth/dedsec_uplink.fap` | Own BLE service, the screens, vibration, keyboard for commands, RF Hunter engine, self-update |
-| Companion | `uplink/` (Python) or `DedSecUplink.exe` | Tray icon and settings window; collects load and agent state, runs commands, imports RF records, RF analyzer, serves updates |
+| Companion | `uplink/` (Python) or `DedSecUplink.exe` | Tray panel; collects load and agent state, runs commands, imports RF records, RF analyzer, keeps itself and the Flipper app up to date |
 
 Target: Flipper Zero on Unleashed `unlshd-093c` (API 88.9), Windows 10/11 with Bluetooth LE.
 
@@ -87,7 +87,6 @@ Saved to `SD/apps_data/dedsec_uplink/.uplink.settings`.
 | RF after import | Delete / Keep — what happens to a record on the SD card once the PC has it |
 | RF on at app start | on / off |
 | RF import by PC | on / off |
-| Updates | Notify / Auto |
 | Version | shows the installed version; OK installs a pending update |
 
 ## Pocket cmd.exe
@@ -101,24 +100,25 @@ running command: Ctrl+C first, and after 2 seconds the command and everything it
 - Up to 400 output lines per command; ordinary commands running over 2 minutes are stopped.
   Interactive programs (Python, Codex, a `set /p` question) stay until you answer with OK or press Back.
 - The shell runs in a pseudo-terminal (ConPTY) in UTF-8 (`chcp 65001`), so Cyrillic names come through.
-- cmd or PowerShell: choose it in the companion's settings window.
+- cmd by default; `"shell": "powershell"` in `%LOCALAPPDATA%\DedSecUplink\config.json` switches it.
 - Programs launched with `start` from this shell close when it stops or the companion quits.
 
 **Security.** The BLE link has no pairing, so anyone in Bluetooth range who knows the protocol could send
-commands. The remote shell can be turned off in the settings window (*Allow commands from Flipper*), every
-command is logged, output is capped. Turn it off if you don't use CMD.
+commands. Every command is logged and output is capped; if you don't use CMD, turn the shell off with
+`"cmd_enabled": false` in `%LOCALAPPDATA%\DedSecUplink\config.json`.
 
 ## Over-the-air updates
 
 The companion checks the latest [GitHub release](https://github.com/liullinil/flipper-dedsec/releases)
-every 30 minutes. If the Flipper runs an older version, the app shows `>> UPDATE AVAILABLE <<`
-(or installs it right away with *Updates: Auto*). On OK:
+every 30 minutes. When the connected Flipper runs an older app it installs the new one by itself:
 
-1. the companion downloads `dedsec_uplink.fap` from the release;
-2. it streams the file over BLE in base64 chunks with an acknowledgement window (lost chunks are re-sent);
+1. it downloads `dedsec_uplink.fap` from the release;
+2. it streams the file over BLE in base64 chunks with an acknowledgement window (lost chunks are re-sent;
+   apps older than 1.2.0 get one chunk at a time, every BLE write stays within the Flipper's 243-byte buffer);
 3. the app writes it next to itself, checks size and CRC-32, replaces its own `.fap` and restarts.
 
-The first version with OTA support (v1.1.0) has to be installed once by hand; later versions arrive over the air.
+The Flipper shows `UPDATING` with the progress; Back cancels (the companion tries again 10 minutes later).
+The first version with OTA support (v1.1.0) has to be installed once by hand.
 
 ## RF Hunter
 
@@ -143,7 +143,7 @@ writes them to `%LOCALAPPDATA%\DedSecUplink\rf_hunter` and only then tells the F
 (or keeps them, see *RF after import*). An interrupted import continues where it stopped; a record is never
 imported twice.
 
-**RF analyzer** (tray menu → *RF Hunter analyzer*, or the settings window): a waterfall of frequency over
+**RF analyzer** (tray panel → *RF Hunter analyzer*): a waterfall of frequency over
 time, a timeline, signal families grouped by structure (carrier, modulation, pulse timing, repetition — not
 by payload or RSSI), similarity explanations, notes and JSON/CSV export. It can also open a copied SD-card
 folder. Details: [RF_HUNTER_ANALYZER.md](RF_HUNTER_ANALYZER.md); the engine:
@@ -166,16 +166,21 @@ spectrum, and RSSI helps a search but is not direction finding.
 A hooded-skull icon appears in the tray (Windows may hide it under the `^` arrow next to the clock).
 The ring shows the link: green connected, yellow searching, grey paused, red error.
 
-The tray menu shows the link and the versions and has *Open settings…* (also a left click on the icon),
-*RF Hunter analyzer…*, *Check for updates*, *Install companion update*, *Install Flipper app update*,
-*Pause uplink* and *Quit*.
+A click on the icon (left or right) opens the DedSec panel: link and session status, RF records waiting on
+the Flipper, versions, update progress, and *RF Hunter analyzer*, *Pause uplink*, *Quit*. `> JOIN US_`
+opens this repository.
 
-![Settings window](../docs/companion_settings.png)
+![Tray panel](../docs/companion_tray.png)
 
-The settings window: allow commands from the Flipper and choose cmd or PowerShell, start with Windows,
-Claude Code hooks, RF Hunter import status (*Import from Flipper now*, *Open RF analyzer*), updates and the
-log. *Install companion update* downloads the new `DedSecUplink.exe` from the release, swaps it in and
-restarts (the `.exe` only; from source use `git pull`). The Flipper app update uses the BLE path above.
+There is nothing to set up:
+
+- **Start with Windows** and the **Claude Code hooks** are switched on at every start (if something turned
+  them off, they come back).
+- **Updates are automatic.** Every 30 minutes the companion checks the latest release. `DedSecUplink.exe`
+  downloads its new version, swaps itself and restarts; a Flipper app older than the release gets the new
+  `.fap` over Bluetooth while it is connected (a failed attempt is retried after 10 minutes).
+- The remote shell is on and uses `cmd`; `%LOCALAPPDATA%\DedSecUplink\config.json` can switch it to
+  `"shell": "powershell"` or turn it off with `"cmd_enabled": false`.
 
 Command line (`.exe` or `.pyw`): `--console` (log to the console), `--dump` (print one data frame, no BLE),
 `--install-autostart` / `--uninstall-autostart`, `--install-claude-hooks` / `--remove-claude-hooks`.
@@ -184,9 +189,11 @@ Log: `%LOCALAPPDATA%\DedSecUplink\uplink.log`. Only one copy runs at a time.
 ### Build the .exe
 
 ```bash
+hook\build.bat                      # the native Claude Code hook (MSVC) -> hook/uplink_hook.exe
 python -m pip install pyinstaller
 python -m PyInstaller --onefile --windowed --name DedSecUplink --collect-submodules bleak \
-    --collect-submodules winrt --hidden-import pystray._win32 dedsec_uplink.pyw
+    --collect-submodules bleak_winrt --collect-submodules winrt --hidden-import pystray._win32 \
+    --add-binary "hook/uplink_hook.exe;." dedsec_uplink.pyw
 ```
 
 ### Where session state comes from
@@ -205,7 +212,7 @@ current step come from the transcript.
 ### Claude Code hooks (precise state)
 
 Without hooks, permission prompts are guessed from the transcript. With hooks, Claude Code itself reports the
-transitions. Enable them in the settings window, with `--install-claude-hooks`, or:
+transitions. The companion installs them at every start; by hand: `--install-claude-hooks`, or:
 
 ```bash
 python install_claude_hooks.py            # add
@@ -214,7 +221,10 @@ python install_claude_hooks.py --remove   # remove
 
 This adds `Notification`, `Stop`, `SubagentStop` and `UserPromptSubmit` hooks to `~/.claude/settings.json`
 (merged with your own hooks, a `settings.json.bak-*` backup is kept). Each hook appends one line to
-`%LOCALAPPDATA%\DedSecUplink\claude_events.jsonl`. Restart Claude Code sessions (or run `/hooks`) afterwards.
+`%LOCALAPPDATA%\DedSecUplink\claude_events.jsonl`. The hook is a tiny native program
+(`hook/uplink_hook.c`, copied to `%LOCALAPPDATA%\DedSecUplink\uplink_hook.exe`) that takes about 20 ms, so
+Claude does not wait for it; without it the Python script is used. Restart Claude Code sessions (or run
+`/hooks`) after the first install.
 
 ## Protocol
 

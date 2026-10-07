@@ -1,7 +1,7 @@
 """One Tk interpreter in one thread for every companion window.
 
-pystray owns the main thread, so Tk runs in a thread of its own. All windows (settings, RF analyzer)
-are Toplevels of a hidden root created here; other threads never touch Tk objects, they post
+pystray owns the main thread, so Tk runs in a thread of its own. All windows (the tray panel, the
+RF analyzer) are Toplevels of a hidden root created here; other threads never touch Tk objects, they post
 callables with :meth:`UiThread.call`. Tk variables and widgets are created and released on this
 thread too: releasing them from another thread at exit made Tcl abort the process.
 """

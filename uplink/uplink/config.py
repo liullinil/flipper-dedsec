@@ -74,3 +74,17 @@ def set_autostart(enable):
                 log.info("autostart disabled")
             except OSError:
                 pass
+
+
+def ensure_autostart():
+    """Start with Windows is always on: (re)write the Run entry if it is missing or stale."""
+    if os.name != "nt":
+        return
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            current, _ = winreg.QueryValueEx(key, RUN_NAME)
+    except OSError:
+        current = None
+    if current != _script_command():
+        set_autostart(True)

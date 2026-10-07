@@ -27,13 +27,15 @@ A Flipper Zero project in a Watch Dogs / DedSec style for **Unleashed firmware**
 - **Vibrates** when a session needs you (question / approval, or the agent finished its turn) and when the console replies.
 - **Cyrillic** in session names, details and console output, in all four font sizes.
 - **Vertical mode** for holding the Flipper upright.
-- **Over-the-air updates**: the companion checks GitHub releases, the Flipper offers the update and installs it over BLE, then restarts itself.
-- **Settings** on the Flipper: vibration, LED, screen wake, indicators, font size, orientation, tab order, RF options, auto-update.
-- Companion: tray icon and settings window, Windows autostart, optional Claude Code hooks, the RF analyzer, self-update.
+- **Automatic updates**: the companion follows the GitHub releases, installs new Flipper app versions over BLE and replaces itself.
+- **Settings** on the Flipper: vibration, LED, screen wake, indicators, font size, orientation, tab order, RF options.
+- Companion: a DedSec tray panel, no settings to manage — it starts with Windows, keeps its Claude Code hooks on and updates itself and the Flipper app automatically; the RF analyzer.
 
 ![RF Hunter tab](docs/uplink_rf.png)
 
 ![Vertical mode](docs/uplink_vertical.png)
+
+![Tray panel](docs/companion_tray.png)
 
 Full documentation: **[uplink/README.md](uplink/README.md)**.
 

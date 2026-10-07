@@ -22,12 +22,14 @@ import zlib
 REPO = "liullinil/flipper-dedsec"
 ASSET = "dedsec_uplink.fap"
 COMPANION_ASSET = "DedSecUplink.exe"
-COMPANION_VERSION = "1.2.0"
+COMPANION_VERSION = "1.2.1"
 CHECK_EVERY = 30 * 60      # seconds between release checks
 CHUNK = 192                # raw bytes per chunk (256 base64 chars, fits the Flipper's line buffer)
-WINDOW = 4                 # chunks in flight
+WINDOW = 4                 # chunks in flight for apps from 1.2.0 on
+OLD_APP_WINDOW = 1         # before 1.2.0 the app's BLE thread blocks when it gets data too fast
 RETRANSMIT_AFTER = 2.0     # seconds without ack progress -> resend from the last ack
-GIVE_UP_AFTER = 20.0       # seconds without any ack -> abort
+GIVE_UP_AFTER = 30.0       # seconds without the ack count growing -> abort
+AUTO_RETRY = 10 * 60       # seconds before pushing the same update again after a failed attempt
 
 log = logging.getLogger("uplink.update")
 
@@ -47,6 +49,8 @@ class Updater:
         self.last_check = 0.0
         self.checking = False
         self.on_change = None
+        self.auto_retry_at = 0.0    # next automatic push to an older Flipper app
+        self.requesting = False     # a download for the Flipper is running
         self._reset()
 
     def _reset(self):
@@ -55,7 +59,10 @@ class Updater:
         self.tag = ""
         self.began = self.ready = self.ended = False
         self.sent = self.acked = 0
-        self.began_t = self.progress_t = 0.0
+        self.began_t = self.progress_t = self.stall_t = 0.0
+        self.window = WINDOW
+        self.logged_pct = 0
+        self.ub_sent = 0
 
     # ------------------------------------------------------------------ release check
     def check_async(self, force=False):
@@ -110,6 +117,24 @@ class Updater:
                 return []
             return [f"N|{latest['tag']}|{latest['size']}"]
 
+    def auto_flipper(self):
+        """Push the latest release to an older Flipper app on our own (called once a second
+        while linked). A failed or cancelled attempt is retried after AUTO_RETRY."""
+        with self.lock:
+            if self.active or not self.latest or not self.flipper_version:
+                return False
+            tag = self.latest["tag"]
+            if parse_version(tag) <= parse_version(self.flipper_version):
+                return False
+            now = time.time()
+            if now < self.auto_retry_at:
+                return False
+            self.auto_retry_at = now + AUTO_RETRY
+        log.info("flipper runs %s, installing %s automatically", self.flipper_version, tag)
+        threading.Thread(target=self.request, args=(tag,), name="flipper-update",
+                         daemon=True).start()
+        return True
+
     def flipper_update_available(self):
         with self.lock:
             return bool(self.latest and self.flipper_version and
@@ -163,31 +188,43 @@ class Updater:
 
     # ------------------------------------------------------------------ transfer
     def request(self, tag):
-        """Flipper asked for an update (runs in a worker thread: it downloads)."""
+        """Start a transfer of the latest release (runs in a worker thread: it downloads). Both the
+        Flipper (U|tag) and auto_flipper() call it; only one transfer runs at a time."""
         with self.lock:
             latest = self.latest
-            if self.active:
+            if self.active or self.requesting:
                 return
-        if not latest:
-            log.warning("update requested but no release known")
-            return
+            self.requesting = True
         try:
-            req = urllib.request.Request(latest["url"], headers={"User-Agent": "dedsec-uplink"})
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = resp.read()
-        except Exception as exc:
-            log.warning("download failed: %s", exc)
-            return
-        if len(data) != latest["size"]:
-            log.warning("download size %d != %d", len(data), latest["size"])
-            return
+            if not latest:
+                log.warning("update requested but no release known")
+                return
+            try:
+                req = urllib.request.Request(latest["url"], headers={"User-Agent": "dedsec-uplink"})
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = resp.read()
+            except Exception as exc:
+                log.warning("download failed: %s", exc)
+                return
+            if len(data) != latest["size"]:
+                log.warning("download size %d != %d", len(data), latest["size"])
+                return
+            self._start(latest, data)
+        finally:
+            with self.lock:
+                self.requesting = False
+
+    def _start(self, latest, data):
         with self.lock:
             self._reset()
             self.active = True
             self.data = data
             self.tag = latest["tag"]
-        log.info("sending %s to the flipper: %d bytes, crc %08x",
-                 self.tag, len(data), zlib.crc32(data) & 0xFFFFFFFF)
+            old_app = parse_version(self.flipper_version) < (1, 2, 0)
+            self.window = OLD_APP_WINDOW if old_app else WINDOW
+            self.stall_t = time.time()
+        log.info("sending %s to the flipper: %d bytes, crc %08x, window %d",
+                 self.tag, len(data), zlib.crc32(data) & 0xFFFFFFFF, self.window)
 
     def on_ack(self, written):
         with self.lock:
@@ -198,10 +235,16 @@ class Updater:
                 self._reset()
                 return
             now = time.time()
+            if not self.ready:
+                log.info("flipper accepted %s, sending (ack %d)", self.tag, written)
             self.ready = True
             if written > self.acked:
                 self.acked = written
-                self.progress_t = now
+                self.progress_t = self.stall_t = now
+                pct = written * 100 // max(1, len(self.data))
+                if pct >= self.logged_pct + 10:
+                    self.logged_pct = pct - pct % 10
+                    log.info("update %s: %d%% (%d/%d)", self.tag, pct, written, len(self.data))
             if not self.progress_t:
                 self.progress_t = now
 
@@ -216,19 +259,27 @@ class Updater:
             if not self.began:
                 out.append(f"UB|{self.tag}|{size}|{zlib.crc32(self.data) & 0xFFFFFFFF}")
                 self.began, self.began_t = True, now
+                self.ub_sent += 1
+                if self.ub_sent > 1:
+                    log.info("no answer to the update start, asking again (%d)", self.ub_sent)
                 return out
             if not self.ready:
-                if now - self.began_t > 5:          # no answer to UB: try again
+                if now - self.stall_t > GIVE_UP_AFTER:
+                    log.warning("the flipper never answered the update start, giving up")
+                    self._reset()
+                elif now - self.began_t > 5:          # no answer to UB: try again
                     self.began = False
                 return out
-            if now - self.progress_t > GIVE_UP_AFTER:
+            if now - self.stall_t > GIVE_UP_AFTER:
+                # stall_t moves only when the Flipper acknowledges new bytes: retransmissions
+                # must not keep a dead transfer alive forever
                 log.warning("update stalled at %d/%d, giving up", self.acked, size)
                 self._reset()
                 return out
             if self.sent > self.acked and now - self.progress_t > RETRANSMIT_AFTER:
                 self.sent = self.acked               # go-back-N
                 self.progress_t = now
-            while self.sent < size and self.sent - self.acked < WINDOW * CHUNK:
+            while self.sent < size and self.sent - self.acked < self.window * CHUNK:
                 chunk = self.data[self.sent:self.sent + CHUNK]
                 out.append(f"UD|{self.sent}|{base64.b64encode(chunk).decode('ascii')}")
                 self.sent += len(chunk)
@@ -238,6 +289,17 @@ class Updater:
                 log.info("update %s delivered", self.tag)
                 self._reset()
         return out
+
+    def busy(self):
+        """True while a transfer runs (the regular frame pauses so the Flipper keeps up)."""
+        return self.active
+
+    def progress(self):
+        """(tag, percent) of the running transfer, or None."""
+        with self.lock:
+            if self.active and self.data:
+                return self.tag, self.acked * 100 // len(self.data)
+            return None
 
     def status(self):
         with self.lock:

@@ -10,6 +10,7 @@ RX_UUID = "de5ec001-1d00-4a1e-8b5e-0f11e7ca1000"  # PC -> Flipper (write)
 TX_UUID = "de5ec002-1d00-4a1e-8b5e-0f11e7ca1000"  # Flipper -> PC (notify)
 ADV_UUID = "0000ded5-0000-1000-8000-00805f9b34fb"
 NAME_PREFIX = "DedSec"
+RX_WRITE_MAX = 240                                  # UPLINK_RX_MAX (243) on the Flipper
 
 log = logging.getLogger("uplink.link")
 
@@ -108,7 +109,9 @@ class Link:
 
         async with BleakClient(dev, timeout=20.0, disconnected_callback=on_disconnect) as client:
             self._set("connected", dev.name or dev.address)
-            chunk = max(20, (client.mtu_size or 23) - 3)
+            # the Flipper's RX characteristic holds at most 243 bytes: a longer write without
+            # response is dropped silently, so long lines go out in several writes
+            chunk = min(max(20, (client.mtu_size or 23) - 3), RX_WRITE_MAX)
             self._rxbuf = ""
 
             def on_tx(_handle, data):

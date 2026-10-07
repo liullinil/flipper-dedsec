@@ -718,15 +718,10 @@ static void parse_line(App* app, char* line) {
             }
             app->ota.available = true;
             if(!app->ota.notified) {
+                // updates are always automatic: ask for it right away (the companion from
+                // 1.2.1 on also pushes it by itself; the request covers older companions)
                 app->ota.notified = true;
-                if(app->settings.auto_update) {
-                    ota_request(app);
-                } else {
-                    app->alert = true;
-                    app->alert_update = true;
-                    app->alert_until = app->tick + ALERT_TICKS * 3;
-                    uplink_notify(app, NotifyUpdate);
-                }
+                ota_request(app);
             }
         }
         break;
@@ -1915,7 +1910,6 @@ static const char* const on_off[] = {"OFF", "ON"};
 static const char* const ind_vals[] = {"Bars", "Text"};
 static const char* const font_vals[] = {"Normal", "Large", "Small", "Micro"};
 static const char* const orientation_vals[] = {"Horizontal", "Vertical"};
-static const char* const update_vals[] = {"Notify", "Auto"};
 // tab choices in the order the user sees them; stored as ScreenId
 static const char* const tab_vals[] = {"SYS", "CDX", "CLD", "CMD", "RF", "Off"};
 static const uint8_t tab_screens[] = {ScreenSys, ScreenCodex, ScreenClaude, ScreenCmd, ScreenRf, ScreenOff};
@@ -1948,7 +1942,6 @@ enum {
     SetRfKeep,
     SetRfAutostart,
     SetRfSync,
-    SetAutoUpdate,
     SetVersion, // read-only; OK installs a pending update
 };
 
@@ -1999,9 +1992,6 @@ static void setting_text(uint8_t row, uint8_t idx, char* out, size_t size) {
         return;
     case SetRfKeep:
         text = rf_keep_vals[idx];
-        break;
-    case SetAutoUpdate:
-        text = update_vals[idx];
         break;
     default:
         text = on_off[idx];
@@ -2086,9 +2076,6 @@ static void setting_changed(VariableItem* item) {
     case SetRfSync:
         s->rf_sync = idx;
         break;
-    case SetAutoUpdate:
-        s->auto_update = idx;
-        break;
     default:
         break;
     }
@@ -2153,7 +2140,6 @@ static void build_settings(App* app) {
     add_row(app, "RF after import", SetRfKeep, COUNT_OF(rf_keep_vals), s->rf_keep);
     add_row(app, "RF on at app start", SetRfAutostart, 2, s->rf_autostart);
     add_row(app, "RF import by PC", SetRfSync, 2, s->rf_sync);
-    add_row(app, "Updates", SetAutoUpdate, 2, s->auto_update);
     // Version row: shows what is installed and what can be installed
     static char version_text[40];
     if(app->ota.available) {

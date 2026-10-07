@@ -31,3 +31,6 @@ tools/uplink_render/render.exe
 
 # local agent worktrees
 .claude/
+
+# native Claude Code hook (built by uplink/hook/build.bat, bundled into the .exe)
+uplink/hook/uplink_hook.exe
