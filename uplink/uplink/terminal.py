@@ -28,6 +28,8 @@ import re
 import threading
 from typing import Callable, Optional
 
+from .frozen import child_env
+
 try:  # pywinpty is Windows-only; importing the companion on another host should still work.
     from winpty import PtyProcess
 except ImportError:  # pragma: no cover - exercised on non-Windows development hosts
@@ -695,7 +697,7 @@ class Terminal:
             if PtyProcess is None:
                 raise RuntimeError("pywinpty is required for the interactive Windows shell")
             argv = list(self.argv or ["powershell.exe" if self.kind == "powershell" else "cmd.exe"])
-            env = dict(self.env if self.env is not None else os.environ)
+            env = child_env(self.env)    # without the one-file exe's private variables
             env.setdefault("TERM", "xterm-256color")
             env.setdefault("COLORTERM", "truecolor")
             cwd = self.cwd if self.cwd and os.path.isdir(self.cwd) else os.path.expanduser("~")

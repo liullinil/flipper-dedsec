@@ -184,7 +184,8 @@ There is nothing to set up:
 
 Command line (`.exe` or `.pyw`): `--console` (log to the console), `--dump` (print one data frame, no BLE),
 `--install-autostart` / `--uninstall-autostart`, `--install-claude-hooks` / `--remove-claude-hooks`.
-Log: `%LOCALAPPDATA%\DedSecUplink\uplink.log`. Only one copy runs at a time.
+Log: `%LOCALAPPDATA%\DedSecUplink\uplink.log`; each self-update notes its steps in `update.log` next to it.
+Only one copy runs at a time.
 
 ### Build the .exe
 

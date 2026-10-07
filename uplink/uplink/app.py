@@ -6,11 +6,9 @@ import logging.handlers
 import os
 import queue
 import socket
-import subprocess
 import sys
 import threading
 import time
-import tempfile
 import webbrowser
 from collections import deque
 
@@ -18,6 +16,7 @@ from . import config, hooks
 from .claude import ClaudeWatcher
 from .codex import CodexWatcher
 from .common import ascii_text
+from .frozen import apply_companion_update
 from .link import Link
 from .rf_sync import RfSync
 from .shell import Shell
@@ -274,48 +273,6 @@ def ensure_integration():
         hooks.ensure_installed()
     except Exception:
         log.exception("cannot install the Claude Code hooks")
-
-
-def apply_companion_update(temp_path, quit_app):
-    """Swap the running one-file exe for temp_path and restart it.
-
-    A one-file exe runs as two processes (bootloader parent + Python child) and the parent keeps
-    the exe open, so a PowerShell helper waits for both, retries the swap until the file is free,
-    starts the new version and removes itself. UTF-8 with BOM: Windows PowerShell 5.1 reads
-    BOM-less scripts as ANSI, which breaks non-ASCII paths."""
-    target = sys.executable
-
-    def quote(value):
-        return "'" + str(value).replace("'", "''") + "'"
-
-    log_path = os.path.join(APP_DIR, "update.log")
-    script = os.path.join(tempfile.gettempdir(), "DedSecUplink-apply-update.ps1")
-    body = "\r\n".join([
-        "$ErrorActionPreference = 'Stop'",
-        "foreach ($id in @(%d, %d)) {" % (os.getpid(), os.getppid()),
-        "  $p = Get-Process -Id $id -ErrorAction SilentlyContinue",
-        "  if ($p -and $p.ProcessName -like 'DedSecUplink*') { $p.WaitForExit(30000) | Out-Null }",
-        "}",
-        "$ok = $false",
-        "for ($i = 0; $i -lt 40 -and -not $ok; $i++) {",
-        "  try { Move-Item -LiteralPath %s -Destination %s -Force; $ok = $true }" % (
-            quote(temp_path), quote(target)),
-        "  catch { Start-Sleep -Milliseconds 500 }",
-        "}",
-        "if (-not $ok) { Add-Content -LiteralPath %s -Value 'update: could not replace the exe' }"
-        % quote(log_path),
-        "Start-Process -FilePath %s" % quote(target),
-        "Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force",
-    ])
-    with open(script, "w", encoding="utf-8-sig") as fh:
-        fh.write(body)
-    subprocess.Popen(
-        ["powershell.exe", "-NoLogo", "-NoProfile", "-WindowStyle", "Hidden",
-         "-ExecutionPolicy", "Bypass", "-File", script],
-        creationflags=0x08000000,
-    )
-    log.info("companion update downloaded, restarting")
-    quit_app()
 
 
 def run_tray(feed, cfg):
